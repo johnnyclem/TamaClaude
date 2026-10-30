@@ -1,0 +1,1 @@
+{"t":"ask_rsp","id":"ffffffff","ok":false}

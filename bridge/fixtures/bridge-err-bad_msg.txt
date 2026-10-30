@@ -1,0 +1,1 @@
+{"t":"err","code":"bad_msg","msg":"example for bad_msg"}

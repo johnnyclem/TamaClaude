@@ -1,0 +1,1 @@
+{"t":"hello","v":1,"token":"AHOVcjqx4_ELSZgn","dev":"","fw":"","rate":16000,"bits":16,"ch":1}

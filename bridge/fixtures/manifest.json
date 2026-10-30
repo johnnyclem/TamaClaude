@@ -1,0 +1,1507 @@
+[
+  {
+    "file": "device-hello-typical.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "A normal hello: protocol 1, 16 kHz 16-bit mono"
+  },
+  {
+    "file": "device-hello-token-min.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Shortest token (16), empty dev and fw"
+  },
+  {
+    "file": "device-hello-token-charset.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Token using every allowed punctuation character"
+  },
+  {
+    "file": "device-hello-max.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Every field at its maximum; numbers are shape-checked only, the server rejects the values"
+  },
+  {
+    "file": "device-hello-worst-case.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "dev and fw are all quotes, so every character escapes: the largest hello frame"
+  },
+  {
+    "file": "device-say-typical.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "A typed prompt"
+  },
+  {
+    "file": "device-say-empty.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Empty text is valid on the wire; whether it does anything is the server's business"
+  },
+  {
+    "file": "device-say-escapes.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Quote and backslash, the only characters JSON escapes in ASCII"
+  },
+  {
+    "file": "device-say-max.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "All of printable ASCII, 400 characters"
+  },
+  {
+    "file": "device-say-worst-case.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Every character escapes, so this is the largest say frame"
+  },
+  {
+    "file": "device-listen-start.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Push-to-talk: start"
+  },
+  {
+    "file": "device-listen-stop.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Push-to-talk: stop"
+  },
+  {
+    "file": "device-listen-cancel.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Push-to-talk: cancel"
+  },
+  {
+    "file": "device-ask_rsp-allow.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "The only message that can approve a tool call"
+  },
+  {
+    "file": "device-ask_rsp-deny.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "A tap on DENY"
+  },
+  {
+    "file": "device-abort.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "The only message with no fields"
+  },
+  {
+    "file": "device-ping-0.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Application ping"
+  },
+  {
+    "file": "device-ping-max.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Largest counter"
+  },
+  {
+    "file": "device-ping-noncanonical-whitespace.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "canonical": false,
+    "note": "Whitespace (space, tab, CR, LF) before, between and after the tokens, none of it at the very end of the file: a ping with n 7"
+  },
+  {
+    "file": "device-ask_rsp-noncanonical-order.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "canonical": false,
+    "note": "Keys in another order, t not first: an ask_rsp denying 0a1b2c3d"
+  },
+  {
+    "file": "device-say-noncanonical-escapes.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "canonical": false,
+    "note": "The escapes \\/ and \\uXXXX for printable ASCII: the text A/B A 0 \"q\" \\"
+  },
+  {
+    "file": "device-listen-noncanonical-escaped-key.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "canonical": false,
+    "note": "Key names written with \\u escapes: a listen stop"
+  },
+  {
+    "file": "device-audio-mic-min.bin",
+    "dir": "device",
+    "kind": "binary",
+    "expect": "valid",
+    "note": "One sample, the shortest legal frame"
+  },
+  {
+    "file": "device-audio-mic-20ms.bin",
+    "dir": "device",
+    "kind": "binary",
+    "expect": "valid",
+    "note": "20 ms at 16 kHz s16le"
+  },
+  {
+    "file": "device-audio-mic-max.bin",
+    "dir": "device",
+    "kind": "binary",
+    "expect": "valid",
+    "note": "40 ms, the largest legal payload"
+  },
+  {
+    "file": "bridge-hello_ack-ok.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Accepted; sid is the session id"
+  },
+  {
+    "file": "bridge-hello_ack-ok-sid-max.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Longest sid"
+  },
+  {
+    "file": "bridge-hello_ack-ok-worst-case.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Largest v and a sid of all quotes: the largest hello_ack frame"
+  },
+  {
+    "file": "bridge-hello_ack-refused-token.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Refused: token"
+  },
+  {
+    "file": "bridge-hello_ack-refused-version.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Refused: version"
+  },
+  {
+    "file": "bridge-hello_ack-refused-bad_hello.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Refused: bad_hello"
+  },
+  {
+    "file": "bridge-state-idle.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Phase idle"
+  },
+  {
+    "file": "bridge-state-listening.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Phase listening"
+  },
+  {
+    "file": "bridge-state-transcribing.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Phase transcribing"
+  },
+  {
+    "file": "bridge-state-thinking.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Phase thinking"
+  },
+  {
+    "file": "bridge-state-tool.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Phase tool"
+  },
+  {
+    "file": "bridge-state-asking.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Phase asking"
+  },
+  {
+    "file": "bridge-state-speaking.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Phase speaking"
+  },
+  {
+    "file": "bridge-state-done.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Phase done"
+  },
+  {
+    "file": "bridge-state-error.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Phase error"
+  },
+  {
+    "file": "bridge-state-max.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Largest counters, longest label"
+  },
+  {
+    "file": "bridge-state-worst-case.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "The longest phase name and a label of all quotes (a receiver ignores tl outside tool and asking): the largest state frame"
+  },
+  {
+    "file": "bridge-stt-typical.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "A transcript"
+  },
+  {
+    "file": "bridge-stt-worst-case.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Every character escapes"
+  },
+  {
+    "file": "bridge-ask-low.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "An ask of risk low"
+  },
+  {
+    "file": "bridge-ask-med.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "An ask of risk med"
+  },
+  {
+    "file": "bridge-ask-high.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "An ask of risk high"
+  },
+  {
+    "file": "bridge-ask-escapes.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Quote and backslash in the summary"
+  },
+  {
+    "file": "bridge-ask-ttl-0.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Zero is valid on the wire, though the bridge rounds up and sends at least 1"
+  },
+  {
+    "file": "bridge-ask-max.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Every field at its maximum"
+  },
+  {
+    "file": "bridge-ask-worst-case.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Every string character escapes: the largest ask frame"
+  },
+  {
+    "file": "bridge-ask_end-answered.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Ask ended: answered"
+  },
+  {
+    "file": "bridge-ask_end-timeout.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Ask ended: timeout"
+  },
+  {
+    "file": "bridge-ask_end-abort.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Ask ended: abort"
+  },
+  {
+    "file": "bridge-ask_end-disconnect.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Ask ended: disconnect"
+  },
+  {
+    "file": "bridge-result-ok.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "A finished turn"
+  },
+  {
+    "file": "bridge-result-fail.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "A turn that ended badly"
+  },
+  {
+    "file": "bridge-result-empty.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Empty text is valid on the wire"
+  },
+  {
+    "file": "bridge-result-worst-case.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "ok false is the longer spelling, and every character escapes: the largest result frame"
+  },
+  {
+    "file": "bridge-err-bad_msg.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Error code bad_msg"
+  },
+  {
+    "file": "bridge-err-busy.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Error code busy"
+  },
+  {
+    "file": "bridge-err-unknown_ask.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Error code unknown_ask"
+  },
+  {
+    "file": "bridge-err-not_listening.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Error code not_listening"
+  },
+  {
+    "file": "bridge-err-too_long.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Error code too_long"
+  },
+  {
+    "file": "bridge-err-empty.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Error code empty"
+  },
+  {
+    "file": "bridge-err-stt_unavailable.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Error code stt_unavailable"
+  },
+  {
+    "file": "bridge-err-stt_failed.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Error code stt_failed"
+  },
+  {
+    "file": "bridge-err-driver.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Error code driver"
+  },
+  {
+    "file": "bridge-err-internal.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Error code internal"
+  },
+  {
+    "file": "bridge-err-worst-case.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "The longest code and a msg of all quotes: the largest err frame"
+  },
+  {
+    "file": "bridge-pong-0.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Reply to ping"
+  },
+  {
+    "file": "bridge-pong-max.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Largest counter"
+  },
+  {
+    "file": "bridge-audio-tts-min.bin",
+    "dir": "bridge",
+    "kind": "binary",
+    "expect": "valid",
+    "note": "One sample, the shortest legal frame"
+  },
+  {
+    "file": "bridge-audio-tts-20ms.bin",
+    "dir": "bridge",
+    "kind": "binary",
+    "expect": "valid",
+    "note": "20 ms at 16 kHz s16le"
+  },
+  {
+    "file": "bridge-audio-tts-max.bin",
+    "dir": "bridge",
+    "kind": "binary",
+    "expect": "valid",
+    "note": "40 ms, the largest legal payload"
+  },
+  {
+    "file": "invalid-device-array-json.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A JSON array holding a valid message"
+  },
+  {
+    "file": "invalid-device-null-json.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "JSON null"
+  },
+  {
+    "file": "invalid-device-string-json.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A bare JSON string"
+  },
+  {
+    "file": "invalid-device-number-json.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A bare JSON number"
+  },
+  {
+    "file": "invalid-device-empty-frame.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A zero-byte text frame"
+  },
+  {
+    "file": "invalid-device-not-json.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Plain text"
+  },
+  {
+    "file": "invalid-device-truncated-json.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Cut off before the closing brace"
+  },
+  {
+    "file": "invalid-device-trailing-data.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Bytes after the object"
+  },
+  {
+    "file": "invalid-device-two-objects.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Two messages in one frame"
+  },
+  {
+    "file": "invalid-device-trailing-comma.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Trailing comma"
+  },
+  {
+    "file": "invalid-bridge-array-json.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A JSON array holding a valid message"
+  },
+  {
+    "file": "invalid-bridge-null-json.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "JSON null"
+  },
+  {
+    "file": "invalid-device-unknown-type.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A type that does not exist"
+  },
+  {
+    "file": "invalid-device-unknown-type-bridge-msg.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A bridge message sent by a device"
+  },
+  {
+    "file": "invalid-device-unknown-type-empty.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Empty type"
+  },
+  {
+    "file": "invalid-device-missing-type.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "No t at all"
+  },
+  {
+    "file": "invalid-device-wrong-type-t.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "t is a number"
+  },
+  {
+    "file": "invalid-bridge-unknown-type.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A type that does not exist"
+  },
+  {
+    "file": "invalid-bridge-unknown-type-device-msg.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A device message sent by the bridge"
+  },
+  {
+    "file": "invalid-device-missing-key-say.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "say without text"
+  },
+  {
+    "file": "invalid-device-missing-key-hello-ch.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "hello without ch"
+  },
+  {
+    "file": "invalid-device-missing-key-ask_rsp-ok.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "An answer with no verdict must not default to either"
+  },
+  {
+    "file": "invalid-device-extra-key-ping.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "One key too many"
+  },
+  {
+    "file": "invalid-device-extra-key-abort.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "abort takes no fields"
+  },
+  {
+    "file": "invalid-device-extra-key-ask_rsp.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "An approval carrying a field the protocol does not define"
+  },
+  {
+    "file": "invalid-bridge-missing-key-state-pend.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "state without pend"
+  },
+  {
+    "file": "invalid-bridge-extra-key-state.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "One key too many"
+  },
+  {
+    "file": "invalid-bridge-missing-key-ask-ttl.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "ask without ttl"
+  },
+  {
+    "file": "invalid-bridge-hello_ack-ok-with-why.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Accepted form carrying the refused form's key"
+  },
+  {
+    "file": "invalid-bridge-hello_ack-refused-with-sid.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Refused form carrying the accepted form's key"
+  },
+  {
+    "file": "invalid-bridge-extra-key-hello_ack-both.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Both forms' keys at once"
+  },
+  {
+    "file": "invalid-bridge-wrong-type-hello_ack-ok.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "ok must be a real boolean, not a truthy string"
+  },
+  {
+    "file": "invalid-bridge-missing-key-hello_ack-ok.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "No discriminator"
+  },
+  {
+    "file": "invalid-device-proto-key-nested.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "__proto__ holding an object"
+  },
+  {
+    "file": "invalid-device-proto-key-scalar.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "__proto__ as an ordinary extra key"
+  },
+  {
+    "file": "invalid-device-proto-key-constructor.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "constructor as an extra key"
+  },
+  {
+    "file": "invalid-bridge-proto-key-scalar.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "__proto__ as an ordinary extra key"
+  },
+  {
+    "file": "invalid-device-duplicate-key-ask_rsp.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A deny followed by an allow: parsers disagree about which wins"
+  },
+  {
+    "file": "invalid-device-duplicate-key-same-value.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Duplicates are refused even when they agree"
+  },
+  {
+    "file": "invalid-device-duplicate-key-t.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Duplicate type"
+  },
+  {
+    "file": "invalid-bridge-duplicate-key-state.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Duplicate seq"
+  },
+  {
+    "file": "invalid-device-wrong-type-ping-n-string.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A number sent as a string"
+  },
+  {
+    "file": "invalid-device-wrong-type-ask_rsp-ok-string.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A verdict sent as a string"
+  },
+  {
+    "file": "invalid-device-wrong-type-ask_rsp-ok-number.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A verdict sent as 1"
+  },
+  {
+    "file": "invalid-device-wrong-type-say-number.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "text is a number"
+  },
+  {
+    "file": "invalid-device-wrong-type-say-null.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "text is null"
+  },
+  {
+    "file": "invalid-device-nested-object-value.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "An object where a string belongs"
+  },
+  {
+    "file": "invalid-device-nested-array-value.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "An array where a string belongs"
+  },
+  {
+    "file": "invalid-bridge-wrong-type-result-ok.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "ok is a string"
+  },
+  {
+    "file": "invalid-bridge-wrong-type-ask-ttl-string.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "ttl is a string"
+  },
+  {
+    "file": "invalid-device-number-negative-zero.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "-0 prints as 0 in most languages; refused rather than repaired"
+  },
+  {
+    "file": "invalid-device-number-negative.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Negative"
+  },
+  {
+    "file": "invalid-device-number-exponent-huge.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Exponent form that overflows a double"
+  },
+  {
+    "file": "invalid-device-number-exponent.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "An integer written with an exponent"
+  },
+  {
+    "file": "invalid-device-number-fraction.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "An integer written with a fraction"
+  },
+  {
+    "file": "invalid-device-number-leading-zero.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Leading zero (octal in some parsers)"
+  },
+  {
+    "file": "invalid-device-number-plus-sign.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Explicit plus sign"
+  },
+  {
+    "file": "invalid-device-number-nan.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "NaN is not JSON"
+  },
+  {
+    "file": "invalid-device-number-too-many-digits.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "More digits than a double holds exactly"
+  },
+  {
+    "file": "invalid-device-number-over-int32.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "One past the int32 maximum"
+  },
+  {
+    "file": "invalid-bridge-number-fraction-ttl.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Fractional ttl"
+  },
+  {
+    "file": "invalid-bridge-number-over-int32-seq.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "seq one past the int32 maximum"
+  },
+  {
+    "file": "invalid-device-bad-enum-listen.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Unknown listen mode"
+  },
+  {
+    "file": "invalid-device-bad-enum-listen-case.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Enums are case sensitive"
+  },
+  {
+    "file": "invalid-bridge-bad-enum-state-ph.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Unknown phase"
+  },
+  {
+    "file": "invalid-bridge-bad-enum-ask-risk.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Unknown risk"
+  },
+  {
+    "file": "invalid-bridge-bad-enum-ask_end-why.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Unknown ask_end reason"
+  },
+  {
+    "file": "invalid-bridge-bad-enum-err-code.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Unknown error code"
+  },
+  {
+    "file": "invalid-bridge-bad-enum-hello_ack-why.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Unknown refusal reason"
+  },
+  {
+    "file": "invalid-device-non-ascii-raw.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A raw UTF-8 e-acute inside a string"
+  },
+  {
+    "file": "invalid-device-non-ascii-escaped.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "The same character written as a JSON escape (the frame itself is pure ASCII)"
+  },
+  {
+    "file": "invalid-device-non-ascii-lone-surrogate.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A lone surrogate escape"
+  },
+  {
+    "file": "invalid-device-non-ascii-nul.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "An escaped NUL, which would end a C string early"
+  },
+  {
+    "file": "invalid-device-non-ascii-newline-escape.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "An escaped newline"
+  },
+  {
+    "file": "invalid-device-non-ascii-del.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A raw DEL (0x7f), legal JSON but not printable"
+  },
+  {
+    "file": "invalid-device-non-ascii-emoji.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "An emoji, which is four UTF-8 bytes"
+  },
+  {
+    "file": "invalid-device-bad-string-raw-newline.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A raw newline inside a string is not legal JSON"
+  },
+  {
+    "file": "invalid-device-bad-string-bad-escape.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "\\x is not a JSON escape"
+  },
+  {
+    "file": "invalid-device-bad-string-unterminated.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "String never closes"
+  },
+  {
+    "file": "invalid-bridge-non-ascii-stt.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A raw UTF-8 e-acute"
+  },
+  {
+    "file": "invalid-bridge-non-ascii-ask-sum.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "CJK in the summary"
+  },
+  {
+    "file": "invalid-device-too-long-say.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "One character past the cap"
+  },
+  {
+    "file": "invalid-device-too-long-hello-dev.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "dev one past the cap"
+  },
+  {
+    "file": "invalid-device-too-long-hello-fw.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "fw one past the cap"
+  },
+  {
+    "file": "invalid-bridge-too-long-state-tl.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Label one past the cap"
+  },
+  {
+    "file": "invalid-bridge-too-long-ask-sum.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Summary one past the cap"
+  },
+  {
+    "file": "invalid-bridge-too-long-stt.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Transcript one past the cap"
+  },
+  {
+    "file": "invalid-bridge-too-long-result.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Result one past the cap"
+  },
+  {
+    "file": "invalid-bridge-too-long-err-msg.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Message one past the cap"
+  },
+  {
+    "file": "invalid-bridge-too-long-hello_ack-sid.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "sid one past the cap"
+  },
+  {
+    "file": "invalid-device-oversized-frame.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A valid say padded to one byte over the device frame limit"
+  },
+  {
+    "file": "invalid-device-oversized-frame-multibyte.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Fewer characters than the limit but more bytes: the limit is in bytes"
+  },
+  {
+    "file": "invalid-bridge-oversized-frame.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A valid pong padded to one byte over the bridge frame limit"
+  },
+  {
+    "file": "invalid-device-bad-id-uppercase.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Ids are lowercase hex"
+  },
+  {
+    "file": "invalid-device-bad-id-short.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Seven characters"
+  },
+  {
+    "file": "invalid-device-bad-id-long.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Nine characters"
+  },
+  {
+    "file": "invalid-device-bad-id-not-hex.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "g is not a hex digit"
+  },
+  {
+    "file": "invalid-device-bad-id-empty.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Empty id"
+  },
+  {
+    "file": "invalid-device-bad-id-number.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "An id that is a JSON number"
+  },
+  {
+    "file": "invalid-bridge-bad-id-ask.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A bad id in an ask"
+  },
+  {
+    "file": "invalid-bridge-bad-id-ask_end.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Uppercase id in ask_end"
+  },
+  {
+    "file": "invalid-device-token-short.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Fifteen characters"
+  },
+  {
+    "file": "invalid-device-token-empty.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Empty token"
+  },
+  {
+    "file": "invalid-device-token-long.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Sixty-five characters"
+  },
+  {
+    "file": "invalid-device-token-bad-chars-space.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A space"
+  },
+  {
+    "file": "invalid-device-token-bad-chars-base64.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Plain base64 punctuation; only the URL-safe alphabet is allowed"
+  },
+  {
+    "file": "invalid-device-token-bad-chars-quote-escape.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "An escaped quote"
+  },
+  {
+    "file": "invalid-device-wrong-type-hello-v.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "v as a string"
+  },
+  {
+    "file": "invalid-device-odd-length-audio.bin",
+    "dir": "device",
+    "kind": "binary",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Three payload bytes: a torn s16 sample"
+  },
+  {
+    "file": "invalid-device-unknown-kind-audio-0.bin",
+    "dir": "device",
+    "kind": "binary",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Kind 0x00"
+  },
+  {
+    "file": "invalid-device-unknown-kind-audio-3.bin",
+    "dir": "device",
+    "kind": "binary",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Kind 0x03"
+  },
+  {
+    "file": "invalid-device-unknown-kind-audio-ff.bin",
+    "dir": "device",
+    "kind": "binary",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Kind 0xff"
+  },
+  {
+    "file": "invalid-device-empty-audio.bin",
+    "dir": "device",
+    "kind": "binary",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A zero-byte binary frame"
+  },
+  {
+    "file": "invalid-device-empty-audio-payload.bin",
+    "dir": "device",
+    "kind": "binary",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A kind byte and no samples"
+  },
+  {
+    "file": "invalid-device-too-big-audio.bin",
+    "dir": "device",
+    "kind": "binary",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "An even payload, but past the 40 ms cap"
+  },
+  {
+    "file": "invalid-bridge-odd-length-audio.bin",
+    "dir": "bridge",
+    "kind": "binary",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Three payload bytes: a torn s16 sample"
+  },
+  {
+    "file": "invalid-bridge-unknown-kind-audio-0.bin",
+    "dir": "bridge",
+    "kind": "binary",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Kind 0x00"
+  },
+  {
+    "file": "invalid-bridge-unknown-kind-audio-3.bin",
+    "dir": "bridge",
+    "kind": "binary",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Kind 0x03"
+  },
+  {
+    "file": "invalid-bridge-unknown-kind-audio-ff.bin",
+    "dir": "bridge",
+    "kind": "binary",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "Kind 0xff"
+  },
+  {
+    "file": "invalid-bridge-empty-audio.bin",
+    "dir": "bridge",
+    "kind": "binary",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A zero-byte binary frame"
+  },
+  {
+    "file": "invalid-bridge-empty-audio-payload.bin",
+    "dir": "bridge",
+    "kind": "binary",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "A kind byte and no samples"
+  },
+  {
+    "file": "invalid-bridge-too-big-audio.bin",
+    "dir": "bridge",
+    "kind": "binary",
+    "expect": "invalid",
+    "code": "bad_msg",
+    "note": "An even payload, but past the 40 ms cap"
+  }
+]

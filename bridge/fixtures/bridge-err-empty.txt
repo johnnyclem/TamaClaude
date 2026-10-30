@@ -1,0 +1,1 @@
+{"t":"err","code":"empty","msg":"example for empty"}
