@@ -51,6 +51,30 @@ export const LIMITS = {
 
 export const AUDIO = { rate: 16000, bits: 16, channels: 1 } as const;
 
+/**
+ * WebSocket close codes the bridge sends or relies on. PROTOCOL.md's close-code table is
+ * held to this object by test/protocol.test.ts, so a code cannot change in one place only.
+ * 1006 (abnormal closure, no close frame) is not a code anyone sends: it is what a peer
+ * reports when the connection was dropped, so it is deliberately absent.
+ */
+export const CLOSE = {
+  normal: 1000,
+  goingAway: 1001,
+  /** A text frame that is not valid UTF-8; the transport sends it before the protocol sees the frame. */
+  invalidData: 1007,
+  /** Five bad frames in a row. */
+  policy: 1008,
+  /** A message above the socket's own ceiling (see MAX_PAYLOAD in server.ts). */
+  tooBig: 1009,
+  /** This connection was replaced by a newer, authenticated one. */
+  replaced: 4001,
+  /** The handshake failed: the hello was refused or never came. */
+  handshake: 4002,
+} as const;
+
+/** The `m` values of a `listen` message. */
+export const LISTEN_MODES = ['start', 'stop', 'cancel'] as const;
+
 /** First byte of every binary WebSocket frame. */
 export const FRAME_KIND_MIC = 0x01; // device -> bridge, PCM while listening
 export const FRAME_KIND_TTS = 0x02; // bridge -> device, PCM while speaking

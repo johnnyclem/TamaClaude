@@ -9,6 +9,10 @@
  * identifiers), so the model is told to confirm before acting when a misheard word
  * could change a harmless command into a destructive one.
  *
+ * The last rule exists because the driver switches background and delegated work off
+ * (nothing can report back after the turn's answer, and a promise of "I will tell you when it
+ * is done" would be a lie the owner waits on).
+ *
  * Constraints, all pinned by test/voice-prompt.test.ts: printable ASCII only (it is
  * echoed back into logs and may be quoted to the device), under ~1200 characters (it
  * is paid for on every request), and no markdown of its own (it would model the style
@@ -24,4 +28,5 @@ export const VOICE_RULES: string = [
   'The input is DICTATED by voice and may contain recognition errors, especially in identifiers, file names and commands. When a word could be a destructive command or a different file name, confirm with the user before acting.',
   'Never claim an action succeeded unless a tool result showed it.',
   'If a permission request is denied, that is the decision of the user. Accept it, do not try the same thing another way, and say what was not done.',
+  'Background tasks and scheduled wake-ups are not available. Finish the work within this turn, and if it is long, say so in the final message instead of promising to report back later.',
 ].join('\n');

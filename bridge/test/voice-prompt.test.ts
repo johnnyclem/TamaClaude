@@ -28,6 +28,7 @@ const RULES: Record<string, RegExp> = {
   'confirm before a different file name': /different file name/i,
   'no claim without a tool result': /never claim[\s\S]*unless a tool result/i,
   'a denial is the users decision': /denied[\s\S]*decision of the user[\s\S]*accept it/i,
+  'no background work and no later report': /background tasks[\s\S]*not available[\s\S]*instead of promising/i,
 };
 
 function missingRules(text: string): string[] {
@@ -50,11 +51,22 @@ test('the prompt states every rule', () => {
   assert.deepEqual(missingRules(VOICE_RULES), []);
 });
 
+test('the rules agree with what the driver actually switches off', async () => {
+  // The prompt promises the model that background work does not exist; the driver must make
+  // that true, or the model is told something false. Both halves are checked from here so a
+  // change to one without the other fails a test.
+  const { buildChildEnv } = await import('../src/drivers/claude.ts');
+  const { env } = buildChildEnv({}, 'sk-ant-x');
+  assert.equal(env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, '1');
+  assert.match(VOICE_RULES, /background tasks/i);
+});
+
 test('the rule check can fail: a prompt without a rule is reported as missing it', () => {
   assert.deepEqual(missingRules(VOICE_RULES.replace('DICTATED', 'spoken')), ['input is dictated']);
   assert.deepEqual(missingRules(VOICE_RULES.replace('exactly ONE short question', 'a few questions')), [
     'ask exactly one question',
   ]);
+  assert.deepEqual(missingRules(VOICE_RULES.replace('not available', 'fine')), ['no background work and no later report']);
   assert.ok(missingRules('').length === Object.keys(RULES).length);
 });
 

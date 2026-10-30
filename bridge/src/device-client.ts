@@ -294,6 +294,12 @@ export class DeviceClient extends EventEmitter {
         this.#violation(`state repeated: ${describeMsg(m)}`);
       }
       this.#lastState = m;
+      // The wire must not contradict itself: `pend` counts open asks, and the bridge ends an ask
+      // (ask_end) before it reports the count without it, so "none open" with an ask still on
+      // the screen means the device would be told it is idle while an approval waits on it.
+      if (m.pend === 0 && this.openAsk !== undefined) {
+        this.#violation(`state says no ask is open (pend 0) while ask ${this.openAsk.id} is still on the panel`);
+      }
     } else if (m.t === 'ask') {
       if (this.openAsk !== undefined && this.openAsk.id !== m.id) {
         this.#violation(`ask ${m.id} presented while ${this.openAsk.id} is still open`);

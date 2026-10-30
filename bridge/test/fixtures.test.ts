@@ -58,7 +58,13 @@ describe('fixtures on disk match the encoders', () => {
   it('the format stays boring: fixed keys, plain names, no trailing newline in a text frame', () => {
     for (const e of manifest) {
       const keys = Object.keys(e).sort();
-      assert.deepEqual(keys, (e.expect === 'invalid' ? ['code', 'dir', 'expect', 'file', 'kind', 'note'] : ['dir', 'expect', 'file', 'kind', 'note']), e.file);
+      // `canonical: false` is the one optional key, only on a valid device text frame.
+      const base = e.expect === 'invalid' ? ['code', 'dir', 'expect', 'file', 'kind', 'note'] : ['dir', 'expect', 'file', 'kind', 'note'];
+      assert.deepEqual(keys, 'canonical' in e ? [...base, 'canonical'].sort() : base, e.file);
+      if ('canonical' in e) {
+        assert.equal(e.canonical, false, e.file);
+        assert.deepEqual([e.expect, e.kind, e.dir], ['valid', 'text', 'device'], `${e.file}: only a frame the bridge accepts can be loose`);
+      }
       assert.match(e.file, /^[a-z0-9_-]+\.(txt|bin)$/);
       assert.equal(e.file.endsWith('.txt'), e.kind === 'text', e.file);
       assert.ok(e.dir === 'device' || e.dir === 'bridge');
@@ -66,8 +72,10 @@ describe('fixtures on disk match the encoders', () => {
       if (e.expect === 'invalid') assert.equal(e.code, 'bad_msg');
       if (e.expect === 'valid' && e.kind === 'text') {
         // The encoders emit the frame and nothing else; a newline here would be an
-        // editor's doing and would make the file not the wire bytes.
-        assert.doesNotMatch(textOf(e), /[\r\n]/, e.file);
+        // editor's doing and would make the file not the wire bytes. A hand-written loose frame
+        // may contain line breaks BETWEEN tokens (the grammar allows them), never at the very end.
+        if (e.canonical === false) assert.doesNotMatch(textOf(e), /[\r\n]$/, e.file);
+        else assert.doesNotMatch(textOf(e), /[\r\n]/, e.file);
       }
     }
   });
@@ -82,7 +90,7 @@ describe('valid fixtures', () => {
   });
 
   it('decode, and re-encode to the same bytes', () => {
-    for (const e of valid) {
+    for (const e of valid.filter((x) => x.canonical !== false)) {
       if (e.kind === 'binary') {
         const r = decodeAudioFrame(bytesOf(e));
         assert.ok(r.ok, e.file);
@@ -102,6 +110,26 @@ describe('valid fixtures', () => {
     }
   });
 
+  it('the loose frames are accepted, mean what their note says, and really are not what the encoder writes', () => {
+    const want: Record<string, unknown> = {
+      'device-ping-noncanonical-whitespace.txt': { t: 'ping', n: 7 },
+      'device-ask_rsp-noncanonical-order.txt': { t: 'ask_rsp', id: '0a1b2c3d', ok: false },
+      'device-say-noncanonical-escapes.txt': { t: 'say', text: 'A/B A 0 "q" \\' },
+      'device-listen-noncanonical-escaped-key.txt': { t: 'listen', m: 'stop' },
+    };
+    const loose = valid.filter((e) => e.canonical === false);
+    assert.deepEqual(loose.map((e) => e.file).sort(), Object.keys(want).sort(), 'the set is the set the doc describes');
+    for (const e of loose) {
+      const r = decodeDeviceMsg(textOf(e));
+      assert.ok(r.ok, `${e.file}: ${r.ok ? '' : r.msg}`);
+      if (!r.ok) continue;
+      assert.deepEqual(r.msg, want[e.file], e.file);
+      const canonical = encodeDeviceMsg(r.msg);
+      assert.notEqual(canonical, textOf(e), `${e.file} is the canonical form, so it proves nothing about leniency`);
+      assert.deepEqual(decodeDeviceMsg(canonical), { ok: true, msg: r.msg }, `${e.file}: the canonical form means the same`);
+    }
+  });
+
   it('are refused by the OTHER direction\'s decoder, so `dir` means something', () => {
     for (const e of valid.filter((x) => x.kind === 'text')) {
       const r = e.dir === 'device' ? decodeBridgeMsg(textOf(e)) : decodeDeviceMsg(textOf(e));
@@ -115,6 +143,29 @@ describe('valid fixtures', () => {
       const max = e.dir === 'device' ? LIMITS.deviceFrameMax : LIMITS.bridgeFrameMax;
       assert.ok(bytesOf(e).length <= max, e.file);
     }
+  });
+
+  it('the largest fixture of each text type is exactly the worst-case frame PROTOCOL.md promises', () => {
+    // The doc says the fixtures include "the largest possible frame of each text type". It is the
+    // doc's own table that is checked, so a limit change that moves the table also moves this.
+    const doc = readFileSync(new URL('../PROTOCOL.md', import.meta.url), 'utf8');
+    const rows = doc.slice(doc.indexOf('WORST_CASE_TABLE')).split('\n').filter((l) => l.startsWith('| `'));
+    assert.ok(rows.length >= 14, 'the table was not found');
+    const documented = new Map(rows.map((l) => {
+      const cells = l.split('|').map((c) => c.trim().replace(/`/g, ''));
+      return [`${cells[3]}:${cells[1]}`, Number(cells[2])] as const;
+    }));
+    const largest = new Map<string, number>();
+    // The loose frames are bigger on purpose (whitespace, escapes) and are not what any side sends.
+    for (const e of valid.filter((x) => x.kind === 'text' && x.canonical !== false)) {
+      const r = e.dir === 'device' ? decodeDeviceMsg(textOf(e)) : decodeBridgeMsg(textOf(e));
+      assert.ok(r.ok, e.file);
+      if (!r.ok) continue;
+      const key = `${e.dir}:${r.msg.t}`;
+      largest.set(key, Math.max(largest.get(key) ?? 0, bytesOf(e).length));
+    }
+    assert.deepEqual([...documented.keys()].sort(), [...largest.keys()].sort(), 'every type, both directions');
+    for (const [key, size] of documented) assert.equal(largest.get(key), size, `${key}: the biggest fixture is not the biggest possible frame`);
   });
 
   describe('cover the whole contract (measured from the decoded fixtures, against the enums in types.ts)', () => {

@@ -21,9 +21,14 @@
  * A turn is running exactly while `base` is `thinking`. Tools exist only inside a
  * turn, so tool events and terminal events outside one are ignored, not adopted:
  * adopting a late `tool_start` would park the pet on `tool` with no terminal event
- * left to clear it. `asks` is the exception, on purpose. It is not an event of the
- * turn but a report of what is open right now, and hiding an ask that is open would
- * leave the player's panel idle while an approval waits on it.
+ * left to clear it. `asks` is the exception, on purpose, and the reducer treats it that
+ * way everywhere: it is not an event of the turn but a REPORT of what the approval manager
+ * has open right now, so only an `asks` input changes it. A terminal event, a stop or a
+ * new prompt leave it alone, because an ask can outlive its turn (a background task asking
+ * after the result) and hiding an ask that is open would leave the player's panel idle
+ * while an approval waits on it. The server therefore has nothing to re-assert after a
+ * terminal event: the one place that decides what is open is the manager, and the one input
+ * that mirrors it is `asks`.
  *
  * Guarantees the server relies on:
  *  - `reduce` never throws and never mutates its argument, for any input of the declared
@@ -61,7 +66,12 @@ export interface BridgeState {
 export type StateInput =
   | DriverEvent
   | { k: 'listen_start' } | { k: 'listen_stop' } | { k: 'listen_cancel' }
-  | { k: 'stt_done' }               // transcript accepted, a prompt is about to be sent
+  /**
+   * The transcript has been handed to the device. A dictated transcript never starts a turn
+   * by itself (PROTOCOL.md): the player reads it and the device sends a `say`, so this only
+   * ends the transcription and the pet rests.
+   */
+  | { k: 'stt_done' }
   | { k: 'prompt_sent' }
   | { k: 'asks'; count: number; label: string }   // open asks changed (label of the head ask, '' when none)
   | { k: 'aborted' }                // the USER stopped the turn
@@ -163,11 +173,12 @@ export function reduce(s: BridgeState, i: StateInput): BridgeState {
     case 'listen_cancel':
       return s.base === 'listening' || s.base === 'transcribing' ? patch(s, { base: 'idle' }) : s;
 
-    // `stt_done` and `prompt_sent` both start the turn, in that order for a dictated
-    // prompt. The second finds the turn already running and must not restart it, or a
-    // tool that began in between would be forgotten.
+    // The transcript is out; only a prompt (the player's SEND, as a `say`) starts a turn. A
+    // repeated or stray `stt_done` outside a transcription changes nothing.
     case 'stt_done':
-      return s.base === 'transcribing' ? startTurn(s) : s;
+      return s.base === 'transcribing' ? patch(s, { base: 'idle' }) : s;
+    // A second `prompt_sent` while the turn runs must not restart it, or a tool that began in
+    // between would be forgotten.
     case 'prompt_sent':
       return isTurnRunning(s) ? s : startTurn(s);
 
@@ -200,7 +211,8 @@ export function reduce(s: BridgeState, i: StateInput): BridgeState {
       // A user stop is not a failure. Only a `result` is the stopped turn's own ending;
       // a `fatal` means the session itself died, which the player should still see.
       const base: BasePhase = i.k === 'fatal' ? 'error' : s.aborting ? 'idle' : i.ok === true ? 'done' : 'error';
-      return patch(s, { base, tools: NO_TOOLS, asks: 0, askLabel: '', aborting: false });
+      // `asks` and `askLabel` are deliberately left as they are: see the header.
+      return patch(s, { base, tools: NO_TOOLS, aborting: false });
     }
 
     case 'aborted':

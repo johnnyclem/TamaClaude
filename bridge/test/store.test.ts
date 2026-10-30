@@ -6,7 +6,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import fs, { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { clearSession, isValidSessionId, loadSession, saveSession } from '../src/store.ts';
@@ -144,4 +145,33 @@ test('clearSession forgets the saved session, and forgetting nothing is fine', (
   assert.equal(loadSession(dir, CWD), undefined);
   assert.doesNotThrow(() => clearSession(dir));
   assert.doesNotThrow(() => clearSession(join(dir, 'never', 'existed')));
+});
+
+test('a save is atomic: when the final rename fails the old session is whole, and the new one is nowhere to be seen', (t) => {
+  const dir = scratch(t);
+  saveSession(dir, CWD, ID);
+  const before = readFileSync(file(dir), 'utf8');
+
+  // The write goes to a temporary file and only a rename makes it THE file. Make the rename the
+  // thing that fails (a power cut between the two steps looks exactly like this), and check that
+  // no byte of the new record reached the real path. A save that wrote the real path directly
+  // would have replaced the old record before anything could go wrong.
+  const real = fs.renameSync;
+  fs.renameSync = (): never => {
+    throw Object.assign(new Error('simulated failure between the write and the rename'), { code: 'EIO' });
+  };
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => saveSession(dir, CWD, 'replacement-id'), /simulated failure/);
+  } finally {
+    fs.renameSync = real;
+    syncBuiltinESMExports();
+  }
+  assert.equal(readFileSync(file(dir), 'utf8'), before, 'the old record is byte for byte intact');
+  assert.equal(loadSession(dir, CWD), ID);
+  assert.deepEqual(readdirSync(dir), ['session.json'], 'and the half-finished temporary file was cleaned up');
+
+  // Companion: with the rename working, the same call does replace it, so the failure above was the rename.
+  saveSession(dir, CWD, 'replacement-id');
+  assert.equal(loadSession(dir, CWD), 'replacement-id');
 });

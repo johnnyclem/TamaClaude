@@ -12,9 +12,9 @@ import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
-import { createServer as createNetServer } from 'node:net';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { connect as netConnect, createServer as createNetServer } from 'node:net';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { networkInterfaces, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { PassThrough } from 'node:stream';
@@ -22,18 +22,27 @@ import { WebSocketServer } from 'ws';
 import { DeviceClient } from '../src/device-client.ts';
 import { runFakeDevice } from '../tools/fake-device.ts';
 import {
+  buildClaudeConfig,
+  buildServerOptions,
   ConfigError,
   hardDenyFor,
   installShutdown,
   isLoopbackHost,
   listUrls,
+  needsAskFor,
   parseConfig,
   renderBanner,
   run,
+  USAGE,
 } from '../src/main.ts';
 import type { Config, Io } from '../src/main.ts';
+import { CHILD_ENV_NAMES, CHILD_ENV_PREFIXES } from '../src/drivers/claude.ts';
+import { DEFAULTS } from '../src/server.ts';
+import { AUTO_RUN_TOOLS } from '../src/tools.ts';
 import { saveSession } from '../src/store.ts';
 import { LIMITS } from '../src/types.ts';
+import type { DriverFactory } from '../src/types.ts';
+import { ScriptedStt } from '../src/stt.ts';
 
 const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const MAIN = join(ROOT, 'src', 'main.ts');
@@ -65,6 +74,10 @@ test('defaults: loopback, port 8787, fake delay 400, a generated 24-hex token, p
   assert.equal(c.cwd, '/work/project');
   assert.equal(c.newSession, false);
   assert.deepEqual(c.warnings, []);
+  assert.deepEqual(
+    { tokenSource: c.tokenSource, allowLocalDevice: c.allowLocalDevice, passEnv: c.passEnv, model: c.model, maxTurns: c.maxTurns },
+    { tokenSource: 'generated', allowLocalDevice: true, passEnv: [], model: undefined, maxTurns: undefined },
+  );
 });
 
 test('the real generator makes 24 lowercase hex characters, a different one each time', () => {
@@ -144,6 +157,8 @@ test('numbers are checked: whole, in range, and port 0 is allowed', () => {
   refuses(fake('--port', '80.5'), {}, /whole number/);
   assert.equal(cfg(fake('--ask-ttl-sec', '30', '--grace-sec', '0')).graceSec, 0);
   refuses(fake('--ask-ttl-sec', '0'), {}, /--ask-ttl-sec must be between 1/);
+  assert.equal(cfg(fake('--ask-ttl-sec', '3600')).askTtlSec, 3600, 'an hour is the longest an ask may wait');
+  refuses(fake('--ask-ttl-sec', '3601'), {}, /--ask-ttl-sec must be between 1 and 3600/);
   refuses(fake('--grace-sec', '99999'), {}, /--grace-sec must be between/);
   assert.equal(cfg(fake('--fake-delay-ms', '0')).fakeDelayMs, 0);
   assert.equal(cfg(fake('--fake-delay-ms', '50')).fakeDelayMs, 50);
@@ -178,7 +193,8 @@ test('setting sources: project and local by default; none, user and lists are ac
   const u = cfg(fake('--setting-sources', 'user,project'));
   assert.deepEqual(u.settingSources, ['user', 'project']);
   assert.equal(u.warnings.length, 1);
-  assert.match(u.warnings[0] ?? '', /WITHOUT asking/);
+  assert.match(u.warnings[0] ?? '', /permission rules and hooks are ignored/, 'the warning says what is still true, not what the old design allowed');
+  assert.doesNotMatch(u.warnings[0] ?? '', /WITHOUT asking/);
   refuses(fake('--setting-sources', 'project,global'), {}, /"global" is not one of/);
   refuses(fake('--setting-sources', ','), {}, /at least one/);
 });
@@ -272,7 +288,7 @@ test('run: --help prints the usage and starts nothing', async () => {
   assert.equal(r.exitCode, 0);
   assert.equal(r.server, undefined);
   const text = c.out.join('');
-  for (const flag of ['--host', '--port', '--token', '--cwd', '--fake-claude', '--fake-delay-ms', '--state-dir', '--new-session', '--ask-ttl-sec', '--grace-sec', '--setting-sources']) {
+  for (const flag of ['--host', '--port', '--token', '--token-file', '--allow-local-device', '--cwd', '--fake-claude', '--fake-delay-ms', '--model', '--max-turns', '--pass-env', '--state-dir', '--new-session', '--ask-ttl-sec', '--grace-sec', '--setting-sources']) {
     assert.ok(text.includes(flag), flag);
   }
 });
@@ -336,7 +352,8 @@ test('run: real mode wires the saved session through, and --new-session forgets 
   t.after(() => rmSync(work, { recursive: true, force: true }));
   saveSession(dir, work, 'saved-session-0001');
 
-  const args = ['--port', '0', '--cwd', work, '--state-dir', dir];
+  // The device below is on this machine, which a real-mode bridge refuses unless it is told to allow it.
+  const args = ['--port', '0', '--cwd', work, '--state-dir', dir, '--allow-local-device'];
   const c1 = capture();
   const r1 = await run(args, { ANTHROPIC_API_KEY: KEY }, c1.io, deps);
   assert.ok(r1.server);
@@ -378,6 +395,327 @@ test('the hard-deny veto handed to the real driver is the describer\'s own deny'
   assert.equal(deny('Read', { file_path: 'src/app.ts' }), undefined);
 });
 
+// ===========================================================================
+// The token file, local devices, and the child Claude runs in
+// ===========================================================================
+
+const tokenFile = (text: string, mode = 0o600): Parameters<typeof parseConfig>[2] => ({ ...deps, readTokenFile: () => ({ text, mode }) });
+const real = (...a: string[]): string[] => a;
+const KEYENV = { ANTHROPIC_API_KEY: KEY };
+
+test('--token-file: the secret comes from the file, trimmed, is never shown, and is never on the command line', () => {
+  let asked = '';
+  const c = parseConfig(fake('--token-file', 'secrets/bridge.token'), { BRIDGE_TOKEN: 'from-the-environment-0123' }, {
+    ...deps,
+    readTokenFile: (path) => {
+      asked = path;
+      return { text: `${SUPPLIED}\n`, mode: 0o600 };
+    },
+  });
+  assert.equal(asked, resolve('/work/project', 'secrets/bridge.token'), 'a relative path is relative to where you ran it');
+  assert.deepEqual([c.token, c.tokenSource, c.tokenGenerated, c.warnings], [SUPPLIED, 'file', false, []], 'and it beats the environment');
+  const banner = renderBanner(c, ['ws://127.0.0.1:8787/']).join('\n');
+  assert.equal(banner.includes(SUPPLIED), false);
+  assert.match(banner, /token file/);
+});
+
+test('--token-file: a file others can read is warned about; an empty, missing, short or doubled one is refused', () => {
+  const loose = parseConfig(fake('--token-file', '/t'), {}, tokenFile(SUPPLIED, 0o644));
+  assert.equal(loose.warnings.length, 1);
+  assert.match(loose.warnings[0] ?? '', /can be read by other users \(mode 644\).*chmod 600/);
+  assert.deepEqual(parseConfig(fake('--token-file', '/t'), {}, tokenFile(SUPPLIED, 0o600)).warnings, [], 'companion: 0600 is fine');
+  assert.deepEqual(parseConfig(fake('--token-file', '/t'), {}, tokenFile(SUPPLIED, 0o400)).warnings, [], 'and so is 0400');
+
+  const refuse = (argv: string[], d: Parameters<typeof parseConfig>[2], re: RegExp): void =>
+    assert.throws(() => parseConfig(argv, {}, d), (e: unknown) => e instanceof ConfigError && re.test(e.message), JSON.stringify(argv));
+  refuse(fake('--token-file', '/t'), tokenFile('  \n'), /is empty/);
+  refuse(fake('--token-file', '/t'), tokenFile('short'), /at least 16/);
+  refuse(fake('--token-file', '/t'), tokenFile('has a space inside it 123'), /may only use/);
+  refuse(fake('--token-file', '/t', '--token', SUPPLIED), tokenFile(SUPPLIED), /give one of them/);
+  refuse(fake('--token-file', '/nope'), { ...deps, readTokenFile: () => { throw Object.assign(new Error('boom'), { code: 'ENOENT' }); } }, /Cannot read --token-file \/nope \(ENOENT\)/);
+});
+
+test('--token-file reads a real file, and its mode is the real mode', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'tamaclaude-tok-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const f = join(dir, 'token');
+  writeFileSync(f, `${SUPPLIED}\n`);
+  chmodSync(f, 0o600);
+  const ok = parseConfig(fake('--token-file', f), {}, deps);
+  assert.deepEqual([ok.token, ok.warnings], [SUPPLIED, []]);
+  chmodSync(f, 0o640);
+  assert.match(parseConfig(fake('--token-file', f), {}, deps).warnings[0] ?? '', /mode 640/);
+});
+
+test('where the token came from decides what is said: a flag warns about ps, the environment is named, a generated one is shown once', () => {
+  const flag = cfg(fake('--token', SUPPLIED));
+  assert.equal(flag.tokenSource, 'argv');
+  assert.equal(flag.warnings.length, 1);
+  assert.match(flag.warnings[0] ?? '', /--token puts the secret on the command line.*'ps'.*--token-file/);
+  const env = cfg(fake(), { BRIDGE_TOKEN: SUPPLIED });
+  assert.deepEqual([env.tokenSource, env.warnings], ['env', []]);
+  assert.match(renderBanner(env, ['ws://x/']).join('\n'), /from BRIDGE_TOKEN.*every process of your user/);
+  assert.deepEqual([cfg(fake()).tokenSource, cfg(fake('--token', '')).tokenSource], ['generated', 'generated']);
+  for (const c of [flag, env]) assert.equal(renderBanner(c, ['ws://x/']).join('\n').includes(SUPPLIED), false, c.tokenSource);
+});
+
+test('--allow-local-device: real mode refuses a device on this machine unless told; fake mode always allows it; each case says so', () => {
+  assert.equal(cfg(fake()).allowLocalDevice, true);
+  assert.equal(cfg(fake('--allow-local-device')).allowLocalDevice, true);
+  assert.equal(cfg(real(), KEYENV).allowLocalDevice, false, 'the default of real mode is the safe one');
+  assert.equal(cfg(real('--allow-local-device'), KEYENV).allowLocalDevice, true);
+
+  // The default real run on the default host can never be reached by anything; say so.
+  const stuck = cfg(real(), KEYENV);
+  assert.equal(stuck.warnings.length, 1);
+  assert.match(stuck.warnings[0] ?? '', /No device can connect.*refuses a device on its own machine.*--allow-local-device/);
+  // A host that other machines can reach has nothing to warn about...
+  assert.deepEqual(cfg(real('--host', '0.0.0.0'), KEYENV).warnings.filter((w) => /No device/.test(w)), []);
+  // ...and allowing the local one is a risk the operator is told they took.
+  const risky = cfg(real('--allow-local-device'), KEYENV);
+  assert.equal(risky.warnings.length, 1);
+  assert.match(risky.warnings[0] ?? '', /can connect as the device.*approve its own asks.*emulator only/);
+  assert.deepEqual(cfg(fake()).warnings, [], 'fake mode has no such risk');
+});
+
+test('--pass-env: names are validated, split on commas, repeatable; the secrets that must never reach Claude are refused loudly', () => {
+  assert.deepEqual(cfg(real('--pass-env', 'SSH_AUTH_SOCK'), KEYENV).passEnv, ['SSH_AUTH_SOCK']);
+  assert.deepEqual(cfg(real('--pass-env', 'A_ONE, B_TWO', '--pass-env', 'C_3,A_ONE'), KEYENV).passEnv, ['A_ONE', 'B_TWO', 'C_3'], 'trimmed and de-duplicated');
+  assert.deepEqual(cfg(real(), KEYENV).passEnv, []);
+  for (const name of ['BRIDGE_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS']) {
+    refuses(real('--pass-env', name), KEYENV, new RegExp(`--pass-env ${name} is refused`), name);
+  }
+  refuses(real('--pass-env', 'SSH_AUTH_SOCK,BRIDGE_TOKEN'), KEYENV, /BRIDGE_TOKEN is refused: it is the credential/, 'among others');
+  for (const bad of ['has space', '1LEADING', 'a=b', 'a;rm', '$(x)']) refuses(real('--pass-env', bad), KEYENV, /not an environment variable name/, bad);
+  refuses(['--fake-claude', '--pass-env', 'A'], {}, /--pass-env only applies to the real Claude/);
+});
+
+test('--model and --max-turns: checked, passed on, shown in the banner, and meaningless in fake mode', () => {
+  const c = cfg(real('--model', 'claude-sonnet-4-5', '--max-turns', '12'), KEYENV);
+  assert.deepEqual([c.model, c.maxTurns], ['claude-sonnet-4-5', 12]);
+  assert.match(renderBanner(c, ['ws://x/']).join('\n'), /model claude-sonnet-4-5, at most 12 turns a prompt/);
+  assert.match(renderBanner(cfg(real(), KEYENV), ['ws://x/']).join('\n'), /model default/);
+  assert.equal(cfg(real('--model', 'claude-opus-4-1[1m]'), KEYENV).model, 'claude-opus-4-1[1m]');
+  for (const bad of ['', ' x', 'a b', '--max-turns', 'x;y', 'é', 'x'.repeat(101)]) refuses(real('--model', bad), KEYENV, /does not look like a model id|argument/, JSON.stringify(bad));
+  refuses(real('--max-turns', '0'), KEYENV, /--max-turns must be between 1 and 1000/);
+  refuses(real('--max-turns', '1001'), KEYENV, /--max-turns must be between 1 and 1000/);
+  refuses(real('--max-turns', 'many'), KEYENV, /whole number/);
+  refuses(['--fake-claude', '--model', 'x'], {}, /--model only applies to the real Claude/);
+  refuses(['--fake-claude', '--max-turns', '3'], {}, /--max-turns only applies to the real Claude/);
+});
+
+test('the real-mode banner says what runs without a tap, which devices are accepted, and which settings are read', () => {
+  const text = renderBanner(cfg(real('--host', '0.0.0.0'), KEYENV), ['ws://x/']).join('\n');
+  assert.match(text, /no tap  Read, Glob, Grep, LS, NotebookRead inside the working directory; every other call asks the device first/);
+  assert.match(text, /devices only on other machines/);
+  assert.match(text, /settings project, local: CLAUDE\.md and env apply; their permission rules and hooks are ignored/);
+  assert.match(renderBanner(cfg(real('--setting-sources', 'none'), KEYENV), ['ws://x/']).join('\n'), /settings none are read/);
+  assert.match(renderBanner(cfg(real('--allow-local-device'), KEYENV), ['ws://x/']).join('\n'), /devices on this machine AND elsewhere/);
+  const fakeText = renderBanner(cfg(fake()), ['ws://x/']).join('\n');
+  assert.doesNotMatch(fakeText, /no tap|settings|devices/, 'none of it applies to the scripted Claude');
+});
+
+// ===========================================================================
+// run()'s wiring, line by line
+// ===========================================================================
+
+test('buildClaudeConfig: the key, the settings, the hard-deny, the tap rule, the child environment and the model', () => {
+  const env = { ANTHROPIC_API_KEY: `  ${KEY}\n`, BRIDGE_TOKEN: SUPPLIED, OTHER: 'x' };
+  const c = cfg(real('--pass-env', 'SSH_AUTH_SOCK', '--model', 'm-1', '--max-turns', '9'), env);
+  const d = buildClaudeConfig(c, env);
+  assert.equal(d.apiKey, KEY, 'the key comes from the environment, trimmed');
+  assert.deepEqual(d.passEnv, ['SSH_AUTH_SOCK']);
+  assert.equal(d.model, 'm-1');
+  assert.equal(d.maxTurns, 9);
+  assert.equal(JSON.stringify(d).includes(SUPPLIED), false, 'the bridge token is nowhere in what the driver is given');
+
+  // Which settings files are read is exactly what was asked for, including "none".
+  assert.deepEqual(d.settingSources, ['project', 'local']);
+  assert.deepEqual(buildClaudeConfig(cfg(real('--setting-sources', 'none'), env), env).settingSources, []);
+  assert.deepEqual(buildClaudeConfig(cfg(real('--setting-sources', 'user,project'), env), env).settingSources, ['user', 'project']);
+
+  // Without the optional flags the driver is not given the options at all.
+  const plain = buildClaudeConfig(cfg(real(), KEYENV), KEYENV);
+  assert.equal('model' in plain, false);
+  assert.equal('maxTurns' in plain, false);
+  assert.deepEqual(plain.passEnv, []);
+
+  // The veto and the tap rule are the describer's, relative to the working directory that was configured.
+  const deny = d.hardDeny;
+  const ask = d.needsAsk;
+  assert.ok(deny && ask, 'both are set: with no needsAsk the driver would ask about everything, with no hardDeny about nothing');
+  assert.match(deny('Bash', { command: 'rm -rf ~' }) ?? '', /recursive delete/);
+  assert.equal(deny('Bash', { command: 'npm test' }), undefined);
+  assert.equal(deny('Bash', { command: 'rm -rf .' }), undefined, 'deleting the project\'s own contents is the human\'s call in /work/project...');
+  assert.match(buildClaudeConfig(cfg(real('--cwd', '/'), env), env).hardDeny?.('Bash', { command: 'rm -rf .' }) ?? '', /recursive delete/, '...and the root\'s in /');
+  assert.equal(ask('Read', { file_path: '/work/project/src/app.ts' }), false, 'a read inside the project runs without a tap');
+  assert.equal(ask('Read', { file_path: 'src/app.ts' }), false);
+  for (const [tool, input] of [
+    ['Read', { file_path: '/etc/hostname' }],
+    ['Bash', { command: 'ls' }],
+    ['Write', { file_path: 'a.txt', content: 'x' }],
+    ['WebFetch', { url: 'https://example.com/' }],
+    ['mcp__x__y', { a: 1 }],
+  ] as const) {
+    assert.equal(ask(tool, { ...input }), true, `${tool} needs a tap`);
+  }
+  // The same function the rest of the bridge uses: no second opinion.
+  assert.equal(needsAskFor('/work/project')('Bash', { command: 'ls' }), true);
+});
+
+test('buildServerOptions: seconds become milliseconds, the host is the flag, the recognizer is canned only in fake mode', async () => {
+  const factory: DriverFactory = () => {
+    throw new Error('not used');
+  };
+  const log = (): void => {};
+  const r = buildServerOptions(cfg(real('--host', '10.1.2.3', '--port', '9000', '--ask-ttl-sec', '30', '--grace-sec', '7', '--cwd', '/srv/app', '--token', SUPPLIED), KEYENV), factory, { stateDir: '/var/state', log });
+  assert.deepEqual(
+    { host: r.host, port: r.port, token: r.token, cwd: r.cwd, askTtlMs: r.askTtlMs, graceMs: r.graceMs, allowLocalDevice: r.allowLocalDevice, stateDir: r.stateDir },
+    { host: '10.1.2.3', port: 9000, token: SUPPLIED, cwd: '/srv/app', askTtlMs: 30_000, graceMs: 7_000, allowLocalDevice: false, stateDir: '/var/state' },
+  );
+  assert.equal(r.driverFactory, factory);
+  assert.equal(r.log, log);
+  assert.equal('stt' in r, false, 'real mode has no recognizer: listen stop says "not set up" rather than pretending');
+
+  const f = buildServerOptions(cfg(fake()), factory);
+  assert.ok(f.stt instanceof ScriptedStt, 'fake mode can dictate');
+  assert.equal(await f.stt.transcribe(Buffer.alloc(2)), 'please run the tests');
+  assert.equal(f.allowLocalDevice, true, 'the scripted demo runs on this machine');
+  assert.equal('stateDir' in f, false, 'and keeps no state');
+
+  assert.equal(buildServerOptions(cfg(real('--allow-local-device'), KEYENV), factory).allowLocalDevice, true);
+  // The defaults the CLI hands over are the defaults the server would use itself.
+  const d = buildServerOptions(cfg(fake()), factory);
+  assert.deepEqual([d.askTtlMs, d.graceMs], [DEFAULTS.askTtlMs, DEFAULTS.graceMs]);
+});
+
+const nonLoopback = (): string | undefined =>
+  Object.values(networkInterfaces()).flat().find((a) => a !== undefined && !a.internal && a.family === 'IPv4')?.address;
+
+/** Resolves with how a TCP connection attempt ended: 'connected' or the error code. */
+function tcp(host: string, port: number): Promise<string> {
+  return new Promise((resolve) => {
+    const s = netConnect({ host, port });
+    s.once('connect', () => {
+      s.destroy();
+      resolve('connected');
+    });
+    s.once('error', (e: NodeJS.ErrnoException) => resolve(e.code ?? 'error'));
+  });
+}
+
+test('run: a default run listens on loopback only, and the bound address says so; a wildcard host really is reachable', async (t) => {
+  // 127.0.0.2 is loopback on Linux but is not 127.0.0.1: a server bound to a wildcard answers there, one bound to
+  // 127.0.0.1 does not. It stands in for "another address of this machine" where there is no network interface.
+  const other = nonLoopback() ?? (process.platform === 'linux' ? '127.0.0.2' : undefined);
+  if (other === undefined) return t.skip('no second address on this machine to probe');
+
+  const work = mkdtempSync(join(tmpdir(), 'tamaclaude-cwd-'));
+  t.after(() => rmSync(work, { recursive: true, force: true }));
+  const c1 = capture();
+  const r1 = await run(['--port', '0', '--cwd', work, '--allow-local-device'], KEYENV, c1.io, deps);
+  assert.ok(r1.server);
+  t.after(() => r1.server?.close());
+  assert.equal(r1.server.host, '127.0.0.1', 'bound to the host that was asked for, which is the default');
+  assert.equal(await tcp('127.0.0.1', r1.server.port), 'connected', 'the probe works at all');
+  assert.equal(await tcp(other, r1.server.port), 'ECONNREFUSED', `and ${other} is not served`);
+
+  // Companion: the same probe DOES get through to a server that was told to listen on every interface.
+  const c2 = capture();
+  const r2 = await run(fake('--port', '0', '--host', '0.0.0.0', '--cwd', work), {}, c2.io, deps);
+  assert.ok(r2.server);
+  t.after(() => r2.server?.close());
+  assert.equal(r2.server.host, '0.0.0.0');
+  assert.equal(await tcp(other, r2.server.port), 'connected', 'so the refusal above was the bind address and not the network');
+});
+
+test('run: real mode turns a device on this machine away unless --allow-local-device, and says so before anyone asks', async (t) => {
+  const work = mkdtempSync(join(tmpdir(), 'tamaclaude-cwd-'));
+  t.after(() => rmSync(work, { recursive: true, force: true }));
+  const closed = capture();
+  const r1 = await run(['--port', '0', '--cwd', work], KEYENV, closed.io, deps);
+  assert.ok(r1.server);
+  t.after(() => r1.server?.close());
+  assert.match(closed.out.join(''), /WARNING No device can connect/);
+  await assert.rejects(DeviceClient.connect(r1.server.url, GEN), /403/, 'even with the right token');
+  assert.match(closed.err.join(''), /admission: refused 1 connection\(s\): refused a device on this machine/);
+
+  const open = capture();
+  const r2 = await run(['--port', '0', '--cwd', work, '--allow-local-device'], KEYENV, open.io, deps);
+  assert.ok(r2.server);
+  t.after(() => r2.server?.close());
+  assert.match(open.out.join(''), /WARNING --allow-local-device: a process on this machine can connect as the device/);
+  const dev = await DeviceClient.connect(r2.server.url, GEN);
+  assert.equal(dev.ack?.ok, true);
+  dev.terminate();
+  assert.equal((open.out.join('') + open.err.join('')).includes(KEY), false);
+});
+
+test('run: a token from --token-file is what the device must send, and it appears nowhere in the output', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'tamaclaude-tok-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const f = join(dir, 'token');
+  writeFileSync(f, `${SUPPLIED}\n`, { mode: 0o600 });
+  const c = capture();
+  const r = await run(fake('--port', '0', '--fake-delay-ms', '0', '--cwd', ROOT, '--token-file', f), {}, c.io, deps);
+  assert.ok(r.server);
+  t.after(() => r.server?.close());
+  assert.equal((await DeviceClient.connect(r.server.url, SUPPLIED)).ack?.ok, true);
+  await assert.rejects(DeviceClient.connect(r.server.url, GEN), /token/, 'and the generator was not consulted');
+  assert.equal((c.out.join('') + c.err.join('')).includes(SUPPLIED), false);
+});
+
+test('fake-device: told no by a real-mode bridge on its own machine, it says which flag lets it in', async (t) => {
+  const work = mkdtempSync(join(tmpdir(), 'tamaclaude-cwd-'));
+  t.after(() => rmSync(work, { recursive: true, force: true }));
+  const c = capture();
+  const r = await run(['--port', '0', '--cwd', work], KEYENV, c.io, deps);
+  assert.ok(r.server);
+  t.after(() => r.server?.close());
+  const err: string[] = [];
+  const code = await runFakeDevice(['--url', r.server.url, '--token', GEN], {}, {
+    out: () => {},
+    err: (s) => void err.push(s),
+    input: new PassThrough(),
+    tty: false,
+  });
+  assert.equal(code, 1);
+  assert.match(err.join(''), /Could not connect.*403/);
+  assert.match(err.join(''), /--allow-local-device/);
+  assert.equal(err.join('').includes(GEN), false, 'the token is never echoed');
+});
+
+// ===========================================================================
+// README.md is held to the code on the points that are security claims
+// ===========================================================================
+
+test('README: lists every flag, the exact set that runs without a tap, and the exact environment the child gets', () => {
+  const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+  const flagsTable = readme.slice(readme.indexOf('## Flags'), readme.indexOf('`SIGINT` and `SIGTERM`'));
+  const usage = [...USAGE.matchAll(/^\s+(?:-h, )?(--[a-z-]+)/gm)].map((m) => m[1]!);
+  assert.ok(usage.length >= 16, 'the usage text was not read');
+  for (const flag of usage.filter((f) => f !== '--help')) assert.ok(flagsTable.includes(`\`${flag}\``), `${flag} is not in the README's flags table`);
+
+  // "Exactly these calls run without a tap": the bullet names precisely AUTO_RUN_TOOLS.
+  const bullet = /\*\*Exactly these calls run without a tap: ([^*]*)\*\*/.exec(readme)?.[1];
+  assert.ok(bullet, 'the README no longer states which calls run without a tap');
+  const named = [...bullet.matchAll(/`([A-Za-z]+)`/g)].map((m) => m[1]!);
+  assert.deepEqual(named.sort(), [...AUTO_RUN_TOOLS].sort(), 'the README and tools.ts disagree about what needs no tap');
+
+  // The environment allowlist, by name.
+  const env = readme.slice(readme.indexOf('### What the commands Claude runs can see'), readme.indexOf('### Who may connect'));
+  for (const name of [...CHILD_ENV_NAMES].filter((n) => n === n.toUpperCase() || !CHILD_ENV_NAMES.has(n.toUpperCase()))) {
+    assert.ok(env.includes(`\`${name}\``), `${name} is passed to the child but the README does not say so`);
+  }
+  for (const prefix of CHILD_ENV_PREFIXES) assert.ok(env.includes(`\`${prefix}*\``), `${prefix}* is passed but not in the README`);
+  assert.match(env, /`BRIDGE_TOKEN`[^.]*stay behind/);
+
+  // No claim the code no longer makes.
+  assert.doesNotMatch(readme, /one-line change/);
+  assert.doesNotMatch(readme, /Where this implementation and PROTOCOL\.md differ/);
+  assert.doesNotMatch(readme, /xxd/, 'the token recipe silently produced an empty token without xxd');
+});
+
 test('installShutdown: a signal closes the server then exits 0; a second signal forces exit 1', async () => {
   const handlers = new Map<string, () => void>();
   const exits: number[] = [];
@@ -389,6 +727,7 @@ test('installShutdown: a signal closes the server then exits 0; a second signal 
   let finish: () => void = () => {};
   const server = {
     port: 0,
+    host: '127.0.0.1',
     url: '',
     close: () => {
       closed += 1;
@@ -544,9 +883,15 @@ test('fake-device: /n denies, /a aborts, /l dictates through the listen path', a
   dev.write('/y\n'); // nothing to answer yet
   await dev.waitOut(/no ask is open/);
 
+  dev.write('/send\n'); // nothing has been heard yet
+  await dev.waitOut(/nothing was heard yet/);
+
   dev.write('/l\n'); // the canned recognizer hears "please run the tests"
   await dev.waitOut(/\(O_O\)>\s+listening/);
   await dev.waitOut(/heard: "please run the tests"/);
+  await dev.waitOut(/heard: "please run the tests"[^]*\(o_o\)\s+idle/); // and the pet rests: nothing has been sent
+  assert.doesNotMatch(dev.out(), /APPROVE\?/, 'dictation alone asked for nothing');
+  dev.write('/send\n'); // the player's SEND tap
   await dev.waitOut(/APPROVE\?/);
   dev.write('/n\n');
   await dev.waitOut(/RESULT \(ok\):.*denied/);
@@ -574,6 +919,23 @@ test('fake-device: when input ends it waits for the turn to finish, then leaves'
   const { code } = await dev.exited;
   assert.equal(code, 0, dev.err());
   assert.match(dev.out(), /RESULT \(ok\): You said: hello from a script/);
+});
+
+test('fake-device: when input ends right after a dictation it leaves, because no turn follows a transcript', async (t) => {
+  const { url } = await startBridge(t);
+  const dev = spawnNode(t, DEVICE, ['--url', url], { BRIDGE_TOKEN: SUPPLIED });
+  await dev.waitOut(/\(o_o\)\s+idle/);
+  dev.write('/l\n');
+  dev.end();
+  // A device that waited for a result would wait for ever: nothing runs until the transcript is sent.
+  const done = await Promise.race([
+    dev.exited,
+    new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 8000).unref()),
+  ]);
+  assert.notEqual(done, 'hung', 'it is still waiting for a result that is not coming');
+  assert.equal((done as { code: number | null }).code, 0, dev.err());
+  assert.match(dev.out(), /heard: "please run the tests"/);
+  assert.doesNotMatch(dev.out(), /APPROVE\?/);
 });
 
 test('fake-device: a rejected hello exits non-zero with the reason, and never prints the token', async (t) => {

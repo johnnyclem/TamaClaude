@@ -10,7 +10,11 @@
  *   /y  /n       allow or deny the ask that is open (the only way to approve anything)
  *   /a           abort the running turn
  *   /l           dictate: send a short burst of audio through the listen path
+ *   /send        send the last thing heard as a prompt (the player's SEND tap)
  *   /q           quit
+ *
+ * A dictated transcript is only SHOWN: the bridge never runs it by itself. /send is the tap
+ * that makes the device send it back as a `say`, exactly as the handheld's SEND button will.
  *
  * It is a thin shell over src/device-client.ts, which the end-to-end tests drive too, so
  * the code a person types into is the code the tests exercise.
@@ -51,7 +55,8 @@ export const FACES: Readonly<Record<Phase, string>> = {
 const BELL = '\x07';
 const HELP = [
   'Type a request and press enter to send it.',
-  '  /y /n   allow or deny the open ask    /a  abort    /l  dictate    /q  quit',
+  '  /y /n   allow or deny the open ask    /a  abort    /q  quit',
+  '  /l      dictate (then /send to send what was heard)',
 ].join('\n');
 
 const USAGE = `Usage: node tools/fake-device.ts [--url ws://127.0.0.1:8787] [--token <token>]
@@ -116,7 +121,7 @@ function render(m: BridgeMsg): string | undefined {
     case 'result':
       return `RESULT (${m.ok ? 'ok' : 'failed'}): ${m.text}`;
     case 'stt':
-      return `heard: "${m.text}"`;
+      return `heard: "${m.text}"   (nothing runs until you /send it)`;
     case 'err':
       return `!! ${m.code}`;
     case 'pong':
@@ -149,7 +154,11 @@ export async function runFakeDevice(
       return 2;
     }
     // The URL is the person's own and safe to echo; the token never appears in an error.
-    io.err(`Could not connect to ${args.url}: ${err instanceof Error ? err.message : String(err)}\n`);
+    const why = err instanceof Error ? err.message : String(err);
+    io.err(`Could not connect to ${args.url}: ${why}\n`);
+    // A real-mode bridge turns away a device on its own machine with a 403, and that is the one
+    // refusal a person at a desk is likely to meet and unlikely to guess.
+    if (/\b403\b/.test(why)) io.err('A bridge in real mode refuses a device on its own machine unless it was started with --allow-local-device.\n');
     return 1;
   }
 
@@ -159,9 +168,16 @@ export async function runFakeDevice(
   let quitting = false;
   /** A prompt or utterance has gone out and its result has not come back. */
   let inFlight = false;
+  /** The last transcript the bridge showed, waiting for the player's SEND. */
+  let heard: string | undefined;
 
   const show = (m: BridgeMsg): void => {
     if (m.t === 'result' || m.t === 'err') inFlight = false;
+    // A transcript ends the dictation; no turn follows it until it is sent.
+    if (m.t === 'stt') {
+      heard = m.text;
+      inFlight = false;
+    }
     const line = render(m);
     if (line !== undefined) io.out(`${line}\n`);
   };
@@ -205,6 +221,17 @@ export async function runFakeDevice(
           inFlight = true;
           client.speak();
           return;
+        case '/send': {
+          if (heard === undefined) {
+            io.out('nothing was heard yet; /l dictates\n');
+            return;
+          }
+          const text = heard;
+          heard = undefined;
+          inFlight = true;
+          client.say(text);
+          return;
+        }
         case '/help':
         case '/?':
           io.out(`${HELP}\n`);

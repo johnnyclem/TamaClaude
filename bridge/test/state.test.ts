@@ -91,7 +91,8 @@ const TABLE: readonly Row[] = [
   // The input path: idle -> listening -> transcribing -> thinking.
   row('idle', listenStart, 'listening'),
   row('listening', listenStop, 'transcribing'),
-  row('transcribing', sttDone, 'thinking'),
+  // A transcript never starts a turn by itself: it is shown, and only a prompt starts one.
+  row('transcribing', sttDone, 'idle'),
   row('transcribing', promptSent, 'thinking'),
   row('listening', listenCancel, 'idle'),
   row('transcribing', listenCancel, 'idle'),
@@ -154,16 +155,18 @@ const TABLE: readonly Row[] = [
   row('thinking', asks(0), 'thinking'),
   row('idle', asks(0), 'idle'),
 
-  // A terminal event ends the turn and takes the tools and asks with it.
+  // A terminal event ends the turn and takes the tools with it. It does NOT take the asks: they
+  // are what the approval manager has open, an ask can outlive its turn, and the panel must
+  // keep showing one that is still answerable.
   row('thinking', result(), 'done'),
   row('thinking', result(false), 'error'),
   row('thinking', fatal, 'error'),
   row('tool', result(), 'done', '', 0),
   row('tool', result(false), 'error', '', 0),
   row('tool', fatal, 'error', '', 0),
-  row('asking', result(), 'done', '', 0),
-  row('asking', result(false), 'error', '', 0),
-  row('asking', fatal, 'error', '', 0),
+  row('asking', result(), 'asking', 'Bash', 1),
+  row('asking', result(false), 'asking', 'Bash', 1),
+  row('asking', fatal, 'asking', 'Bash', 1),
 
   // Terminal events with no turn to end change nothing. In particular a repeat must not
   // flip a settled error into a success, and a stray one must not invent a turn.
@@ -439,13 +442,25 @@ describe('asks', () => {
     assert.doesNotThrow(() => encodeBridgeMsg(huge));
   });
 
-  it('are cleared by a terminal event even if the server never reports them closed', () => {
+  it('outlive their turn: a terminal event leaves them as the approval manager reported them', () => {
+    // The state's `asks` is a report of what is open, so only an `asks` input changes it. The
+    // old rule (a terminal event zeroed it) made the server re-read the manager after every
+    // ending, and a caller that forgot told the device `idle, pend 0` with an ask on its screen.
     for (const end of [result(), result(false), fatal, stopped]) {
       const s = fold(promptSent, asks(2, 'Bash'), end);
-      assert.equal(s.asks, 0);
-      assert.equal(s.askLabel, '');
-      assert.equal(view(s).pend, 0);
+      assert.equal(s.asks, 2, JSON.stringify(end));
+      assert.equal(s.askLabel, 'Bash');
+      assert.deepEqual(view(s), { ph: 'asking', tl: 'Bash', pend: 2 });
+      // ...and it goes away exactly when the manager says so, resting where the turn left it.
+      assert.deepEqual(view(reduce(s, asks(0))), { ph: s.base === 'idle' ? 'idle' : s.base, tl: '', pend: 0 });
     }
+  });
+
+  it('a settled turn does not hide an ask that is still open, nor does the next prompt drop it', () => {
+    const s = fold(promptSent, asks(1, 'Edit'), result(), settle);
+    assert.deepEqual(view(s), { ph: 'asking', tl: 'Edit', pend: 1 });
+    assert.deepEqual(view(reduce(s, asks(0))), { ph: 'idle', tl: '', pend: 0 }, 'closed at last: back to rest');
+    assert.deepEqual(view(reduce(s, promptSent)), { ph: 'asking', tl: 'Edit', pend: 1 }, 'a new turn is no reason to forget it');
   });
 
   it('are shown even with no turn running, because an open ask is a fact, and settle back afterwards', () => {
@@ -570,8 +585,8 @@ describe('whole turns', () => {
     replay([
       [listenStart, 'listening'],
       [listenStop, 'transcribing'],
-      [sttDone, 'thinking'],
-      [promptSent, 'thinking'],
+      [sttDone, 'idle'],                 // the transcript is shown; nothing runs yet
+      [promptSent, 'thinking'],          // the player's SEND, as a `say`
       [{ k: 'session', id: 's1' }, 'thinking'],
       [{ k: 'text', text: 'I will run the tests.' }, 'thinking'],
       [toolStart('t1', 'Bash'), 'tool', 'Bash', 0],
@@ -682,7 +697,8 @@ describe('whole turns', () => {
       [result(), 'done'],
       [listenStart, 'listening'],
       [listenStop, 'transcribing'],
-      [sttDone, 'thinking'],
+      [sttDone, 'idle'],
+      [promptSent, 'thinking'],
       [result(), 'done'],
     ]);
   });
@@ -794,7 +810,7 @@ describe('toStateMsg', () => {
     assert.equal(toStateMsg(fold(asks(2, 'A')), 1).pend, 2);
     assert.equal(toStateMsg(fold(promptSent, toolStart('a'), asks(3, 'A')), 1).pend, 3);
     assert.equal(toStateMsg(fold(promptSent, toolStart('a')), 1).pend, 0);
-    assert.equal(toStateMsg(fold(promptSent, asks(1, 'A'), result()), 1).pend, 0);
+    assert.equal(toStateMsg(fold(promptSent, asks(1, 'A'), result()), 1).pend, 1, 'an ask outlives the turn that raised it');
   });
 
   it('is accepted by the wire encoder in every phase', () => {
@@ -848,9 +864,16 @@ describe('fuzz: 5000 random inputs from a seeded generator', () => {
         const input = randomInput(rand);
         const before = JSON.stringify(s);
         const prevPhase = phaseOf(s);
+        const prevAsks = s.asks;
+        const prevLabel = s.askLabel;
         const next = reduce(s, input);
         assert.equal(JSON.stringify(s), before, `step ${n}: the previous state was modified by ${input.k}`);
         s = next;
+        // The one rule about asks: they are a report, and only a report changes them.
+        if (input.k !== 'asks') {
+          assert.equal(s.asks, prevAsks, `step ${n}: ${input.k} changed the number of open asks`);
+          assert.equal(s.askLabel, prevLabel, `step ${n}: ${input.k} changed the label of the open ask`);
+        }
 
         const msg = toStateMsg(s, ++seq);
         const where = `step ${n} (${input.k}) -> ${JSON.stringify({ ph: msg.ph, tl: msg.tl.slice(0, 20), pend: msg.pend })}`;
@@ -868,7 +891,8 @@ describe('fuzz: 5000 random inputs from a seeded generator', () => {
         assert.equal(msg.ph === 'asking', msg.pend > 0, where);
         // Tools only exist inside a turn.
         if (s.tools.length > 0) assert.equal(s.base, 'thinking', where);
-        // A terminal event ends a turn that was visibly running, and leaves nothing open.
+        // A terminal event ends a turn that was visibly running; nothing was open (an open ask
+        // would have shown as `asking`), so nothing is open afterwards either.
         if ((input.k === 'result' || input.k === 'fatal') && (prevPhase === 'thinking' || prevPhase === 'tool')) {
           assert.ok(msg.ph === 'done' || msg.ph === 'error' || msg.ph === 'idle', where);
           assert.equal(msg.pend, 0, where);

@@ -1,174 +1,84 @@
 /**
  * Driver tests against a scripted fake of the SDK's `query()`.
  *
- * Nothing here has touched the live API (there is no key in the build sandbox), so these
- * tests are the whole of the evidence for the driver's behaviour. What they establish is
- * the driver's contract with the SDK as the typings describe it. What they cannot
- * establish is that the real CLI honours that contract (that hooks really run before
- * allow rules, that an interrupt really ends in a result, that `resume` of an unknown id
- * fails the way the driver assumes); the first run against the real thing has to.
+ * What these establish is the driver's contract with the SDK as the typings describe it AND
+ * as the real CLI was measured to behave: test/real-cli.integration.test.ts (opt-in,
+ * BRIDGE_REAL_CLI=1) runs the same driver over the real bundled CLI against a fake Anthropic
+ * API, and every claim about the CLI that this file relies on (hooks beat allow rules, an
+ * interrupt ends in an `aborted_*` result, a stale resume id fails before any frame, the
+ * results echo the prompt's uuid) is pinned there. This file cannot establish that the real
+ * CLI keeps behaving that way; that is what the opt-in run is for.
  *
  * The fake records the options it was called with and what the driver pushed into the
  * input iterable, and lets a test play the CLI's side message by message, so an ordering
  * that matters (a result arriving after an interrupt, a stream dying mid-tool) is written
- * out rather than inferred.
+ * out rather than inferred. It stamps the frames it plays with the prompt's uuid the way the
+ * real CLI does (test/support/fake-sdk.ts); a frame of a turn nobody asked for is pushed with
+ * `{ stamp: false }`.
  *
  * Every "never" below has a companion that shows the mechanism it relies on engaging:
  * a guard that is vacuously true when nothing happens is not a guard.
  */
 
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import type {
-  HookInput,
-  Options,
-  PermissionResult,
-  Query,
-  SDKMessage,
-  SDKUserMessage,
-  query as sdkQuery,
-} from '@anthropic-ai/claude-agent-sdk';
-import { claudeDriverFactory } from '../src/drivers/claude.ts';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { HookInput, Options, PermissionResult, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
+import { buildChildEnv, CHILD_ENV_NAMES, claudeDriverFactory, pinnedSettings, UNSERVED_TOOLS } from '../src/drivers/claude.ts';
 import type { ClaudeDriverConfig } from '../src/drivers/claude.ts';
+import { describeTool } from '../src/tools.ts';
 import { VOICE_RULES } from '../src/voice-prompt.ts';
-import type {
-  Clock,
-  DriverEvent,
-  PermissionHandler,
-  PermissionRequest,
-  SessionDriver,
-  TimerHandle,
-} from '../src/types.ts';
+import type { DriverEvent, PermissionHandler, PermissionRequest, SessionDriver } from '../src/types.ts';
+import {
+  FakeClock,
+  apiRetry,
+  assistantText,
+  blockStop,
+  cliToolCall,
+  fakeSdk,
+  init,
+  resultAborted,
+  resultErr,
+  resultOk,
+  settle,
+  toolResult,
+  toolStart,
+  SID,
+} from './support/fake-sdk.ts';
+import type { FakeQuery } from './support/fake-sdk.ts';
 
 const KEY = 'sk-ant-test-0123456789abcdef';
-const SID = 'sess-1';
-const UUID0 = '00000000-0000-4000-8000-000000000000';
 const CWD = '/work/proj';
 
+// One scratch directory for every driver's pinned-settings file in this file.
+const SCRATCH = mkdtempSync(join(tmpdir(), 'claude-driver-test-'));
+after(() => rmSync(SCRATCH, { recursive: true, force: true }));
+
+/** A parent environment with secrets in it, so every test that builds a child env is a leak test. */
+const PARENT_ENV: NodeJS.ProcessEnv = {
+  PATH: '/usr/bin:/bin',
+  HOME: '/home/tester',
+  LANG: 'en_US.UTF-8',
+  LC_ALL: 'C',
+  XDG_CONFIG_HOME: '/home/tester/.config',
+  HTTPS_PROXY: 'http://proxy.example:3128',
+  no_proxy: 'localhost',
+  BRIDGE_TOKEN: 'bridge-token-must-not-leak-0123',
+  AWS_SECRET_ACCESS_KEY: 'aws-secret-must-not-leak',
+  GITHUB_TOKEN: 'gh-secret-must-not-leak',
+  ANTHROPIC_API_KEY: 'sk-ant-from-the-shell-should-lose',
+  ANTHROPIC_AUTH_TOKEN: 'extra-bearer-must-not-leak',
+  ANTHROPIC_BASE_URL: 'https://gateway.example',
+  CLAUDE_CODE_USE_BEDROCK: '1',
+  CLAUDE_CODE_REMOTE: 'true',
+  MY_OPT_IN: 'operator-asked-for-this',
+};
+
 // ---------------------------------------------------------------------------
-// Fakes
+// Harness
 // ---------------------------------------------------------------------------
-
-class FakeClock implements Clock {
-  t = 1_000_000;
-  #seq = 0;
-  #live = new Map<number, { at: number; fn: () => void }>();
-  now(): number {
-    return this.t;
-  }
-  setTimeout(fn: () => void, ms: number): TimerHandle {
-    const id = ++this.#seq;
-    this.#live.set(id, { at: this.t + ms, fn });
-    return id;
-  }
-  clearTimeout(h: TimerHandle): void {
-    this.#live.delete(h as number);
-  }
-  get armed(): number {
-    return this.#live.size;
-  }
-  advance(ms: number): void {
-    const target = this.t + ms;
-    for (;;) {
-      let best: [number, { at: number; fn: () => void }] | undefined;
-      for (const e of this.#live) {
-        if (e[1].at > target) continue;
-        if (best === undefined || e[1].at < best[1].at) best = e;
-      }
-      if (best === undefined) break;
-      this.#live.delete(best[0]);
-      this.t = Math.max(this.t, best[1].at);
-      best[1].fn();
-    }
-    this.t = target;
-  }
-}
-
-type QueryParams = Parameters<typeof sdkQuery>[0];
-type Waiter = { resolve: (r: IteratorResult<SDKMessage, void>) => void; reject: (e: unknown) => void };
-
-/** The CLI's side of one query: a channel the test pushes messages into. */
-class FakeQuery {
-  readonly params: QueryParams;
-  readonly received: SDKUserMessage[] = [];
-  interrupts = 0;
-  closes = 0;
-  inputEnded = false;
-  /** Replace to make interrupt() hang or fail. */
-  onInterrupt: () => Promise<undefined> = () => Promise.resolve(undefined);
-  /** A CLI that ignores close() and keeps talking, to prove the driver stops listening. */
-  keepOpenOnClose = false;
-  #items: ({ msg: SDKMessage } | { err: unknown })[] = [];
-  #waiters: Waiter[] = [];
-  #done = false;
-
-  constructor(params: QueryParams) {
-    this.params = params;
-    if (typeof params.prompt !== 'string') void this.#drain(params.prompt);
-  }
-
-  async #drain(input: AsyncIterable<SDKUserMessage>): Promise<void> {
-    for await (const m of input) this.received.push(m);
-    this.inputEnded = true;
-  }
-
-  push(msg: SDKMessage): void {
-    const w = this.#waiters.shift();
-    if (w !== undefined) w.resolve({ value: msg, done: false });
-    else this.#items.push({ msg });
-  }
-  fail(err: unknown): void {
-    const w = this.#waiters.shift();
-    if (w !== undefined) w.reject(err);
-    else this.#items.push({ err });
-  }
-  end(): void {
-    this.#done = true;
-    for (const w of this.#waiters.splice(0)) w.resolve({ value: undefined, done: true });
-  }
-
-  [Symbol.asyncIterator](): this {
-    return this;
-  }
-  next(): Promise<IteratorResult<SDKMessage, void>> {
-    const item = this.#items.shift();
-    if (item !== undefined) {
-      return 'msg' in item ? Promise.resolve({ value: item.msg, done: false }) : Promise.reject(item.err);
-    }
-    if (this.#done) return Promise.resolve({ value: undefined, done: true });
-    return new Promise((resolve, reject) => this.#waiters.push({ resolve, reject }));
-  }
-  return(): Promise<IteratorResult<SDKMessage, void>> {
-    this.end();
-    return Promise.resolve({ value: undefined, done: true });
-  }
-  throw(err: unknown): Promise<IteratorResult<SDKMessage, void>> {
-    return Promise.reject(err);
-  }
-  interrupt(): Promise<undefined> {
-    this.interrupts++;
-    return this.onInterrupt();
-  }
-  close(): void {
-    this.closes++;
-    if (!this.keepOpenOnClose) this.end();
-  }
-}
-
-/**
- * The fake stands in for `Query`, an AsyncGenerator with two dozen control methods of
- * which the driver uses three (iteration, interrupt, close). One cast, here, rather than
- * a class that implements methods nobody calls.
- */
-function asQuery(q: FakeQuery): Query {
-  return q as unknown as Query;
-}
-
-/** Let every promise chain the driver is waiting on run to completion. Not a sleep. */
-async function settle(): Promise<void> {
-  for (let i = 0; i < 8; i++) await new Promise<void>((r) => setImmediate(r));
-}
 
 interface HarnessOpts {
   cfg?: Partial<ClaudeDriverConfig>;
@@ -178,6 +88,7 @@ interface HarnessOpts {
   interruptGraceMs?: number;
   /** Make query() throw for the first N calls. */
   queryThrows?: { times: number; error: unknown };
+  env?: NodeJS.ProcessEnv;
 }
 
 interface Harness {
@@ -195,22 +106,18 @@ interface Harness {
 function harness(over: HarnessOpts = {}): Harness {
   const events: DriverEvent[] = [];
   const logs: string[] = [];
-  const queries: FakeQuery[] = [];
   const requests: PermissionRequest[] = [];
   const clock = new FakeClock();
-  let throwsLeft = over.queryThrows?.times ?? 0;
-
-  const fakeQuery: typeof sdkQuery = (params) => {
-    if (throwsLeft > 0) {
-      throwsLeft--;
-      throw over.queryThrows!.error;
-    }
-    const q = new FakeQuery(params);
-    queries.push(q);
-    return asQuery(q);
-  };
+  const sdkFake = fakeSdk(over.queryThrows === undefined ? {} : { throwTimes: over.queryThrows.times, error: over.queryThrows.error });
+  const queries = sdkFake.queries;
   const cfg: ClaudeDriverConfig = { apiKey: KEY, ...over.cfg };
-  const driver = claudeDriverFactory(cfg, { query: fakeQuery, clock, interruptGraceMs: over.interruptGraceMs ?? 5000 })({
+  const driver = claudeDriverFactory(cfg, {
+    query: sdkFake.query,
+    clock,
+    interruptGraceMs: over.interruptGraceMs ?? 5000,
+    env: over.env ?? PARENT_ENV,
+    settingsDir: SCRATCH,
+  })({
     cwd: CWD,
     resume: over.resume,
     log: (l) => logs.push(l),
@@ -253,39 +160,6 @@ async function begin(h: Harness, text = 'do the thing'): Promise<FakeQuery> {
   assert.equal(h.queries.length, before + 1, 'a query should have been started');
   return h.queries[h.queries.length - 1]!;
 }
-
-// ---------------------------------------------------------------------------
-// SDK message builders (see claude-adapter.test.ts for the typed versions of these)
-// ---------------------------------------------------------------------------
-
-/** Same single cast as in the adapter tests: only the fields the driver's adapter reads. */
-function sdk(partial: Record<string, unknown>): SDKMessage {
-  return { uuid: UUID0, session_id: SID, ...partial } as unknown as SDKMessage;
-}
-const init = (id = SID): SDKMessage => sdk({ type: 'system', subtype: 'init', session_id: id });
-const toolStart = (id: string, name = 'Bash'): SDKMessage =>
-  sdk({
-    type: 'stream_event',
-    parent_tool_use_id: null,
-    event: { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id, name, input: {} } },
-  });
-const blockStop = (): SDKMessage =>
-  sdk({ type: 'stream_event', parent_tool_use_id: null, event: { type: 'content_block_stop', index: 0 } });
-const toolResult = (id: string, isError = false): SDKMessage =>
-  sdk({
-    type: 'user',
-    parent_tool_use_id: null,
-    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'x', is_error: isError }] },
-  });
-const assistantText = (text: string): SDKMessage =>
-  sdk({
-    type: 'assistant',
-    parent_tool_use_id: null,
-    message: { id: 'msg_1', role: 'assistant', content: [{ type: 'text', text }] },
-  });
-const resultOk = (text: string): SDKMessage => sdk({ type: 'result', subtype: 'success', is_error: false, result: text });
-const resultErr = (subtype = 'error_during_execution'): SDKMessage =>
-  sdk({ type: 'result', subtype, is_error: true, errors: ['x'] });
 
 const terminals = (events: DriverEvent[]): DriverEvent[] => events.filter((e) => e.k === 'result' || e.k === 'fatal');
 
@@ -333,9 +207,72 @@ test('the query is started with the options that keep every call behind the hand
   // still a key somebody can later fill in.
   assert.ok(!('allowedTools' in o), 'an auto-allow list would let calls skip canUseTool');
   assert.ok(!('allowDangerouslySkipPermissions' in o));
-  assert.ok(!('hooks' in o), 'no hook is registered unless a hardDeny rule was given');
   assert.ok(!('resume' in o), 'nothing to resume yet');
   assert.ok(!('model' in o) && !('maxTurns' in o) && !('pathToClaudeCodeExecutable' in o));
+});
+
+test('a repository cannot grant itself permissions: the policy tier locks rules and hooks, and the hook is always there', async () => {
+  const h = harness();
+  await begin(h);
+  const o = h.options();
+  // Without the lock a `.claude/settings.local.json` allow rule ran Bash and Write with
+  // canUseTool never called (measured against the real CLI).
+  assert.deepEqual(o.managedSettings, { allowManagedPermissionRulesOnly: true, allowManagedHooksOnly: true });
+  const entries = o.hooks?.PreToolUse;
+  assert.ok(entries !== undefined && entries.length === 1, 'the PreToolUse hook is registered even with no rule configured');
+  // An MCP server in the repository would start at once with no question asked.
+  assert.equal(o.strictMcpConfig, true);
+  // Typed or dictated words are never a CLI command or a file mention.
+  assert.equal(o.verbatimPrompts, true);
+  assert.deepEqual(o.disallowedTools, [...UNSERVED_TOOLS]);
+  assert.ok(o.disallowedTools!.includes('AskUserQuestion') && o.disallowedTools!.includes('ScheduleWakeup'));
+});
+
+test('every tool the driver removes from the model is also refused by the bridge\'s own rules', () => {
+  // Two lists, one fact (the repo's recurring trap): the driver stops OFFERING these, the
+  // describer REFUSES a call to them. If a name drifts out of one list this fails.
+  for (const name of UNSERVED_TOOLS) {
+    const view = describeTool(name, {}, CWD);
+    assert.ok(view.deny !== undefined, `${name} is removed from the model but describeTool would ask the device about it`);
+  }
+  // Companion: the check can fail, because an ordinary tool is not refused.
+  assert.equal(describeTool('Read', { file_path: `${CWD}/a.txt` }, CWD).deny, undefined);
+});
+
+test('the pinned settings file holds the endpoint, the proxies and an empty key helper, and is private', async () => {
+  const h = harness({ env: { PATH: '/bin', HOME: '/h', HTTPS_PROXY: 'http://user:proxy-pass@proxy.example:3128', ANTHROPIC_BASE_URL: 'https://gateway.example' } , cfg: { passEnv: ['ANTHROPIC_BASE_URL'] } });
+  await begin(h);
+  const path = h.options().settings;
+  assert.equal(typeof path, 'string', 'a path, not an inline object: inline settings show up in `ps`');
+  const text = readFileSync(path as string, 'utf8');
+  const pinned = JSON.parse(text) as { env: Record<string, string>; apiKeyHelper: string };
+  assert.equal(pinned.env.ANTHROPIC_BASE_URL, 'https://gateway.example');
+  assert.equal(pinned.env.HTTPS_PROXY, 'http://user:proxy-pass@proxy.example:3128');
+  assert.equal(pinned.env.HTTP_PROXY, '', 'a proxy the operator did not set is pinned to none, not left to the repository');
+  assert.equal(pinned.apiKeyHelper, '');
+  assert.equal(statSync(path as string).mode & 0o077, 0, 'the file may hold a proxy password: owner only');
+  // The command line carries only the path; the password must not be in anything the SDK serialises into argv.
+  const { settings, managedSettings, ...rest } = h.options();
+  void settings;
+  assert.ok(!JSON.stringify([managedSettings, rest.systemPrompt, rest.disallowedTools]).includes('proxy-pass'));
+});
+
+test('without an operator endpoint the pin is the public API, and the pin function is what decides', () => {
+  assert.equal(pinnedSettings({}).env.ANTHROPIC_BASE_URL, 'https://api.anthropic.com');
+  assert.equal(pinnedSettings({ ANTHROPIC_BASE_URL: 'http://127.0.0.1:9' }).env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:9');
+  for (const k of ['HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'no_proxy', 'all_proxy']) {
+    assert.equal(pinnedSettings({}).env[k], '', k);
+    assert.equal(pinnedSettings({ [k]: 'http://p' }).env[k], 'http://p', k);
+  }
+});
+
+test('close removes the pinned settings file the driver wrote', async () => {
+  const h = harness();
+  await begin(h);
+  const path = h.options().settings as string;
+  assert.ok(existsSync(path));
+  await h.driver.close();
+  assert.ok(!existsSync(path), 'a settings file with a proxy password must not outlive the driver');
 });
 
 test('user-level settings are not loaded unless the caller asks for them', async () => {
@@ -360,22 +297,58 @@ test('settingSources is a copy: changing the config afterwards changes nothing',
   assert.deepEqual(h.options().settingSources, ['project']);
 });
 
-test('the child process keeps the parent environment and gets the configured key on top', async () => {
-  process.env.TAMA_DRIVER_TEST_SENTINEL = 'kept';
-  const before = process.env.ANTHROPIC_API_KEY;
-  process.env.ANTHROPIC_API_KEY = 'sk-ant-from-the-shell-should-lose';
-  try {
-    const h = harness();
-    await begin(h);
-    const env = h.options().env!;
-    assert.equal(env.TAMA_DRIVER_TEST_SENTINEL, 'kept', 'the SDK replaces the env wholesale; PATH and HOME must be carried over');
-    assert.equal(env.ANTHROPIC_API_KEY, KEY);
-    assert.equal(env.PATH, process.env.PATH);
-  } finally {
-    delete process.env.TAMA_DRIVER_TEST_SENTINEL;
-    if (before === undefined) delete process.env.ANTHROPIC_API_KEY;
-    else process.env.ANTHROPIC_API_KEY = before;
+test('the child gets an allowlist of the parent environment, never BRIDGE_TOKEN or other secrets', async () => {
+  const h = harness();
+  await begin(h);
+  const env = h.options().env!;
+  // Carried over by hand, because the SDK REPLACES the child's environment when `env` is set.
+  assert.equal(env.PATH, PARENT_ENV.PATH);
+  assert.equal(env.HOME, PARENT_ENV.HOME);
+  assert.equal(env.LANG, PARENT_ENV.LANG);
+  assert.equal(env.LC_ALL, 'C', 'locale families are passed whole');
+  assert.equal(env.XDG_CONFIG_HOME, PARENT_ENV.XDG_CONFIG_HOME);
+  assert.equal(env.HTTPS_PROXY, PARENT_ENV.HTTPS_PROXY);
+  assert.equal(env.no_proxy, 'localhost', 'proxy names in both cases');
+  assert.equal(env.ANTHROPIC_API_KEY, KEY, 'the configured key wins over the shell\'s');
+  // The model's tool subprocesses run as this user: anything in here is theirs.
+  for (const secret of ['BRIDGE_TOKEN', 'AWS_SECRET_ACCESS_KEY', 'GITHUB_TOKEN', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_REMOTE', 'MY_OPT_IN']) {
+    assert.ok(!(secret in env), `${secret} must not reach the child`);
   }
+  assert.ok(!('ANTHROPIC_BASE_URL' in env), 'an endpoint is the operator\'s to name, not inherited from the shell');
+  assert.ok(!JSON.stringify(env).includes('must-not-leak'));
+  // Companion: the filter is what removes them, not an environment that never had them.
+  assert.equal(PARENT_ENV.BRIDGE_TOKEN, 'bridge-token-must-not-leak-0123');
+});
+
+test('background work is switched off in the child, and no passEnv entry can undo that or the key', () => {
+  const { env, refused } = buildChildEnv(
+    { ...PARENT_ENV, CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '0' },
+    KEY,
+    ['MY_OPT_IN', 'BRIDGE_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS', 'not a name', 'ABSENT_VAR'],
+  );
+  assert.equal(env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, '1');
+  assert.equal(env.ANTHROPIC_API_KEY, KEY);
+  assert.equal(env.MY_OPT_IN, 'operator-asked-for-this', 'a name the operator opted into is passed');
+  assert.ok(!('BRIDGE_TOKEN' in env), 'even a named BRIDGE_TOKEN is not passed: it would let the model impersonate the device');
+  assert.ok(!('ABSENT_VAR' in env), 'a name that is not set is simply absent');
+  assert.deepEqual(refused, ['BRIDGE_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS', 'not a name']);
+});
+
+test('the allowlist is exactly what the design says, so a change to it is a decision', () => {
+  assert.deepEqual([...CHILD_ENV_NAMES].sort(), [
+    'ALL_PROXY', 'CLAUDE_CONFIG_DIR', 'HOME', 'HTTPS_PROXY', 'HTTP_PROXY', 'LANG', 'LOGNAME', 'NODE_EXTRA_CA_CERTS',
+    'NO_PROXY', 'PATH', 'SHELL', 'SSL_CERT_FILE', 'TERM', 'TMPDIR', 'TZ', 'USER',
+    'all_proxy', 'http_proxy', 'https_proxy', 'no_proxy',
+  ].sort());
+  assert.ok(![...CHILD_ENV_NAMES].some((n) => /TOKEN|KEY|SECRET|PASSWORD|BRIDGE/i.test(n)), 'no credential name belongs on the allowlist');
+});
+
+test('the key is trimmed before it reaches the child, and scrubbed from logs in both spellings', async () => {
+  const h = harness({ cfg: { apiKey: `  ${KEY}\n` } });
+  await begin(h);
+  assert.equal(h.options().env!.ANTHROPIC_API_KEY, KEY);
+  h.options().stderr!(`using ${KEY} and ${'  ' + KEY + '\n'} again`);
+  assert.ok(!h.logs.join('\n').includes(KEY));
 });
 
 test('optional config reaches the SDK only when set', async () => {
@@ -395,12 +368,25 @@ test('a prompt reaches the CLI as a user message attributed to a human', async (
   const h = harness();
   const q = await begin(h, 'read the readme');
   assert.equal(q.received.length, 1);
-  assert.deepEqual(q.received[0], {
+  const { uuid, ...rest } = q.received[0]!;
+  assert.deepEqual(rest, {
     type: 'user',
     message: { role: 'user', content: 'read the readme' },
     parent_tool_use_id: null,
     origin: { kind: 'human' },
   });
+  assert.match(uuid ?? '', /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/, 'every prompt carries a uuid the CLI echoes back');
+});
+
+test('each prompt gets its own uuid', async () => {
+  const h = harness();
+  const q = await begin(h, 'one');
+  q.push(resultOk('1'));
+  await settle();
+  h.driver.prompt('two');
+  await settle();
+  const [a, b] = q.received.map((m) => m.uuid);
+  assert.ok(a !== undefined && b !== undefined && a !== b);
 });
 
 test('sessionId() is the resume id until the CLI reports the real one', async () => {
@@ -658,13 +644,87 @@ test('the hook applies to every tool, not a matched subset', async () => {
   assert.equal(hook.count, 1);
 });
 
-test('a call that is not forbidden gets no opinion from the hook, never an allow', async () => {
-  const hook = await hookOf({ hardDeny: (tool) => (tool === 'Bash' ? 'no' : undefined) });
+type HookOut = { hookSpecificOutput?: { hookEventName: string; permissionDecision: string; permissionDecisionReason: string } };
+
+test('a call the bridge rates low gets no opinion from the hook, never an allow', async () => {
+  const hook = await hookOf({ hardDeny: (tool) => (tool === 'Bash' ? 'no' : undefined), needsAsk: (tool) => tool !== 'Read' });
   const out = await hook.run(preToolUse('Read', { file_path: '/a' }));
   assert.deepEqual(out, {});
   // An explicit allow from a hook skips the approval flow, which is the whole point of
   // never returning one. Companion to the deny test above: same hook, opposite input.
   assert.notEqual((await hook.run(preToolUse('Bash', {}))) as object, out);
+  for (const tool of ['Read', 'Bash', 'Write', 'mcp__x__y']) {
+    const o = (await hook.run(preToolUse(tool, {}))) as HookOut;
+    assert.notEqual(o.hookSpecificOutput?.permissionDecision, 'allow', tool);
+  }
+});
+
+test('a call that needs a tap is forced to ask, which beats an allow rule and the CLI\'s own auto-allow', async () => {
+  const seen: [string, Record<string, unknown>][] = [];
+  const hook = await hookOf({ needsAsk: (tool, input) => { seen.push([tool, input]); return true; } });
+  const out = (await hook.run(preToolUse('Write', { file_path: '/a', content: 'x' }))) as HookOut;
+  assert.equal(out.hookSpecificOutput?.hookEventName, 'PreToolUse');
+  assert.equal(out.hookSpecificOutput?.permissionDecision, 'ask');
+  assert.ok((out.hookSpecificOutput?.permissionDecisionReason ?? '').length > 0);
+  assert.deepEqual(seen, [['Write', { file_path: '/a', content: 'x' }]]);
+});
+
+test('with no needsAsk configured every call asks: nothing is left to the CLI by default', async () => {
+  const hook = await hookOf({});
+  for (const tool of ['Read', 'Bash', 'Glob', 'WebFetch']) {
+    const out = (await hook.run(preToolUse(tool, {}))) as HookOut;
+    assert.equal(out.hookSpecificOutput?.permissionDecision, 'ask', tool);
+  }
+});
+
+test('only an explicit false from needsAsk leaves a call to the CLI; anything else, including a throw, asks', async () => {
+  const cases: [string, () => unknown, string | undefined][] = [
+    ['false', () => false, undefined],
+    ['true', () => true, 'ask'],
+    ['undefined', () => undefined, 'ask'],
+    ['0', () => 0, 'ask'],
+    ['an empty string', () => '', 'ask'],
+    ['null', () => null, 'ask'],
+    ['a throw', () => { throw new Error('rule bug'); }, 'ask'],
+  ];
+  for (const [name, fn, expected] of cases) {
+    const hook = await hookOf({ needsAsk: fn as never });
+    const out = (await hook.run(preToolUse('Read', { file_path: '/a' }))) as HookOut;
+    assert.equal(out.hookSpecificOutput?.permissionDecision, expected, name);
+  }
+});
+
+test('a hard-denied call is refused before needsAsk is even consulted', async () => {
+  let asked = 0;
+  const hook = await hookOf({ hardDeny: () => 'never', needsAsk: () => { asked++; return true; } });
+  const out = (await hook.run(preToolUse('Bash', { command: 'rm -rf /' }))) as HookOut;
+  assert.equal(out.hookSpecificOutput?.permissionDecision, 'deny');
+  assert.equal(asked, 0, 'a call that is refused outright must never reach the device, so it is not even classified');
+});
+
+test('through the CLI\'s own pipeline: hard-deny never asks, a tap-worthy call asks even when the CLI would auto-allow, a low call does not', async () => {
+  const h = harness({
+    cfg: {
+      hardDeny: (tool) => (tool === 'Bash' ? 'refused by rule' : undefined),
+      needsAsk: (tool) => tool !== 'Read',
+    },
+  });
+  await begin(h);
+  const o = h.options();
+
+  const denied = await cliToolCall(o, 'Bash', { command: 'rm -rf /' }, { autoAllow: true });
+  assert.deepEqual([denied.decision, denied.via, denied.message], ['deny', 'hook', 'refused by rule']);
+  assert.equal(h.requests.length, 0, 'the device never sees a hard-denied call');
+
+  // The CLI's auto-allow (a write that a local allow rule permits, `ls`) would have let this run.
+  const asked = await cliToolCall(o, 'Write', { file_path: '/a', content: 'x' }, { autoAllow: true });
+  assert.deepEqual([asked.decision, asked.via], ['allow', 'canUseTool']);
+  assert.equal(h.requests.length, 1, 'the tap-worthy call reached the device even though the CLI would have run it');
+
+  // A built-in read inside the working directory: the CLI's own rule applies and nobody is asked.
+  const low = await cliToolCall(o, 'Read', { file_path: `${CWD}/a.txt` }, { autoAllow: true });
+  assert.deepEqual([low.decision, low.via], ['allow', 'cli-auto-allow']);
+  assert.equal(h.requests.length, 1, 'a low call is the only kind that runs without the device');
 });
 
 test('a hard-deny rule that throws, or returns an empty reason, still denies', async () => {
@@ -719,17 +779,17 @@ test('a normal turn: events in order, one result, the session id kept', async ()
   assert.equal(q.closes, 0, 'a finished turn must not tear the session down');
 });
 
-test('an error result is one failed terminal', async () => {
+test('an error result is one failed terminal carrying the CLI\'s own sentence', async () => {
   const h = harness();
   const q = await begin(h);
   q.push(init());
   q.push(toolStart('t1'));
   q.push(blockStop());
-  q.push(resultErr('error_max_turns'));
+  q.push(resultErr('error_max_turns', { errors: ['Reached maximum number of turns (1)'] }));
   await settle();
   assert.deepEqual(h.events.slice(-2), [
     { k: 'tool_end', id: 't1', ok: false },
-    { k: 'result', ok: false, text: '', subtype: 'error_max_turns' },
+    { k: 'result', ok: false, text: 'Reached maximum number of turns (1)', subtype: 'error_max_turns' },
   ]);
   assertOneTerminalEach(h.events, 1);
   assert.deepEqual(dangling(h.events), []);
@@ -770,7 +830,7 @@ test('a stream that throws is one fatal carrying the reason, with the key scrubb
   assert.equal(t.length, 1);
   assert.equal(t[0]!.k, 'fatal');
   const msg = (t[0] as { msg: string }).msg;
-  assert.match(msg, /^Claude session failed: 401 invalid x-api-key/);
+  assert.match(msg, /^Claude failed: 401 invalid x-api-key/);
   assert.ok(!msg.includes(KEY), 'the API key must never leave the process in an event');
   assert.match(msg, /^[\x20-\x7e]*$/, 'fatal text can reach the panel');
   assert.ok(msg.length <= 160);
@@ -799,12 +859,13 @@ test('interrupt mid-turn: the query is interrupted, the CLI answers, one termina
   await settle();
   assert.equal(q.interrupts, 1);
   assert.equal(terminals(h.events).length, 0, 'the terminal is the CLI\'s result, not something the driver invents');
-  q.push(resultErr('error_during_execution'));
+  // What the real CLI sends for an interrupt (measured): an error result with an aborted reason.
+  q.push(resultAborted('aborted_tools'));
   await done;
   await settle();
   assert.deepEqual(h.events.slice(-2), [
     { k: 'tool_end', id: 't1', ok: false },
-    { k: 'result', ok: false, text: '', subtype: 'error_during_execution' },
+    { k: 'result', ok: false, text: '', subtype: 'interrupted' },
   ]);
   assertOneTerminalEach(h.events, 1);
   assert.equal(h.clock.armed, 0, 'the grace timer must not outlive the turn');
@@ -1025,12 +1086,13 @@ test('activity with no turn behind it is dropped, but a session id is not', asyn
   q.push(resultOk('done'));
   await settle();
   const before = h.events.length;
-  q.push(toolStart('bg1'));
-  q.push(assistantText('a background task woke me'));
-  q.push(resultOk('a turn nobody asked for'));
+  // A turn the CLI started on its own: nothing in it echoes a prompt of ours.
+  q.push(toolStart('bg1'), { stamp: false });
+  q.push(assistantText('a background task woke me'), { stamp: false });
+  q.push(resultOk('a turn nobody asked for'), { stamp: false });
   await settle();
   assert.equal(h.events.length, before);
-  assert.ok(h.logs.some((l) => l.includes('no turn in flight')));
+  assert.ok(h.logs.some((l) => l.includes('not the answer to the prompt in flight') || l.includes('no turn in flight')));
   q.push(init('rotated'));
   await settle();
   assert.deepEqual(h.events.slice(before), [{ k: 'session', id: 'rotated' }]);
@@ -1124,7 +1186,7 @@ test('query() throwing is one fatal, and the next prompt tries again', async () 
   assert.equal(h.queries.length, 0);
   const t = terminals(h.events);
   assert.equal(t.length, 1);
-  assert.match((t[0] as { msg: string }).msg, /^Could not start Claude: spawn failed for \*\*\*$/);
+  assert.match((t[0] as { msg: string }).msg, /^Claude did not start: spawn failed for \*\*\*$/);
   const q = await begin(h, 'second');
   q.push(resultOk('ok'));
   await settle();
@@ -1143,6 +1205,374 @@ test('a queued prompt is not lost when the one before it dies', async () => {
   h.queries[1]!.push(resultOk('two'));
   await settle();
   assertOneTerminalEach(h.events, 2);
+});
+
+// ---------------------------------------------------------------------------
+// A saved session that cannot be resumed (H6, D6)
+// ---------------------------------------------------------------------------
+
+/** What the real CLI sends for a resume id with no transcript: no frames, no stamp, nothing ran (measured). */
+const staleResult = (id = 'dead-session'): ReturnType<typeof resultErr> =>
+  resultErr('error_during_execution', {
+    errors: [`No conversation found with session ID: ${id}`],
+    num_turns: 0,
+    duration_ms: 0,
+    session_id: id,
+  });
+
+test('a stale resume id is forgotten and the prompt runs once more on a fresh session, silently', async () => {
+  const h = harness({ resume: 'dead-session' });
+  assert.equal(h.driver.sessionId(), 'dead-session');
+  const q1 = await begin(h, 'what is in the readme');
+  assert.equal(h.options(0).resume, 'dead-session', 'the first attempt really did try to resume');
+  q1.push(staleResult(), { stamp: false });
+  await settle();
+
+  assert.deepEqual(terminals(h.events), [], 'the first attempt never ran, so it owes nobody a terminal');
+  assert.equal(q1.closes, 1, 'the dead query is released');
+  assert.equal(h.queries.length, 2, 'a fresh query was started');
+  assert.ok(!('resume' in h.options(1)), 'the fresh query does not try the dead id again');
+  assert.equal(h.driver.sessionId(), undefined, 'the dead id is no longer ours');
+  const q2 = h.queries[1]!;
+  assert.deepEqual(q2.received.map((m) => m.message.content), ['what is in the readme'], 'the SAME prompt, once');
+  assert.notEqual(q2.received[0]!.uuid, q1.received[0]!.uuid, 'a new uuid: the old one belongs to the discarded query');
+
+  q2.push(init('brand-new'));
+  q2.push(assistantText('It says hello.'));
+  q2.push(resultOk('It says hello.'));
+  await settle();
+  assert.deepEqual(h.events, [
+    { k: 'session', id: 'brand-new' },
+    { k: 'text', text: 'It says hello.' },
+    { k: 'result', ok: true, text: 'It says hello.', subtype: 'success' },
+  ], 'the new id is reported so the server stores it in place of the dead one');
+  assert.equal(h.driver.sessionId(), 'brand-new');
+  assertOneTerminalEach(h.events, 1);
+  assert.ok(h.logs.some((l) => l.includes('could not be resumed')));
+});
+
+test('after a recovery the next query resumes the NEW session, not the dead one', async () => {
+  const h = harness({ resume: 'dead-session' });
+  const q1 = await begin(h, 'first');
+  q1.push(staleResult(), { stamp: false });
+  await settle();
+  const q2 = h.queries[1]!;
+  q2.push(init('brand-new'));
+  q2.push(resultOk('one'));
+  await settle();
+  q2.end(); // the CLI goes away between turns
+  await settle();
+  await begin(h, 'second');
+  assert.equal(h.options(2).resume, 'brand-new');
+});
+
+test('the retry happens once: a second failure is an ordinary failed turn, not a loop', async () => {
+  const h = harness({ resume: 'dead-session' });
+  const q1 = await begin(h, 'first');
+  q1.push(staleResult(), { stamp: false });
+  await settle();
+  const q2 = h.queries[1]!;
+  // The fresh query fails with the same words (it has no resume id, so this is not a stale
+  // resume any more, whatever the text says).
+  q2.push(staleResult('whatever'), { stamp: false });
+  await settle();
+  assert.equal(h.queries.length, 2, 'no third query');
+  assertOneTerminalEach(h.events, 1);
+  const t = terminals(h.events)[0]!;
+  assert.equal(t.k, 'result');
+  assert.equal((t as { ok: boolean }).ok, false);
+});
+
+test('the same recovery when the CLI fails the stream instead of sending a result', async () => {
+  const h = harness({ resume: 'dead-session' });
+  const q1 = await begin(h, 'first');
+  q1.fail(new Error('Claude Code returned an error result: No conversation found with session ID: dead-session'));
+  await settle();
+  assert.deepEqual(terminals(h.events), []);
+  assert.equal(h.queries.length, 2);
+  h.queries[1]!.push(resultOk('fine'));
+  await settle();
+  assertOneTerminalEach(h.events, 1);
+  assert.deepEqual(terminals(h.events), [{ k: 'result', ok: true, text: 'fine', subtype: 'success' }]);
+});
+
+test('a missing transcript in the MIDDLE of a session is not retried: the session was found at the start', async () => {
+  const h = harness({ resume: 'live-session' });
+  const q = await begin(h, 'first');
+  q.push(init('live-session'));
+  q.push(staleResult('live-session'), { stamp: false });
+  await settle();
+  assert.equal(h.queries.length, 1, 'no retry');
+  assertOneTerminalEach(h.events, 1);
+});
+
+test('"no conversation found" on a query that was not resuming anything is not a retry trigger', async () => {
+  const h = harness();
+  const q = await begin(h, 'first');
+  q.push(staleResult(), { stamp: false });
+  await settle();
+  assert.equal(h.queries.length, 1);
+  assertOneTerminalEach(h.events, 1);
+});
+
+// ---------------------------------------------------------------------------
+// A turn nobody asked for is never the answer (M18, D7)
+// ---------------------------------------------------------------------------
+
+test('a notification turn that finishes while a prompt waits is not reported as that prompt\'s answer', async () => {
+  const h = harness();
+  const q = await begin(h, 'what is the status');
+  // The CLI was still running a turn of its own (a finished background job): unstamped frames.
+  q.push(assistantText('NOTIFICATION-TURN: the job finished.'), { stamp: false });
+  q.push(resultOk('NOTIFICATION-TURN: the job finished.'), { stamp: false });
+  await settle();
+  assert.deepEqual(terminals(h.events), [], 'the notification turn\'s result must not end the user\'s turn');
+  assert.ok(!JSON.stringify(h.events).includes('NOTIFICATION'), 'nor may its narration reach the pet');
+  // Companion: the user's own turn, stamped, is then reported normally.
+  q.push(assistantText('All green.'));
+  q.push(resultOk('All green.'));
+  await settle();
+  assert.deepEqual(terminals(h.events), [{ k: 'result', ok: true, text: 'All green.', subtype: 'success' }]);
+});
+
+test('a result that echoes another prompt\'s uuid is not ours, a list containing ours is', async () => {
+  const h = harness();
+  const q = await begin(h, 'one');
+  q.push(resultOk('for someone else'), { stampWith: '11111111-1111-4111-8111-111111111111' });
+  await settle();
+  assert.deepEqual(terminals(h.events), []);
+  assert.ok(h.logs.some((l) => l.includes('not the answer to the prompt in flight')));
+  const mine = q.lastPromptUuid!;
+  q.push({ ...resultOk('folded'), user_message_uuid: 'x', user_message_uuids: ['11111111-1111-4111-8111-111111111111', mine] } as never, { stamp: false });
+  await settle();
+  assert.deepEqual(terminals(h.events), [{ k: 'result', ok: true, text: 'folded', subtype: 'success' }]);
+});
+
+test('a late duplicate of the previous turn\'s result does not end the next turn', async () => {
+  const h = harness();
+  const q = await begin(h, 'first');
+  const firstUuid = q.lastPromptUuid!;
+  q.push(resultOk('one'));
+  await settle();
+  h.driver.prompt('second');
+  await settle();
+  q.push(resultOk('one again'), { stampWith: firstUuid });
+  await settle();
+  assertOneTerminalEach(h.events, 1);
+  q.push(resultOk('two'));
+  await settle();
+  assertOneTerminalEach(h.events, 2);
+  assert.deepEqual(terminals(h.events).map((e) => (e as { text: string }).text), ['one', 'two']);
+});
+
+test('a frame of a turn nobody asked for is dropped even while a prompt is in flight', async () => {
+  const h = harness();
+  const q = await begin(h, 'first');
+  q.push(toolStart('bg1'), { stamp: false });
+  q.push(assistantText('narration of the background turn'), { stamp: false });
+  await settle();
+  assert.equal(h.events.length, 0, 'no tool_start and no text from a turn that is not ours');
+  // Companion: the same frames, stamped, are the turn's own.
+  q.push(toolStart('t1'));
+  q.push(assistantText('narration of my turn'));
+  await settle();
+  assert.deepEqual(h.events.map((e) => e.k), ['tool_start', 'text']);
+});
+
+test('a zeroed error for a turn that never ran ends the prompt, whatever it says', async () => {
+  const h = harness();
+  const q = await begin(h, 'first');
+  q.push(resultErr('error_during_execution', { errors: ['Claude Code requires a newer Node'], num_turns: 0 }), { stamp: false });
+  await settle();
+  assert.deepEqual(terminals(h.events), [
+    { k: 'result', ok: false, text: 'Claude Code requires a newer Node', subtype: 'error_during_execution' },
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// A stop is "Stopped.", not an error (M19)
+// ---------------------------------------------------------------------------
+
+test('a deny with interrupt:true ends the turn as interrupted, not as a failure', async () => {
+  const h = harness({ onPermission: () => Promise.resolve({ allow: false, message: 'stop', interrupt: true }) });
+  const q = await begin(h, 'delete things');
+  q.push(init());
+  q.push(toolStart('t1'));
+  q.push(blockStop());
+  const r = await h.ask('Bash', { command: 'rm x' });
+  assert.deepEqual(r, { behavior: 'deny', message: 'stop', interrupt: true });
+  q.push(resultAborted('aborted_tools'));
+  await settle();
+  assert.deepEqual(h.events.slice(-2), [
+    { k: 'tool_end', id: 't1', ok: false },
+    { k: 'result', ok: false, text: '', subtype: 'interrupted' },
+  ]);
+});
+
+test('an interrupt in mid-stream is reported as interrupted too', async () => {
+  const h = harness();
+  const q = await begin(h, 'talk for a while');
+  const done = h.driver.interrupt();
+  q.push(resultAborted('aborted_streaming'));
+  await done;
+  await settle();
+  assert.deepEqual(terminals(h.events), [{ k: 'result', ok: false, text: '', subtype: 'interrupted' }]);
+});
+
+// ---------------------------------------------------------------------------
+// A rejected key does not stall the pet (M20, D8)
+// ---------------------------------------------------------------------------
+
+test('an API error that retrying cannot fix ends the turn at once with a short sentence', async () => {
+  const h = harness();
+  const q = await begin(h, 'hello');
+  q.push(init());
+  q.push(apiRetry('authentication_failed', 401, 1, 10));
+  await settle();
+  const t = terminals(h.events);
+  assert.equal(t.length, 1, 'one terminal, right away, not after the CLI\'s backoff');
+  assert.equal(t[0]!.k, 'result');
+  const r = t[0] as Extract<DriverEvent, { k: 'result' }>;
+  assert.equal(r.ok, false);
+  assert.equal(r.subtype, 'api_error');
+  assert.match(r.text, /^Claude API error 401: the API key was rejected\./);
+  assert.match(r.text, /^[\x20-\x7e]*$/);
+  assert.equal(q.closes, 1, 'the query that is stuck in backoff is discarded');
+  // Companion: the next prompt is not poisoned by it.
+  const q2 = await begin(h, 'again');
+  q2.push(resultOk('ok'));
+  await settle();
+  assertOneTerminalEach(h.events, 2);
+});
+
+test('every error code the CLI cannot recover from ends the turn; the transient ones are only logged', async () => {
+  const fatal = ['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required', 'billing_error', 'invalid_request', 'model_not_found', 'cloud_credential_error'];
+  for (const code of fatal) {
+    const h = harness();
+    const q = await begin(h, 'hello');
+    q.push(apiRetry(code, 400));
+    await settle();
+    assert.equal(terminals(h.events).length, 1, code);
+  }
+  for (const code of ['rate_limit', 'overloaded', 'server_error', 'unknown', 'max_output_tokens']) {
+    const h = harness();
+    const q = await begin(h, 'hello');
+    q.push(apiRetry(code, 529, 2, 10));
+    await settle();
+    assert.equal(terminals(h.events).length, 0, `${code} may well succeed on the next attempt`);
+    assert.ok(h.logs.some((l) => l.includes('api retry 2/10') && l.includes(code)));
+    q.push(resultOk('made it'));
+    await settle();
+    assertOneTerminalEach(h.events, 1);
+  }
+});
+
+test('a retry notice with no prompt in flight changes nothing', async () => {
+  const h = harness();
+  const q = await begin(h, 'first');
+  q.push(resultOk('done'));
+  await settle();
+  q.push(apiRetry('authentication_failed', 401));
+  await settle();
+  assertOneTerminalEach(h.events, 1);
+  assert.equal(q.closes, 0, 'an idle session is not torn down by a notice');
+});
+
+// ---------------------------------------------------------------------------
+// Permission requests need a prompt behind them
+// ---------------------------------------------------------------------------
+
+test('a permission request with no prompt in flight is refused without asking the device', async () => {
+  const h = harness();
+  const q = await begin(h, 'first');
+  q.push(resultOk('done'));
+  await settle();
+  const r = await h.ask('Bash', { command: 'touch x' });
+  assert.equal(r.behavior, 'deny');
+  assert.equal(h.requests.length, 0, 'the device is idle and must not be shown a question');
+  // Companion: with a prompt in flight the same request reaches the handler.
+  h.driver.prompt('second');
+  await settle();
+  assert.equal((await h.ask('Bash', { command: 'touch x' })).behavior, 'allow');
+  assert.equal(h.requests.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// What the server is allowed to see
+// ---------------------------------------------------------------------------
+
+test('only the bridge\'s own event vocabulary ever leaves the driver', async () => {
+  const h = harness({ resume: 'dead-session' });
+  const q1 = await begin(h, 'one');
+  q1.push(staleResult(), { stamp: false });
+  await settle();
+  const q2 = h.queries[1]!;
+  q2.push(apiRetry('overloaded', 529));
+  q2.push(resultOk('foreign'), { stamp: false });
+  q2.push(init('s2'));
+  q2.push(toolStart('t1'));
+  q2.push(blockStop());
+  q2.push(toolResult('t1'));
+  q2.push(resultOk('fine'));
+  await settle();
+  const allowed = new Set(['session', 'tool_start', 'tool_end', 'text', 'result', 'fatal']);
+  assert.ok(h.events.length > 0);
+  for (const e of h.events) assert.ok(allowed.has(e.k), `${e.k} is the adapter's private signal and must not reach the server`);
+});
+
+test('a listener that sends the next prompt from inside the terminal event gets it delivered in order', async () => {
+  const seen: string[] = [];
+  const h = harness({
+    onEvent: (e) => {
+      if (e.k === 'result') {
+        seen.push(e.text);
+        if (e.text === 'one') h.driver.prompt('follow up');
+      }
+    },
+  });
+  const q = await begin(h, 'first');
+  q.push(resultOk('one'));
+  await settle();
+  assert.deepEqual(q.received.map((m) => m.message.content), ['first', 'follow up']);
+  q.push(resultOk('two'));
+  await settle();
+  assert.deepEqual(seen, ['one', 'two']);
+  assertOneTerminalEach(h.events, 2);
+});
+
+test('the turn is over before anyone is told: a handler that interrupts from the terminal event interrupts nothing', async () => {
+  // The server aborts and cleans up from inside its handler for the terminal event. If the
+  // driver still counted the turn as running at that moment, the interrupt would go to a
+  // CLI with nothing to interrupt and arm a grace timer that later reports a bogus failure.
+  let q!: FakeQuery;
+  const h = harness({
+    onEvent: (e) => {
+      if (e.k === 'result') void h.driver.interrupt();
+    },
+  });
+  q = await begin(h, 'first');
+  q.push(resultOk('done'));
+  await settle();
+  assertOneTerminalEach(h.events, 1);
+  assert.equal(q.interrupts, 0, 'nothing was in flight, so nothing is interrupted');
+  assert.equal(h.clock.armed, 0, 'and no grace timer is left to fire a fatal later');
+  h.clock.advance(60_000);
+  assertOneTerminalEach(h.events, 1);
+});
+
+test('fatal text puts what a person can act on first and is not prefixed twice', async () => {
+  const h = harness();
+  const q = await begin(h, 'first');
+  q.fail(new Error('Claude Code native binary not found at /opt/claude. Please ensure Claude Code is installed.'));
+  await settle();
+  const msg = (terminals(h.events)[0] as { msg: string }).msg;
+  assert.ok(msg.startsWith('Claude Code native binary not found at /opt/claude'), msg);
+  assert.ok(msg.slice(0, 64).includes('/opt/claude'), 'the wire keeps 64 characters: the path must be inside them');
+  const h2 = harness();
+  const q2 = await begin(h2, 'first');
+  q2.fail(new Error('socket hang up'));
+  await settle();
+  assert.equal((terminals(h2.events)[0] as { msg: string }).msg, 'Claude failed: socket hang up');
 });
 
 // ---------------------------------------------------------------------------
@@ -1176,7 +1606,8 @@ test('with no injected query the real SDK is imported on first use, and a missin
   assert.equal(ev.k, 'fatal');
   // From the real SDK's stream, not from the driver's own "could not start" path, which is
   // what a broken import or a rejected options object would produce.
-  assert.match((ev as { msg: string }).msg, /^Claude session failed: .*not found/i);
+  // The SDK's own sentence comes first (the wire carries 64 characters of it), without a prefix in front.
+  assert.match((ev as { msg: string }).msg, /^Claude Code native binary not found at \/nonexistent\/claude-binary/i);
   assert.ok(!JSON.stringify([events, logs]).includes(KEY));
 });
 
@@ -1194,7 +1625,8 @@ function forbiddenTokens(text: string): string[] {
   const found: string[] = [];
   if (/bypass/i.test(text)) found.push('bypass');
   if (/dangerously/i.test(text)) found.push('dangerously');
-  if (/allowedTools/.test(text)) found.push('allowedTools');
+  // Not preceded by a letter: `disallowedTools` is the opposite option and must stay legal.
+  if (/(?<![A-Za-z])allowedTools/.test(text)) found.push('allowedTools');
   for (const m of text.matchAll(/permissionMode\s*[:=]\s*(['"`])([^'"`]*)\1/g)) {
     if (m[2] !== 'default') found.push(`permissionMode ${m[2]}`);
   }
@@ -1212,6 +1644,7 @@ test('the source check can fail: it flags each forbidden option when one is pres
   assert.deepEqual(forbiddenTokens(`permissionMode: '${skip}'`), ['bypass', "permissionMode " + skip]);
   assert.deepEqual(forbiddenTokens(`x.${dang} = true`), ['dangerously']);
   assert.deepEqual(forbiddenTokens(`options.${allow} = ['Bash']`), ['allowedTools']);
+  assert.deepEqual(forbiddenTokens(`options.disallowedTools = ['Bash']`), [], 'the deny list is not the allow list');
   assert.deepEqual(forbiddenTokens(`permissionMode: 'acceptEdits'`), ['permissionMode acceptEdits']);
   assert.deepEqual(forbiddenTokens(`permissionMode: 'default'`), []);
 });

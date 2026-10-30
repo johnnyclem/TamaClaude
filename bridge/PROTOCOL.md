@@ -3,12 +3,25 @@
 Protocol version **1**.
 
 This is the specification the handheld's firmware is written from. The reference
-implementation is `src/protocol.ts`. The two are held together by
-`test/protocol.test.ts`: the limits, the size budgets and the worked example below are
-checked against the code on every test run, and the byte-exact files in `fixtures/` are
-the conformance suite for any other implementation (the firmware's test should read that
-directory). If this document and the code ever disagree, one of them is wrong and a test
-is red.
+implementation is `src/protocol.ts` (the codec) and `src/server.ts` (the behaviour). What
+a test holds this document to, on every run:
+
+- the numbers: the limits table, the size budgets, the close-code table and the timings
+  table are compared with the constants in the code (`LIMITS`, `CLOSE`, `DEFAULTS`);
+- the shapes: every message has a field table, and its keys and their order are compared
+  with what the encoder writes; every message type, phase, enum value and error code must be
+  named here;
+- the conversation: the worked example at the end is **replayed against a live bridge** and
+  every frame it lists must be exactly what the bridge sends, in that order, including the
+  order of the `state` messages that surround an `ask`;
+- the bytes: the files in `fixtures/` are the conformance suite for any other
+  implementation (the firmware's test should read that directory).
+
+What no test compares is the *prose*: the sentences about what the bridge does in a corner
+(the "Input rules" table, the error table, the reconnect rules) are each covered by an
+end-to-end test of the bridge, but nothing checks that the sentence and the test agree. When
+a sentence here and the bridge's behaviour differ, the behaviour is the bug if a test
+pins it and the sentence is the bug if none does: report it.
 
 Words in capitals (MUST, SHOULD, MAY) mean what they mean in RFC 2119. The **device** is
 the handheld, the **bridge** is the server it connects to, and the **player** is the
@@ -60,7 +73,18 @@ State this plainly, because the transport is plaintext.
   tool's actual input, never from the model's own description of what it is doing. The
   bridge also refuses some calls outright without asking.
 - **A failed handshake changes nothing.** A connection that does not pass `hello` never
-  displaces the current connection, never receives state, and is closed.
+  displaces the current connection, never receives a state, an ask or a result (the only
+  frame it can ever be sent is the refusal itself), cannot answer, abort or speak, and is
+  closed.
+- **Who may even connect.** Before a WebSocket exists the bridge may turn a connection
+  away: it refuses an upgrade that carries an `Origin` header (a browser sends one, a device
+  never does, so a web page cannot use the bridge), it refuses an upgrade from the bridge's
+  own machine when it runs the real Claude (the commands Claude runs there could otherwise
+  connect as the device and approve themselves; an emulator needs the bridge started with
+  `--allow-local-device`), it caps how many connections one address and everyone together
+  may hold, and after repeated wrong tokens from one address it stops answering that address
+  for a while. A device sees these as an HTTP error status on the upgrade (403) or as a
+  connection that is dropped with no answer; see "Transport".
 - **Decoding is strict on purpose.** Duplicate keys, extra keys, fractional or negative
   numbers and unprintable characters are errors, not things to be interpreted. A message
   that two parsers could read two ways (a duplicated `ok`, for instance) is exactly how
@@ -78,15 +102,36 @@ State this plainly, because the transport is plaintext.
   device that cannot reassemble fragmented WebSocket messages must still hold a whole
   message in memory (the largest is in "Size budgets").
 - Control frames (ping, pong, close) are ordinary RFC 6455. See "Keepalive".
+- **Before the WebSocket exists** the bridge may answer the upgrade request with an HTTP
+  status instead of `101`: `403` (a browser `Origin` header, or a device on the bridge's own
+  machine and the bridge is not set up for one) or `404` (a path other than `/`). Or it may
+  drop the TCP connection without a word (too many
+  connections, or the address is locked out after repeated wrong tokens). A `403` will not
+  get better by retrying. A dropped connection is treated like any other drop (see
+  "Reconnect and takeover"), except that a device which keeps retrying a wrong token makes
+  the lockout longer. The upgrade request itself must be complete within **5 seconds** of
+  the TCP connection opening, or the bridge hangs up.
 
 ### Close codes
 
+Every close the bridge sends or the transport sends on its behalf, and the one a device sees
+when nobody sent a close at all:
+
 | code | sent by | meaning |
 |---|---|---|
-| 1000 | either | normal close |
-| 1009 | transport | a frame was larger than the receiver's limit (the transport library does this before the protocol sees it) |
+| 1000 | either | normal close: the answer to a close the other side started |
+| 1001 | bridge | the bridge is shutting down; reconnect with a backoff like any other drop |
+| 1006 | nobody | not a code on the wire: what a device's library reports when the connection ended with no close frame (a Wi-Fi drop, or the bridge terminated a connection that went silent) |
+| 1007 | transport | a text frame that is not valid UTF-8. No `err`, and before the handshake no `hello_ack`: the protocol never saw a message |
+| 1008 | bridge | five undecodable or invalid frames in a row after the handshake (the fifth is answered with `err` `bad_msg` first) |
+| 1009 | transport | a message above 2048 bytes. The same, before or after the handshake: no `err`, no `hello_ack` |
 | 4001 | bridge | this connection was replaced by a newer valid one ("takeover") |
-| 4002 | bridge | the handshake failed: the hello was refused (a `hello_ack` with `ok: false` was sent first) or no hello arrived in time |
+| 4002 | bridge | the handshake failed: the hello was refused (a `hello_ack` with `ok: false` was sent first) or no hello arrived in time (nothing was sent) |
+
+Two limits matter for sizes. The protocol's frame limit is 1024 bytes of text for a message in
+either direction. The transport admits up to 2048 bytes so that a frame between the two is
+answered with `err` `bad_msg` ("frame too big") on a connection that stays open, instead of a
+close the player could not explain. Above 2048 the transport closes with 1009.
 
 A connection that goes silent is dropped without a close frame (see "Keepalive").
 
@@ -174,7 +219,7 @@ Lengths of strings are in characters, which for printable ASCII are also bytes.
 device                                   bridge
   |  open ws://host:port/                    |
   |----------------------------------------->|
-  |  hello                                   |   within 10 s of opening
+  |  hello                                   |   within 10 s of opening the socket
   |----------------------------------------->|
   |                      hello_ack ok:true   |
   |<-----------------------------------------|
@@ -202,7 +247,18 @@ order and stops at the first failure:
 
 On any failure the bridge sends `hello_ack` with `ok: false` (its `v` is always the
 bridge's own version, so a device can report which version the bridge speaks), then closes
-with 4002. On success it takes over any existing connection (below) and then sends, in
+with 4002. A wrong token is answered only after **half a second**, so a device's own wait for
+the `hello_ack` must be longer than that. Once a connection has been refused it is finished:
+anything else it sends, in the same burst or later, is ignored, and cannot become a second
+attempt. One socket gets one answer to one `hello`; a second `hello` that arrives while a
+wrong token is being answered is not looked at.
+
+After several wrong tokens from the same address (counted across connections) the bridge
+stops answering that address for a while, and the pause doubles with each further failure up
+to five minutes; a right token resets the count. A device that is told `why: token` should
+stop and ask the player, not retry.
+
+On success the bridge takes over any existing connection (below) and then sends, in
 this order:
 
 1. `hello_ack` with `ok: true`.
@@ -235,15 +291,18 @@ The first frame of every connection.
 ### `say`
 
 A typed prompt. Also how a dictated one is sent once the player has accepted the
-transcript: a transcript never starts a turn by itself.
+transcript: **a transcript never starts a turn by itself**. After `stt` the bridge rests at
+`idle` and waits; the device shows the text and, when the player taps SEND, sends it back as a
+`say`. Claude then gets exactly the text that was sent.
 
 | key | type | allowed | notes |
 |---|---|---|---|
 | `t` | string | `say` | |
 | `text` | string | any printable ASCII | 0 to 400 characters |
 
-Sent while a turn is running it is answered with `err` `busy`. The text of a `say` has no
-power to approve anything.
+Sent while a turn is running, or while the bridge is `listening` or `transcribing`, it is
+answered with `err` `busy` (and a listen window stays open). Text that is empty or only
+spaces is answered with `err` `empty`. The text of a `say` has no power to approve anything.
 
 ### `listen`
 
@@ -256,9 +315,12 @@ Push-to-talk control.
 
 `start` opens a listen window: the bridge reports phase `listening` and accepts MIC audio
 frames. `stop` closes it and the bridge transcribes what it received (phase
-`transcribing`, then an `stt` message). `cancel` closes it and discards the audio. The
-device caps an utterance at 30 seconds; the bridge refuses more than 1120000 bytes (35
-seconds) with `err` `too_long`. `start` while a turn is running is `busy`.
+`transcribing`, then an `stt` message, then `idle`). `cancel` closes it and discards the audio,
+or abandons a transcription that is still running (its result, if it arrives later, is thrown
+away). The device caps an utterance at 30 seconds; the bridge refuses more than 1120000 bytes
+(35 seconds) with `err` `too_long` and closes the window. `start` while a turn is running or
+while a transcription is in flight is `busy`; `start` inside an open window starts it over.
+`stop` with no window open is `err` `not_listening`.
 
 ### `ask_rsp`
 
@@ -282,8 +344,17 @@ Stop the running turn. Takes no fields.
 |---|---|---|---|
 | `t` | string | `abort` | |
 
-Every open ask ends with `ask_end` `abort` (the calls are denied) and the turn is
-interrupted. The device MUST treat the next `state` as the truth about what happened.
+Every open ask is denied and the turn is interrupted. The ask that is being presented ends
+with `ask_end` `abort`; asks still waiting behind it end silently, because they were never
+shown. The turn then ends with a `result` whose `ok` is `false` (text "Stopped." unless the
+session said something else), and the phase goes to `idle`, not `done` or `error`: a stop is
+not a failure. The device MUST treat the next `state` as the truth about what happened.
+
+`abort` with no turn running does not stop anything, but it still ends every open ask in the
+same way (an ask can outlive its turn, and "stop everything" must not leave an approval on
+the panel). It does nothing else, and it is never answered: no `err`, no `state` unless an
+ask ended. In particular it does **not** close a listen window or abandon a transcription;
+send `listen` `cancel` for that.
 
 ### `ping`
 
@@ -343,7 +414,15 @@ The phases mean:
 Treat each `state` as a complete snapshot that replaces the last one. The device MUST NOT
 depend on which phases occur between two others, or on the order of a `state` relative to
 the `ask`, `ask_end` or `result` that goes with it. A receiver SHOULD ignore `tl` unless
-`ph` is `tool` or `asking`.
+`ph` is `tool` or `asking` (both decoders accept a non-empty `tl` in other phases, so a
+receiver that shows it would show a stale label).
+
+`done` and `error` are **transient**: the bridge follows each with `idle` in the same instant,
+so the device cannot wait for `idle` to end a celebration or an error face; it must time
+that itself. `pend` is the number of asks open **right now**, and it is never `0` while an
+ask is on the screen: the bridge ends an ask (`ask_end`) before it reports the count without
+it. An ask can outlive the turn that raised it, so `asking` with `pend` above zero can follow
+a `result`; the phase is `idle` only when nothing is open.
 
 ### `stt`
 
@@ -380,6 +459,24 @@ without waiting, and MUST NOT answer an ask it believes is expired. A device SHO
 ignore a tap for a short moment after an ask appears, so a tap already in flight cannot
 answer a question the player has not read.
 
+What `sum` and `risk` hold is the bridge's business and may change between bridge versions;
+a device shows them and MUST NOT parse them. Today: for a shell command, the command itself
+(cut at 96 characters, and a cut or multi-line command is at least `high`); for a file tool,
+the path (the content of a write is not shown); for a web fetch, host, path and query; for any
+tool the bridge does not know (an MCP tool), the tool's name, the fields that identify its
+target, and the size of its input, always `high`. Any character that is not printable ASCII
+is shown as `?` and rates the call at least `high`. A call whose arguments look like a
+catastrophe is not asked about at all.
+
+An `ask` **replaces** whatever ask the device is showing, whatever its `id`: the bridge
+never presents two at once on a connection (it sends the old one's `ask_end` first), so a
+second `ask` arriving means the first is gone. The device keys what it shows by `id` and
+shows the newest.
+
+The bridge holds at most **8** asks open (the presented one plus those waiting). A call that
+would be the ninth is refused at once, with a message the model reads, and the device is not
+bothered with it.
+
 ### `ask_end`
 
 An ask is no longer open. The device MUST stop showing it.
@@ -396,13 +493,24 @@ When an ask ends and another is waiting, the `ask_end` for the old one is sent b
 
 `answered`: an `ask_rsp` was applied (it is the only reason the device causes, and it is
 sent whether the answer was yes or no). `timeout`: no answer in time; the call was denied.
-`abort`: the turn was aborted; denied. `disconnect`: the device was away longer than the
-grace period; denied. A device that was away usually learns that one only by not seeing
-the ask again after reconnecting.
+`abort`: the turn was aborted; denied. `disconnect`: reserved. The device being away longer
+than the grace period denies the ask, but that can only happen while no device is connected,
+so there is nobody to tell and the bridge **never sends this reason**; a device MUST still
+accept it. What a device that was away learns instead is in "Reconnect and takeover": an ask
+that is not re-sent after the handshake is gone.
+
+Only the ask being presented is announced. Asks waiting behind it have no id on the wire yet
+and end silently if they end before their turn comes (an `abort`, for instance).
 
 ### `result`
 
-The turn is over. Sent once per turn.
+The turn is over. **Every turn ends with exactly one `result`**, whatever ended it: the
+session's answer, an error, a stop, or the session failing outright. (A session that fails
+outright also gets an `err` `driver` just before its `result`, which has `ok` `false`; the
+`err` is the short reason for logs and the `result` is the end of the turn.) A device that
+releases its input on `result` therefore never waits for something that is not coming. It is
+not replayed: a device that was away when it was sent learns the outcome from the `state` it
+gets on reconnecting, which is `idle` or the turn still in progress.
 
 | key | type | allowed | notes |
 |---|---|---|---|
@@ -413,7 +521,9 @@ The turn is over. Sent once per turn.
 ### `err`
 
 Something the device did, or something that went wrong, that is not fatal to the
-connection. `err` never closes the connection by itself.
+connection. An `err` does not close the connection, with one exception: the fifth frame in a
+row that cannot be decoded is answered with `err` `bad_msg` and then closed with 1008. Any
+frame that decodes resets that count.
 
 | key | type | allowed | notes |
 |---|---|---|---|
@@ -505,23 +615,58 @@ call is denied. An `abort` while an ask is open ends it with `ask_end` `abort`. 
 
 ## Errors
 
-`err` never closes the connection. Everything here is about what the device did or what
-the bridge could not do; a refused hello is a `hello_ack`, not an `err`.
+An `err` is about what the device did or what the bridge could not do; a refused hello is a
+`hello_ack`, not an `err`. It never closes the connection, except as described under `err`
+(five undecodable frames in a row).
 
 | code | when | what the device should do |
 |---|---|---|
-| `bad_msg` | a frame that does not decode, is oversized, is of an unknown or wrong-direction type, or is out of sequence (a second `hello`, an audio frame with a bad kind or length) | log `msg`; it is a firmware bug |
-| `busy` | `say` or `listen` while a turn is running | tell the player to wait, or `abort` |
-| `unknown_ask` | `ask_rsp` for an id that is not open | drop that ask from the screen |
-| `not_listening` | a MIC frame outside a listen window | stop sending audio |
-| `too_long` | the utterance passed 1120000 bytes; the audio is discarded | tell the player; the device's own 30 s cap should prevent it |
-| `empty` | nothing intelligible in the audio | ask the player to try again |
+| `bad_msg` | a frame that does not decode, is oversized (1025 to 2048 bytes), is of an unknown or wrong-direction type, or is out of sequence (a second `hello`, an audio frame with a bad kind or length) | log `msg`; it is a firmware bug |
+| `busy` | `say` while a turn is running or the bridge is listening or transcribing; `listen` `start` while a turn is running or a transcription is in flight | tell the player to wait, or `abort` / `listen` `cancel` |
+| `unknown_ask` | `ask_rsp` for an id that is not the ask being presented | drop that ask from the screen |
+| `not_listening` | a MIC frame outside a listen window (at most one reply a second); `listen` `stop` with no window open | stop sending audio |
+| `too_long` | the utterance passed 1120000 bytes; the window is closed and the audio discarded | tell the player; the device's own 30 s cap should prevent it |
+| `empty` | `say` with empty or blank text, or nothing intelligible in the audio | ask the player to try again |
 | `stt_unavailable` | the bridge has no speech-to-text configured | fall back to typed input |
 | `stt_failed` | speech-to-text failed | ask the player to try again |
-| `driver` | the Claude session failed | show an error; a new `say` starts again |
+| `driver` | the Claude session failed; a `result` with `ok` false follows | show an error; a new `say` starts again |
 | `internal` | a bug in the bridge | log it |
 
 `msg` is for people reading logs. Do not branch on it.
+
+A device that receives a frame it cannot decode from the bridge SHOULD log it and ignore it:
+the bridge's frames are all canonical, so an undecodable one is a bug on one side, and the
+next `state` restores what matters.
+
+## Input rules
+
+What the bridge does with each input in each phase. Nothing here is a guess: each row is a
+case the bridge's end-to-end tests drive.
+
+| input | phase | result |
+|---|---|---|
+| `say` with text | `idle` (also `done`, `error`) | starts a turn: `state` `thinking` |
+| `say` with empty or blank text | any | `err` `empty`; nothing starts |
+| `say` | `thinking`, `tool`, `asking` (a turn is running) | `err` `busy`; the turn is untouched |
+| `say` | `listening`, `transcribing` | `err` `busy`; the window or transcription is untouched |
+| `listen` `start` | `idle` | opens a window: `state` `listening` |
+| `listen` `start` | `listening` | starts the window over; the audio so far is discarded |
+| `listen` `start` | a turn running, or `transcribing` | `err` `busy` |
+| MIC audio | `listening` | collected |
+| MIC audio | any other phase | `err` `not_listening` (at most one a second); the audio is discarded |
+| `listen` `stop` | `listening` | `state` `transcribing`, then `stt` and `state` `idle` (or an `err`, then `idle`) |
+| `listen` `stop` | no window open | `err` `not_listening` |
+| `listen` `cancel` | `listening` or `transcribing` | discards the audio or abandons the transcription: `state` `idle`. Nothing is said if nothing was open |
+| `abort` | a turn running | denies every open ask, interrupts the turn, ends with `result` (ok false) and `idle` |
+| `abort` | no turn, an ask open | ends the ask(s) with `ask_end` `abort`; no `result` |
+| `abort` | `listening`, `transcribing`, or nothing open | nothing, and no reply. Use `listen` `cancel` |
+| `ask_rsp` | the id of the ask being presented | applied once: `ask_end` `answered` |
+| `ask_rsp` | any other id, including one that was already answered | `err` `unknown_ask`; nothing changes |
+| `ping` | any | `pong` with the same `n` |
+| `hello` | after the handshake | `err` `bad_msg` ("hello sent twice") |
+
+The way to cancel a transcription is `listen` `cancel`, and the way to stop a turn is `abort`:
+each is ignored in the other's phase, so that a stray tap cannot do the wrong thing.
 
 ## Reconnect and takeover
 
@@ -536,23 +681,35 @@ the bridge could not do; a refused hello is a `hello_ack`, not an `err`.
 - **Any other drop** (Wi-Fi, a sleeping access point, a restarted bridge): reconnect with
   a backoff, for example 1 s doubling up to 30 s, and run the handshake again.
 - **Open asks survive a short disconnect.** They stay open for a **grace period** set in
-  the bridge's configuration (the device MUST NOT assume a value). If the device is back
-  and has passed the handshake inside it, the ask is re-sent and can still be answered,
-  with the `ttl` that is left. After the grace period the call is denied and the ask is
-  gone: it is not re-sent, and an answer for it gets `unknown_ask`.
-- **The device's view is rebuilt from the handshake.** `seq` restarts at 1 and `state` is
-  a snapshot, so the device replaces what it believed. An ask is identified by its `id`,
-  so showing the same ask a second time is harmless: the device SHOULD key what it shows
-  by `id`.
+  the bridge's configuration (the device MUST NOT assume a value; the default is 15 seconds).
+  If the device is back and has passed the handshake inside it, the ask is re-sent and can
+  still be answered, with the `ttl` that is left. After the grace period the call is denied
+  and the ask is gone: it is not re-sent, nothing is said about it, and an answer for it gets
+  `unknown_ask`.
+- **The device's view is rebuilt from the handshake, and the rule is: on every handshake,
+  discard any ask you are showing that is not sent again.** `seq` restarts at 1 and `state`
+  is a snapshot, so the device replaces what it believed. The first `state` of a connection
+  says how many asks are open: **`pend` 0 means none**, and a device that sees it MUST take
+  down any ask it still has on the screen. If `pend` is above zero the bridge sends the
+  presented ask right behind the `state`, and an ask the device was showing under another
+  `id` is replaced by it. An ask is identified by its `id`, so showing the same ask a second
+  time is harmless: the device SHOULD key what it shows by `id`. There is no end-of-handshake
+  marker; `pend` in the first `state` is the signal.
 - **Nothing else is replayed.** The bridge makes no promise to repeat an `stt`, `result`,
-  `ask_end` or `err` that was sent while the device was away.
+  `ask_end` or `err` that was sent while the device was away. In particular the bridge does
+  not send `ask_end` `disconnect` for an ask that expired while the device was gone.
+- **Close events are per socket.** A device that has already opened a new connection may
+  still receive the old one's close (a late 4001 from a half-open socket): handle `close` on
+  the socket it belongs to, and let it stop a reconnect only if it is the current socket's.
 
 ## Keepalive
 
 - The bridge sends a WebSocket **ping** every **10 seconds**. The device's WebSocket
   library MUST answer with a pong (every common one does this on its own).
-- Any frame from the device, including that pong, counts as activity. If the bridge sees
-  **no frame at all for 25 seconds** it drops the connection, without a close frame.
+- Any frame from the device, including that pong, counts as activity. The bridge looks at
+  each connection **every 5 seconds**; at the first look that finds **more than 25 seconds**
+  of silence it drops the connection, without a close frame. A silent device is therefore
+  dropped between 25 and 30 seconds after its last frame (more than 25, at most 30).
 - The device MAY send an application `ping` at any time; the bridge answers with a
   `pong` carrying the same `n`. That tells the device the bridge's code is alive, not
   merely its socket. A device that has not heard from the bridge in about 25 seconds
@@ -561,14 +718,33 @@ the bridge could not do; a refused hello is a `hello_ack`, not an `err`.
 
 ### Timings in one place
 
-| what | value | enforced by |
+Every default the bridge ships with, from `DEFAULTS` in `src/server.ts`; a test compares this
+table with that object row for row, so a number cannot change on one side only. A deployment
+may override any of them (`askTtlMs` and `graceMs` are the two an operator sets from the
+command line); a device MUST NOT assume the defaults for those two.
+
+<!-- TIMINGS_TABLE -->
+
+| setting | default | what it is |
 |---|---|---|
-| time to send `hello` after the socket opens | 10 s | bridge |
-| WebSocket ping interval | 10 s | bridge |
-| silence before the connection is dropped | 25 s | bridge |
-| time to answer an ask | its `ttl`, in seconds | the bridge, authoritatively |
-| how long an ask outlives a disconnect | the bridge's grace period (configuration) | bridge |
-| one utterance | 30 s on the device, 35 s on the bridge | both |
+| `helloTimeoutMs` | 10 s | time to send `hello` after the socket opens; otherwise 4002 |
+| `headersTimeoutMs` | 5 s | time to finish the HTTP upgrade request after the TCP connection opens |
+| `authFailDelayMs` | 0.5 s | a wrong token is answered only after this long |
+| `authFreeFailures` | 5 | wrong tokens from one address before it is paused |
+| `authLockoutBaseMs` | 2 s | the first pause; each further wrong token doubles it |
+| `authLockoutMaxMs` | 5 min | the longest pause |
+| `authForgetMs` | 10 min | an address with no wrong token for this long is forgotten |
+| `pingIntervalMs` | 10 s | WebSocket ping interval |
+| `keepaliveCheckMs` | 5 s | how often a connection is looked at for silence |
+| `deadAfterMs` | 25 s | silence beyond this, found at a look, drops the connection |
+| `askTtlMs` | 90 s | time to answer an ask (its `ttl` counts down from this) |
+| `graceMs` | 15 s | how long an ask outlives a disconnect |
+| `maxConnections` | 32 | TCP connections the bridge holds, from anyone |
+| `maxConnectionsPerAddress` | 8 | TCP connections from one address |
+| `maxBufferedBytes` | 64 KiB | bytes queued for a device that is not reading, beyond which it is dropped |
+| `maxOpenAsks` | 8 | asks open at once, the presented one included |
+
+One utterance is capped at 30 s on the device and 35 s on the bridge (`utteranceMaxBytes`).
 
 ## Versioning
 
@@ -630,11 +806,17 @@ test needs nothing else:
   means the bridge sent it (the device decodes it).
 - `expect`: `valid` frames MUST decode, and every field MUST hold the value the frame
   says. `invalid` frames MUST be refused. `code` is then always `bad_msg`.
+- `canonical`: present only as `false`, on a valid device frame that the bridge accepts but
+  no encoder would write (whitespace, keys in another order, an escape such as `\/` or
+  `\u0041`, a key spelled with an escape). Re-encoding it gives different bytes, so the
+  "decode and re-encode to the same bytes" check does not apply to it. A firmware never has to
+  produce these; another implementation of the bridge has to accept them. Every other valid
+  fixture is canonical, and a manifest entry has no `canonical` key.
 - The valid fixtures cover every message type, both forms of `hello_ack`, every phase,
   risk, `ask_end` reason, `err` code and refusal, and audio frames of 2, 640 and 1280
-  bytes in both directions, plus the largest possible frame of each text type. The valid
-  `bridge` text fixtures are exactly what the bridge's encoder produces today, so they
-  are also the firmware's reference input.
+  bytes in both directions, plus the largest possible frame of each text type (the sizes in
+  "Size budgets"; a test compares them). The valid `bridge` text fixtures are exactly what
+  the bridge's encoder produces today, so they are also the firmware's reference input.
 - The invalid fixtures each contain a single defect on top of an otherwise valid frame:
   an unknown type, a missing key, an extra key, a duplicated key, a wrong type, a bad
   number, a bad enum value, non-ASCII, an over-long string, an oversized frame, a bad id,
@@ -647,9 +829,16 @@ The fixtures are regenerated by `node tools/gen-fixtures.ts` from the real encod
 ## Worked example
 
 A complete conversation. Lines starting with `D>` are text frames the device sends, lines
-starting with `B>` are frames the bridge sends, and lines starting with `#` are
-commentary. The bytes are exactly what the encoders produce; `test/protocol.test.ts`
-decodes every line and re-encodes it to prove it.
+starting with `B>` are frames the bridge sends, lines starting with `#@` are things that
+happen that are not frames (audio, time passing, the connection dropping), and lines
+starting with `#` are commentary.
+
+This is not an illustration: `test/server.e2e.test.ts` **replays it against a live bridge**.
+It sends each `D>` line, performs each `#@` action, and compares what the bridge sends with
+the `B>` lines that follow, byte for byte and in order, so the order of the `state` messages
+around an `ask` is the order a real bridge produces. (The bridge here asks for 60 seconds, not
+the default 90, and a scripted Claude asks to run `npm test` and then `rm -rf build`.)
+`test/protocol.test.ts` also decodes every line and re-encodes it to prove it is canonical.
 
 ```transcript
 # 1. Connect. The device speaks first; its token is a placeholder here.
@@ -659,45 +848,56 @@ B> {"t":"state","seq":1,"ph":"idle","tl":"","pend":0}
 # 2. Keepalive at the application level (optional; see Keepalive).
 D> {"t":"ping","n":1}
 B> {"t":"pong","n":1}
-# 3. Push to talk. Between start and stop the device sends binary MIC frames (not shown).
+# 3. Push to talk. Between start and stop the device sends binary MIC frames.
 D> {"t":"listen","m":"start"}
 B> {"t":"state","seq":2,"ph":"listening","tl":"","pend":0}
+#@ mic 25 frames of 640 bytes (20 ms each)
 D> {"t":"listen","m":"stop"}
 B> {"t":"state","seq":3,"ph":"transcribing","tl":"","pend":0}
 B> {"t":"stt","text":"run the unit tests"}
 B> {"t":"state","seq":4,"ph":"idle","tl":"","pend":0}
-# 4. The player reads the transcript and taps SEND, so the device sends it as a say.
+# 4. Nothing runs yet: a transcript is only shown. The player reads it and taps SEND,
+#    so the device sends it as a say. Only now does a turn start.
 D> {"t":"say","text":"run the unit tests"}
 B> {"t":"state","seq":5,"ph":"thinking","tl":"","pend":0}
-# 5. Claude wants to run a command. The bridge asks; only the tap can allow it.
-B> {"t":"state","seq":6,"ph":"asking","tl":"Bash","pend":1}
+# 5. Claude starts a command, so the phase is `tool`, and then asks. The ask comes before the
+#    state that reports it, and only the tap can allow it.
+B> {"t":"state","seq":6,"ph":"tool","tl":"Bash","pend":0}
 B> {"t":"ask","id":"a3f09c1e","tl":"Bash","risk":"med","sum":"npm test","ttl":60}
+B> {"t":"state","seq":7,"ph":"asking","tl":"Bash","pend":1}
 D> {"t":"ask_rsp","id":"a3f09c1e","ok":true}
 B> {"t":"ask_end","id":"a3f09c1e","why":"answered"}
-B> {"t":"state","seq":7,"ph":"tool","tl":"Bash","pend":0}
-B> {"t":"state","seq":8,"ph":"thinking","tl":"","pend":0}
-# 6. The turn ends: one result, and the phase settles back to idle via done.
+B> {"t":"state","seq":8,"ph":"tool","tl":"Bash","pend":0}
+B> {"t":"state","seq":9,"ph":"thinking","tl":"","pend":0}
+# 6. The turn ends: one result, and the phase settles back to idle via done. `done` is
+#    followed by `idle` at once; the device times its own celebration.
 B> {"t":"result","ok":true,"text":"All 42 tests pass."}
-B> {"t":"state","seq":9,"ph":"done","tl":"","pend":0}
-B> {"t":"state","seq":10,"ph":"idle","tl":"","pend":0}
+B> {"t":"state","seq":10,"ph":"done","tl":"","pend":0}
+B> {"t":"state","seq":11,"ph":"idle","tl":"","pend":0}
 # 7. A second turn asks about a risky command; then the Wi-Fi drops with the ask still open.
 D> {"t":"say","text":"delete the build folder"}
-B> {"t":"state","seq":11,"ph":"thinking","tl":"","pend":0}
-B> {"t":"state","seq":12,"ph":"asking","tl":"Bash","pend":1}
+B> {"t":"state","seq":12,"ph":"thinking","tl":"","pend":0}
+B> {"t":"state","seq":13,"ph":"tool","tl":"Bash","pend":0}
 B> {"t":"ask","id":"b7d24e90","tl":"Bash","risk":"high","sum":"rm -rf build","ttl":60}
-#    (19 seconds pass, the connection is lost, the device reconnects)
-# 8. Reconnect. A fresh state with seq 1, then the open ask again with its REMAINING ttl.
+B> {"t":"state","seq":14,"ph":"asking","tl":"Bash","pend":1}
+#@ wait 10 seconds
+#@ drop the connection
+#@ wait 9 seconds
+# 8. Reconnect, 19 seconds after the ask appeared. A fresh state with seq 1 (pend 1: an ask is
+#    open), then the ask again with its REMAINING ttl.
+#@ reconnect
 D> {"t":"hello","v":1,"token":"example.token_0123456789~abcdef","dev":"tamaclaude-a1b2","fw":"0.1.0","rate":16000,"bits":16,"ch":1}
 B> {"t":"hello_ack","v":1,"ok":true,"sid":"c0ffee00-1234-4abc-8def-0123456789ab"}
 B> {"t":"state","seq":1,"ph":"asking","tl":"Bash","pend":1}
 B> {"t":"ask","id":"b7d24e90","tl":"Bash","risk":"high","sum":"rm -rf build","ttl":41}
 D> {"t":"ask_rsp","id":"b7d24e90","ok":false}
 B> {"t":"ask_end","id":"b7d24e90","why":"answered"}
-B> {"t":"state","seq":2,"ph":"thinking","tl":"","pend":0}
+B> {"t":"state","seq":2,"ph":"tool","tl":"Bash","pend":0}
+B> {"t":"state","seq":3,"ph":"thinking","tl":"","pend":0}
+B> {"t":"result","ok":true,"text":"I did not delete anything because you denied it."}
+B> {"t":"state","seq":4,"ph":"done","tl":"","pend":0}
+B> {"t":"state","seq":5,"ph":"idle","tl":"","pend":0}
 # 9. The same id answered again is unknown now.
 D> {"t":"ask_rsp","id":"b7d24e90","ok":true}
 B> {"t":"err","code":"unknown_ask","msg":"no open ask with that id"}
-B> {"t":"result","ok":false,"text":"I did not delete anything because you denied it."}
-B> {"t":"state","seq":3,"ph":"done","tl":"","pend":0}
-B> {"t":"state","seq":4,"ph":"idle","tl":"","pend":0}
 ```

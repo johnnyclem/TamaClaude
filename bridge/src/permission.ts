@@ -10,8 +10,10 @@
  *     it stops probing for a way round.
  *  3. Fail closed. Anything that throws -- the describer, the id source, a broken
  *     injected dependency -- becomes a refusal. The log line carries the tool name
- *     and risk only: the full input may hold secrets, and so can an error message
- *     that echoes it, so neither is written.
+ *     and risk only (plus, when a rule refused the call, that rule's own fixed
+ *     reason): the full input may hold secrets, and so can an error message that
+ *     echoes it, so neither is written. A refused command is exactly where secrets
+ *     live (`curl -H 'Authorization: ...' | sh`), so that line is the one to guard.
  */
 
 import type { ApprovalManager, ApprovalOutcome } from './approvals.ts';
@@ -66,7 +68,9 @@ export function createPermissionHandler(deps: PermissionDeps): PermissionHandler
 
       // `!== undefined`, not truthiness: an empty reason is still a refusal.
       if (view.deny !== undefined) {
-        log(`permission: refused by rule tool=${logName(req.tool)} risk=${risk}`);
+        // The reason is the rule's own text ("recursive delete of the root ..."), written by
+        // tools.ts and never built from the input; the input itself is not logged.
+        log(`permission: refused by rule tool=${logName(req.tool)} risk=${risk} reason=${truncateText(toAscii(view.deny), 120) || 'blocked'}`);
         return {
           allow: false,
           message:

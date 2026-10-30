@@ -16,6 +16,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { SDKMessage, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import { ClaudeAdapter } from '../src/drivers/claude-adapter.ts';
+import type { AdapterEvent } from '../src/drivers/claude-adapter.ts';
 import type { DriverEvent } from '../src/types.ts';
 
 const SID = 'sess-1';
@@ -97,7 +98,7 @@ const resultOk = (text: string, extra: Record<string, unknown> = {}): SDKMessage
 const resultErr = (subtype: string, extra: Record<string, unknown> = {}): SDKMessage =>
   sdk({ type: 'result', subtype, is_error: true, errors: ['boom'], ...extra });
 
-function feed(a: ClaudeAdapter, ...msgs: SDKMessage[]): DriverEvent[] {
+function feed(a: ClaudeAdapter, ...msgs: SDKMessage[]): AdapterEvent[] {
   return msgs.flatMap((m) => a.map(m));
 }
 
@@ -183,7 +184,7 @@ test('a result becomes the terminal event', () => {
   ]);
 });
 
-test('every error result is a failed terminal with no text, including subtypes added later', () => {
+test('every error result is a failed terminal carrying the CLI\'s own sentence, including subtypes added later', () => {
   for (const subtype of [
     'error_during_execution',
     'error_max_turns',
@@ -192,8 +193,61 @@ test('every error result is a failed terminal with no text, including subtypes a
     'error_from_the_future',
   ]) {
     const a = new ClaudeAdapter();
-    assert.deepEqual(a.map(resultErr(subtype)), [{ k: 'result', ok: false, text: '', subtype }], subtype);
+    assert.deepEqual(a.map(resultErr(subtype)), [{ k: 'result', ok: false, text: 'boom', subtype }], subtype);
   }
+});
+
+test('the CLI\'s internal diagnostics are not a message for a person, and an empty list is no text', () => {
+  const a = new ClaudeAdapter();
+  const diag = '[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null';
+  assert.deepEqual(a.map(resultErr('error_during_execution', { errors: [diag] })), [
+    { k: 'result', ok: false, text: '', subtype: 'error_during_execution' },
+  ]);
+  assert.deepEqual(a.map(resultErr('error_during_execution', { errors: [diag, 'Reached the limit'] })), [
+    { k: 'result', ok: false, text: 'Reached the limit', subtype: 'error_during_execution' },
+  ]);
+  assert.deepEqual(a.map(resultErr('error_during_execution', { errors: [] })), [
+    { k: 'result', ok: false, text: '', subtype: 'error_during_execution' },
+  ]);
+  assert.deepEqual(a.map(resultErr('error_during_execution', { errors: [42, null, '  '] })), [
+    { k: 'result', ok: false, text: '', subtype: 'error_during_execution' },
+  ]);
+  const long = a.map(resultErr('error_during_execution', { errors: ['x'.repeat(5000)] }))[0] as { text: string };
+  assert.ok(long.text.length <= 300, 'a runaway error cannot flood the server');
+});
+
+test('a result the API marked as an error keeps the CLI\'s sentence and is not ok', () => {
+  const a = new ClaudeAdapter();
+  assert.deepEqual(
+    a.map(resultOk('Invalid API key. Fix external API key', { is_error: true, terminal_reason: 'api_error' })),
+    [{ k: 'result', ok: false, text: 'Invalid API key. Fix external API key', subtype: 'success' }],
+  );
+});
+
+test('a stop is reported as interrupted whoever asked for it: the CLI calls it an error', () => {
+  const diag = ['[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null'];
+  for (const reason of ['aborted_streaming', 'aborted_tools']) {
+    const a = new ClaudeAdapter();
+    assert.deepEqual(
+      a.map(resultErr('error_during_execution', { terminal_reason: reason, errors: diag })),
+      [{ k: 'result', ok: false, text: '', subtype: 'interrupted' }],
+      reason,
+    );
+  }
+  // Companions: the same subtype with any other reason is an ordinary failure, so the mapping
+  // is driven by the reason and not by the subtype.
+  for (const reason of ['api_error', 'max_turns', 'completed', undefined]) {
+    const a = new ClaudeAdapter();
+    const out = a.map(resultErr('error_during_execution', { terminal_reason: reason }))[0] as { subtype: string };
+    assert.equal(out.subtype, 'error_during_execution', String(reason));
+  }
+  // And it still closes what was open before it reports.
+  const a = new ClaudeAdapter();
+  feed(a, toolBlockStart(0, 't1'), blockStop(0));
+  assert.deepEqual(a.map(resultErr('error_during_execution', { terminal_reason: 'aborted_tools' })), [
+    { k: 'tool_end', id: 't1', ok: false },
+    { k: 'result', ok: false, text: '', subtype: 'interrupted' },
+  ]);
 });
 
 // ---------------------------------------------------------------------------
@@ -336,7 +390,7 @@ test('a result closes any tool still open before it reports the end of the turn'
   assert.deepEqual(a.map(resultErr('error_during_execution')), [
     { k: 'tool_end', id: 't1', ok: false },
     { k: 'tool_end', id: 't2', ok: false },
-    { k: 'result', ok: false, text: '', subtype: 'error_during_execution' },
+    { k: 'result', ok: false, text: 'boom', subtype: 'error_during_execution' },
   ]);
   assert.equal(a.openToolCount, 0);
 });
@@ -490,6 +544,268 @@ test('history echoed on resume is not this turn', () => {
 
 // ---------------------------------------------------------------------------
 // The balance rule, over generated sequences
+// ---------------------------------------------------------------------------
+// Whose turn is it? (M18, D7)
+// ---------------------------------------------------------------------------
+
+const MINE = '11111111-1111-4111-8111-111111111111';
+const OTHER = '22222222-2222-4222-8222-222222222222';
+
+/** What the real CLI adds to the frames of a turn it ran for a prompt. */
+const stamped = (msg: SDKMessage, ...uuids: string[]): SDKMessage =>
+  ({ ...(msg as object), user_message_uuid: uuids[uuids.length - 1], user_message_uuids: uuids }) as unknown as SDKMessage;
+
+function bound(): ClaudeAdapter {
+  const a = new ClaudeAdapter();
+  a.begin(MINE);
+  return a;
+}
+
+test('an adapter nobody has told about a prompt passes everything through, as before', () => {
+  const a = new ClaudeAdapter();
+  assert.deepEqual(a.map(assistantText('hi')), [{ k: 'text', text: 'hi' }]);
+  assert.deepEqual(a.map(resultOk('done')), [{ k: 'result', ok: true, text: 'done', subtype: 'success' }]);
+});
+
+test('the frames of the turn we asked for are stamped, and their tools and result are ours', () => {
+  const a = bound();
+  const out = feed(
+    a,
+    stamped(messageStart(), MINE),
+    toolBlockStart(0, 't1'),
+    blockStop(0),
+    stamped(assistantTool('t1'), MINE),
+    toolResults({ id: 't1' }),
+    messageStart(),
+    stamped(assistantText('Done.'), MINE),
+    stamped(resultOk('Done.'), MINE),
+  );
+  assert.deepEqual(out, [
+    { k: 'tool_start', id: 't1', name: 'Bash' },
+    { k: 'tool_end', id: 't1', ok: true },
+    { k: 'text', text: 'Done.' },
+    { k: 'result', ok: true, text: 'Done.', subtype: 'success' },
+  ]);
+});
+
+test('a turn that starts on its own is invisible: no tools, no text, and its result is foreign', () => {
+  const a = bound();
+  const out = feed(a, messageStart(), toolBlockStart(0, 'bg1'), blockStop(0), assistantText('the job finished'), toolResults({ id: 'bg1' }));
+  assert.deepEqual(out, [], 'an unstamped first frame is not ours');
+  assert.equal(a.openToolCount, 0, 'a tool of a turn nobody asked for is never announced, so it can never dangle');
+  assert.deepEqual(a.map(resultOk('the job finished')), [{ k: 'foreign_result' }]);
+});
+
+test('a frame stamped with another prompt\'s uuid is not ours, and a list that includes ours is', () => {
+  const a = bound();
+  assert.deepEqual(feed(a, stamped(assistantText('not mine'), OTHER)), []);
+  assert.deepEqual(a.map(stamped(resultOk('not mine'), OTHER)), [{ k: 'foreign_result' }]);
+  // Several prompts folded into one turn: ours is anywhere in the list.
+  assert.deepEqual(a.map(stamped(assistantText('mine'), OTHER, MINE)), [{ k: 'text', text: 'mine' }]);
+  assert.deepEqual(a.map(stamped(resultOk('mine'), OTHER, MINE)), [{ k: 'result', ok: true, text: 'mine', subtype: 'success' }]);
+});
+
+test('the single-uuid field alone is enough when the list is absent (older CLIs)', () => {
+  const a = bound();
+  const only = { ...(assistantText('hi') as object), user_message_uuid: MINE } as unknown as SDKMessage;
+  assert.deepEqual(a.map(only), [{ k: 'text', text: 'hi' }]);
+});
+
+test('a foreign turn running when our prompt is sent does not swallow ours', () => {
+  const a = new ClaudeAdapter();
+  a.begin(OTHER);
+  feed(a, stamped(resultOk('an earlier prompt'), OTHER)); // idle now; the adapter is judging
+  // A notification turn starts on its own, and only THEN is the next prompt pushed behind it.
+  assert.deepEqual(feed(a, assistantText('NOTIFICATION')), []);
+  a.begin(MINE);
+  assert.deepEqual(feed(a, resultOk('NOTIFICATION-TURN: done')), [{ k: 'foreign_result' }], 'its result is not our answer');
+  // Then our own turn.
+  assert.deepEqual(feed(a, stamped(assistantText('real answer'), MINE), stamped(resultOk('real answer'), MINE)), [
+    { k: 'text', text: 'real answer' },
+    { k: 'result', ok: true, text: 'real answer', subtype: 'success' },
+  ]);
+});
+
+test('after our result nothing is awaited: late frames and a second result are foreign', () => {
+  const a = bound();
+  feed(a, stamped(assistantText('x'), MINE), stamped(resultOk('x'), MINE));
+  assert.deepEqual(feed(a, stamped(assistantText('late'), MINE)), [], 'the old uuid no longer names anything in flight');
+  assert.deepEqual(a.map(stamped(resultOk('again'), MINE)), [{ k: 'foreign_result' }]);
+  // A new prompt re-arms it.
+  a.begin(OTHER);
+  assert.deepEqual(a.map(stamped(resultOk('new'), OTHER)), [{ k: 'result', ok: true, text: 'new', subtype: 'success' }]);
+});
+
+test('a result with no stamp is ours only when the turn so far was ours', () => {
+  const a = bound();
+  feed(a, stamped(messageStart(), MINE));
+  assert.deepEqual(a.map(resultOk('done')), [{ k: 'result', ok: true, text: 'done', subtype: 'success' }]);
+  // Companion: the same result with no frame before it at all is foreign.
+  const b = bound();
+  assert.deepEqual(b.map(resultOk('done')), [{ k: 'foreign_result' }]);
+});
+
+test('a zeroed error (the turn never ran) is ours even with no frame and no stamp', () => {
+  const a = bound();
+  assert.deepEqual(a.map(resultErr('error_during_execution', { errors: ['Claude Code requires X'], num_turns: 0 })), [
+    { k: 'result', ok: false, text: 'Claude Code requires X', subtype: 'error_during_execution' },
+  ]);
+  const b = bound();
+  assert.deepEqual(b.map(resultErr('error_during_execution', { errors: ['x'], startup_failure_reason: 'node_too_old' })), [
+    { k: 'result', ok: false, text: 'x', subtype: 'error_during_execution' },
+  ]);
+  // Companion: an ordinary error that did run turns is foreign when nothing says it is ours.
+  const c = bound();
+  assert.deepEqual(c.map(resultErr('error_during_execution', { num_turns: 3 })), [{ k: 'foreign_result' }]);
+});
+
+test('a foreign result does not end tools that belong to our turn', () => {
+  const a = bound();
+  feed(a, stamped(messageStart(), MINE), toolBlockStart(0, 't1'), blockStop(0));
+  assert.equal(a.openToolCount, 1);
+  assert.deepEqual(a.map(stamped(resultOk('other'), OTHER)), [{ k: 'foreign_result' }]);
+  assert.equal(a.openToolCount, 1, 'our tool is still running');
+});
+
+test('a tool result never opens a turn on its own', () => {
+  const a = bound();
+  assert.deepEqual(feed(a, toolResults({ id: 'nope' })), []);
+  // And it did not poison the state: our stamped frame still opens our turn.
+  assert.deepEqual(feed(a, stamped(assistantText('hi'), MINE)), [{ k: 'text', text: 'hi' }]);
+});
+
+test('a stray tool result between turns does not turn the next signal into someone else\'s', () => {
+  // Echoed history, a late result: it opens nothing, so the state stays "no turn yet" and the
+  // zeroed failure that follows (a stale session id) is still recognised as ours.
+  const a = bound();
+  assert.deepEqual(feed(a, toolResults({ id: 'old' })), []);
+  assert.deepEqual(a.map(staleResult()), [{ k: 'resume_failed' }]);
+  const b = bound();
+  feed(b, toolResults({ id: 'old' }));
+  assert.deepEqual(b.map(resultErr('error_during_execution', { errors: ['Claude Code requires X'], num_turns: 0 })), [
+    { k: 'result', ok: false, text: 'Claude Code requires X', subtype: 'error_during_execution' },
+  ]);
+});
+
+test('begin() forgets a turn of ours that never reported its result', () => {
+  const a = bound();
+  feed(a, stamped(messageStart(), MINE)); // turn open, result never came
+  a.begin(OTHER);
+  assert.deepEqual(feed(a, assistantText('unstamped')), [], 'the old turn is not inherited by the new prompt');
+});
+
+// ---------------------------------------------------------------------------
+// Signals only the driver can act on
+// ---------------------------------------------------------------------------
+
+const staleResult = (): SDKMessage =>
+  resultErr('error_during_execution', {
+    errors: ['No conversation found with session ID: dead'],
+    num_turns: 0,
+  });
+
+test('a missing transcript is a resume_failed signal, not a result', () => {
+  const a = bound();
+  assert.deepEqual(a.map(staleResult()), [{ k: 'resume_failed' }]);
+});
+
+test('the stale-resume signal needs all of it: the words, the subtype, nothing seen, a prompt awaited', () => {
+  // Wrong subtype.
+  const a = bound();
+  assert.deepEqual(a.map(resultErr('error_max_turns', { errors: ['No conversation found with session ID: x'] })), [{ k: 'foreign_result' }]);
+  // Frames already seen: the session was found.
+  const b = bound();
+  feed(b, stamped(messageStart(), MINE));
+  const out = b.map(staleResult());
+  assert.ok(!out.some((e) => e.k === 'resume_failed'), 'a session that has produced frames was found');
+  // Nothing awaited.
+  const c = new ClaudeAdapter();
+  c.begin(MINE);
+  c.map(stamped(resultOk('x'), MINE));
+  assert.ok(!c.map(staleResult()).some((e) => e.k === 'resume_failed'));
+  // Other words.
+  const d = bound();
+  assert.ok(!d.map(resultErr('error_during_execution', { errors: ['Something else'], num_turns: 0 })).some((e) => e.k === 'resume_failed'));
+});
+
+test('an unadvised adapter maps a stale-resume result as the plain error it is', () => {
+  const a = new ClaudeAdapter();
+  assert.deepEqual(a.map(staleResult()), [
+    { k: 'result', ok: false, text: 'No conversation found with session ID: dead', subtype: 'error_during_execution' },
+  ]);
+});
+
+test('an api_retry becomes a signal, and only errors retrying cannot fix carry a sentence', () => {
+  const retry = (error: string, status: number | null, attempt = 1): SDKMessage =>
+    sdk({ type: 'system', subtype: 'api_retry', attempt, max_retries: 10, retry_delay_ms: 600, error_status: status, error });
+  const a = new ClaudeAdapter();
+  assert.deepEqual(a.map(retry('authentication_failed', 401)), [
+    { k: 'api_retry', error: 'authentication_failed', status: 401, attempt: 1, max: 10, giveUp: 'Claude API error 401: the API key was rejected. Check ANTHROPIC_API_KEY.' },
+  ]);
+  assert.deepEqual(a.map(retry('overloaded', 529, 3)), [
+    { k: 'api_retry', error: 'overloaded', status: 529, attempt: 3, max: 10, giveUp: undefined },
+  ]);
+  // A connection error has no status; the sentence must not say "null".
+  const out = a.map(retry('billing_error', null))[0] as { giveUp: string };
+  assert.ok(!/null|undefined/.test(out.giveUp) && out.giveUp.startsWith('Claude API error: '), out.giveUp);
+  for (const code of ['authentication_failed', 'oauth_org_not_allowed', 'account_on_hold', 'verification_required', 'billing_error', 'invalid_request', 'model_not_found', 'cloud_credential_error']) {
+    const g = (a.map(retry(code, 400))[0] as { giveUp: string | undefined }).giveUp;
+    assert.ok(g !== undefined && /^[\x20-\x7e]+$/.test(g) && g.length <= 90, `${code}: ${g}`);
+  }
+  // Malformed notices are tolerated.
+  assert.deepEqual(a.map(sdk({ type: 'system', subtype: 'api_retry' })), [
+    { k: 'api_retry', error: 'unknown', status: null, attempt: 0, max: 0, giveUp: undefined },
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// Bound mode over generated sequences
+// ---------------------------------------------------------------------------
+
+test('bound: whatever the interleaving, tools balance and only our stamped results are reported', () => {
+  let ours = 0;
+  let reported = 0;
+  for (let seed = 1; seed <= 300; seed++) {
+    const rnd = lcg(seed * 7919);
+    const pick = <T>(xs: readonly T[]): T => xs[Math.floor(rnd() * xs.length)]!;
+    const a = new ClaudeAdapter();
+    a.begin(MINE);
+    const open = new Set<string>();
+    for (let step = 0; step < 60; step++) {
+      const id = pick(['a', 'b', 'c']);
+      const stamp = pick<string[] | undefined>([[MINE], [OTHER], [OTHER, MINE], undefined, undefined]);
+      const base = pick<SDKMessage>([
+        messageStart(),
+        toolBlockStart(0, id),
+        blockStop(0),
+        assistantTool(id),
+        assistantText('hi'),
+        toolResults({ id }),
+        resultOk('done'),
+        resultErr('error_during_execution'),
+      ]);
+      const msg = stamp !== undefined && ((base as { type: string }).type !== 'user') ? stamped(base, ...stamp) : base;
+      const isResult = (msg as { type: string }).type === 'result';
+      const isOurs = stamp?.includes(MINE) === true;
+      for (const ev of a.map(msg)) {
+        if (ev.k === 'tool_start') open.add(ev.id);
+        else if (ev.k === 'tool_end') {
+          assert.ok(open.has(ev.id), `seed ${seed}: ${ev.id} ended while not open`);
+          open.delete(ev.id);
+        } else if (ev.k === 'result') {
+          reported++;
+          assert.equal(open.size, 0, `seed ${seed}: a result left ${[...open]} dangling`);
+          if (isResult && stamp !== undefined) assert.ok(isOurs, `seed ${seed}: a result stamped ${JSON.stringify(stamp)} was reported as ours`);
+          a.begin(MINE); // the next prompt
+        }
+      }
+      if (isResult && isOurs) ours++;
+      assert.equal(a.openToolCount, open.size, `seed ${seed}: the adapter's own count drifted`);
+    }
+  }
+  assert.ok(ours > 50 && reported > 50, `generator too weak: ${ours} ours, ${reported} reported`);
+});
+
 // ---------------------------------------------------------------------------
 
 /** A small deterministic generator, so a failing sequence can be replayed from its seed. */

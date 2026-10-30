@@ -41,6 +41,13 @@ export interface FixtureEntry {
   expect: 'valid' | 'invalid';
   /** Present only when invalid. */
   code?: 'bad_msg';
+  /**
+   * Present, and `false`, only on a valid frame the bridge ACCEPTS but would never itself write
+   * (whitespace, reordered keys, an escape the encoder does not use). Re-encoding it gives
+   * different bytes by design, so the "decode and re-encode to the same bytes" rule does not
+   * apply to it; decoding it must still give the message `note` describes.
+   */
+  canonical?: false;
   note: string;
 }
 
@@ -83,6 +90,10 @@ export function buildFixtures(): Fixture[] {
   const validText = (dir: 'device' | 'bridge', file: string, wire: string, note: string): void => {
     out.push({ entry: { file: `${file}.txt`, dir, kind: 'text', expect: 'valid', note }, bytes: utf8.encode(wire) });
   };
+  /** A frame the grammar admits and the encoder would never write: typed by hand, on purpose. */
+  const loose = (file: string, wire: string, note: string): void => {
+    out.push({ entry: { file: `device-${file}.txt`, dir: 'device', kind: 'text', expect: 'valid', canonical: false, note }, bytes: utf8.encode(wire) });
+  };
   const dev = (name: string, m: DeviceMsg, note: string): void => validText('device', `device-${name}`, encodeDeviceMsg(m), note);
   const brg = (name: string, m: BridgeMsg, note: string): void => validText('bridge', `bridge-${name}`, encodeBridgeMsg(m), note);
   const validAudio = (dir: 'device' | 'bridge', name: string, kind: number, len: number, note: string): void => {
@@ -102,6 +113,10 @@ export function buildFixtures(): Fixture[] {
     t: 'hello', v: INT_MAX, token: tokenOf(LIMITS.tokenMax), dev: plain(LIMITS.devMax, 'd'), fw: plain(LIMITS.fwMax, 'f'),
     rate: INT_MAX, bits: INT_MAX, ch: INT_MAX,
   }, 'Every field at its maximum; numbers are shape-checked only, the server rejects the values');
+  dev('hello-worst-case', {
+    t: 'hello', v: INT_MAX, token: plain(LIMITS.tokenMax, 'a'), dev: '"'.repeat(LIMITS.devMax), fw: '"'.repeat(LIMITS.fwMax),
+    rate: INT_MAX, bits: INT_MAX, ch: INT_MAX,
+  }, 'dev and fw are all quotes, so every character escapes: the largest hello frame');
 
   dev('say-typical', { t: 'say', text: 'run the tests and tell me what failed' }, 'A typed prompt');
   dev('say-empty', { t: 'say', text: '' }, 'Empty text is valid on the wire; whether it does anything is the server\'s business');
@@ -116,6 +131,13 @@ export function buildFixtures(): Fixture[] {
   dev('ping-0', { t: 'ping', n: 0 }, 'Application ping');
   dev('ping-max', { t: 'ping', n: INT_MAX }, 'Largest counter');
 
+  // Valid, accepted by the bridge, and NOT what an encoder writes. A firmware never has to
+  // produce these; another implementation of the bridge has to accept them.
+  loose('ping-noncanonical-whitespace', ' \t{ "t" : "ping" ,\r\n\t"n" : 7 }\t ', 'Whitespace (space, tab, CR, LF) before, between and after the tokens, none of it at the very end of the file: a ping with n 7');
+  loose('ask_rsp-noncanonical-order', '{"ok":false,"id":"0a1b2c3d","t":"ask_rsp"}', 'Keys in another order, t not first: an ask_rsp denying 0a1b2c3d');
+  loose('say-noncanonical-escapes', '{"t":"say","text":"A\\/B \\u0041\\u00200 \\"q\\" \\\\"}', 'The escapes \\/ and \\uXXXX for printable ASCII: the text A/B A 0 "q" \\');
+  loose('listen-noncanonical-escaped-key', '{"\\u0074":"listen","\\u006d":"stop"}', 'Key names written with \\u escapes: a listen stop');
+
   validAudio('device', 'audio-mic-min', FRAME_KIND_MIC, 2, 'One sample, the shortest legal frame');
   validAudio('device', 'audio-mic-20ms', FRAME_KIND_MIC, 640, '20 ms at 16 kHz s16le');
   validAudio('device', 'audio-mic-max', FRAME_KIND_MIC, LIMITS.audioPayloadMax, '40 ms, the largest legal payload');
@@ -124,6 +146,7 @@ export function buildFixtures(): Fixture[] {
 
   brg('hello_ack-ok', { t: 'hello_ack', v: 1, ok: true, sid: 'c0ffee00-1234-4abc-8def-0123456789ab' }, 'Accepted; sid is the session id');
   brg('hello_ack-ok-sid-max', { t: 'hello_ack', v: 1, ok: true, sid: plain(64, 's') }, 'Longest sid');
+  brg('hello_ack-ok-worst-case', { t: 'hello_ack', v: INT_MAX, ok: true, sid: '"'.repeat(64) }, 'Largest v and a sid of all quotes: the largest hello_ack frame');
   for (const why of HELLO_WHYS) brg(`hello_ack-refused-${why}`, { t: 'hello_ack', v: 1, ok: false, why }, `Refused: ${why}`);
 
   for (const ph of PHASES) {
@@ -131,6 +154,7 @@ export function buildFixtures(): Fixture[] {
     brg(`state-${ph}`, { t: 'state', seq: 1, ph, tl: labelled ? 'Bash' : '', pend: ph === 'asking' ? 1 : 0 }, `Phase ${ph}`);
   }
   brg('state-max', { t: 'state', seq: INT_MAX, ph: 'tool', tl: plain(LIMITS.labelMax, 'L'), pend: INT_MAX }, 'Largest counters, longest label');
+  brg('state-worst-case', { t: 'state', seq: INT_MAX, ph: 'transcribing', tl: '"'.repeat(LIMITS.labelMax), pend: INT_MAX }, 'The longest phase name and a label of all quotes (a receiver ignores tl outside tool and asking): the largest state frame');
 
   brg('stt-typical', { t: 'stt', text: 'run the unit tests' }, 'A transcript');
   brg('stt-worst-case', { t: 'stt', text: '\\'.repeat(LIMITS.sttMax) }, 'Every character escapes');
@@ -152,10 +176,10 @@ export function buildFixtures(): Fixture[] {
   brg('result-ok', { t: 'result', ok: true, text: 'Tests pass. I fixed the off by one in the parser.' }, 'A finished turn');
   brg('result-fail', { t: 'result', ok: false, text: 'I could not finish: the build is broken.' }, 'A turn that ended badly');
   brg('result-empty', { t: 'result', ok: true, text: '' }, 'Empty text is valid on the wire');
-  brg('result-worst-case', { t: 'result', ok: true, text: '\\'.repeat(LIMITS.resultMax) }, 'Every character escapes');
+  brg('result-worst-case', { t: 'result', ok: false, text: '\\'.repeat(LIMITS.resultMax) }, 'ok false is the longer spelling, and every character escapes: the largest result frame');
 
   for (const code of ERR_CODES) brg(`err-${code}`, { t: 'err', code, msg: `example for ${code}` }, `Error code ${code}`);
-  brg('err-worst-case', { t: 'err', code: 'internal', msg: '"'.repeat(LIMITS.errMax) }, 'Every character escapes');
+  brg('err-worst-case', { t: 'err', code: 'stt_unavailable', msg: '"'.repeat(LIMITS.errMax) }, 'The longest code and a msg of all quotes: the largest err frame');
 
   brg('pong-0', { t: 'pong', n: 0 }, 'Reply to ping');
   brg('pong-max', { t: 'pong', n: INT_MAX }, 'Largest counter');

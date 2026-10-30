@@ -28,6 +28,13 @@
     "note": "Every field at its maximum; numbers are shape-checked only, the server rejects the values"
   },
   {
+    "file": "device-hello-worst-case.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "note": "dev and fw are all quotes, so every character escapes: the largest hello frame"
+  },
+  {
     "file": "device-say-typical.txt",
     "dir": "device",
     "kind": "text",
@@ -119,6 +126,38 @@
     "note": "Largest counter"
   },
   {
+    "file": "device-ping-noncanonical-whitespace.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "canonical": false,
+    "note": "Whitespace (space, tab, CR, LF) before, between and after the tokens, none of it at the very end of the file: a ping with n 7"
+  },
+  {
+    "file": "device-ask_rsp-noncanonical-order.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "canonical": false,
+    "note": "Keys in another order, t not first: an ask_rsp denying 0a1b2c3d"
+  },
+  {
+    "file": "device-say-noncanonical-escapes.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "canonical": false,
+    "note": "The escapes \\/ and \\uXXXX for printable ASCII: the text A/B A 0 \"q\" \\"
+  },
+  {
+    "file": "device-listen-noncanonical-escaped-key.txt",
+    "dir": "device",
+    "kind": "text",
+    "expect": "valid",
+    "canonical": false,
+    "note": "Key names written with \\u escapes: a listen stop"
+  },
+  {
     "file": "device-audio-mic-min.bin",
     "dir": "device",
     "kind": "binary",
@@ -152,6 +191,13 @@
     "kind": "text",
     "expect": "valid",
     "note": "Longest sid"
+  },
+  {
+    "file": "bridge-hello_ack-ok-worst-case.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "Largest v and a sid of all quotes: the largest hello_ack frame"
   },
   {
     "file": "bridge-hello_ack-refused-token.txt",
@@ -243,6 +289,13 @@
     "kind": "text",
     "expect": "valid",
     "note": "Largest counters, longest label"
+  },
+  {
+    "file": "bridge-state-worst-case.txt",
+    "dir": "bridge",
+    "kind": "text",
+    "expect": "valid",
+    "note": "The longest phase name and a label of all quotes (a receiver ignores tl outside tool and asking): the largest state frame"
   },
   {
     "file": "bridge-stt-typical.txt",
@@ -361,7 +414,7 @@
     "dir": "bridge",
     "kind": "text",
     "expect": "valid",
-    "note": "Every character escapes"
+    "note": "ok false is the longer spelling, and every character escapes: the largest result frame"
   },
   {
     "file": "bridge-err-bad_msg.txt",
@@ -438,7 +491,7 @@
     "dir": "bridge",
     "kind": "text",
     "expect": "valid",
-    "note": "Every character escapes"
+    "note": "The longest code and a msg of all quotes: the largest err frame"
   },
   {
     "file": "bridge-pong-0.txt",

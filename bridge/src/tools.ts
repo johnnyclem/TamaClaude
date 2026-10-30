@@ -15,20 +15,41 @@
  *
  *  - The summary is built ONLY from the real tool input. The model's own
  *    "description" / title text is never used, because it is exactly the text a
- *    malicious call would use to lie to the human.
+ *    malicious call would use to lie to the human. For a tool this file does not know
+ *    (every MCP tool), only an ALLOWLIST of identifying fields (url, path, command,
+ *    query, to ...) is shown; any other field is reduced to a count and a byte size,
+ *    because a denylist of "narration" keys is one the model only has to step around.
  *  - Risk and deny are computed on the FULL input. The summary is cut to 96
  *    characters, and a dangerous tail must not hide behind the ellipsis; a command
  *    too long to show in full is itself 'high'.
+ *  - Text that the ASCII fold would change or drop (a fullwidth solidus, a zero-width
+ *    space, a Cyrillic look-alike) is shown as `?` and makes the call at least 'high':
+ *    the panel must never display something other than what will run.
+ *  - FAIL CLOSED. If the analyser throws, for any tool and any reason, the call is
+ *    DENIED ("could not be analysed"), not asked about. A crash used to turn a
+ *    hard-deny into an ordinary ask, and a crash is exactly what a hostile input aims for.
+ *    Every lookup keyed by text from the model uses a Map or a Set (never a plain
+ *    object, whose `__proto__` and `constructor` are keys nobody listed).
+ *
+ * WHICH CALLS MAY RUN WITHOUT A TAP. The driver asks the device about every call that is
+ * not hard-denied and not rated 'low' here (see `needsTap`). 'low' is therefore the
+ * auto-run set, and it is deliberately tiny: the built-in READ-ONLY tools (AUTO_RUN_TOOLS)
+ * aimed at a place INSIDE the session's working directory (symlinks followed) that is
+ * not a secret store and does not contain one. Everything else, including every Bash
+ * command however harmless it looks, every write, every web tool and every MCP tool, is
+ * 'med' or 'high' and needs a tap. test/tools.test.ts enumerates this set from the SDK's
+ * own tool list so a new built-in cannot join it by accident.
  *
  * What the Bash analysis catches and does not is listed next to the code that does it
  * (see "COVERAGE" below); the tests exercise both columns so the list cannot rot.
  */
 
+import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { posix } from 'node:path';
 import type { DescribeTool, Risk, ToolView } from './types.ts';
 import { LIMITS } from './types.ts';
-import { sanitize, sanitizeInfo, toAscii } from './text.ts';
+import { sanitize, sanitizeInfo, toAscii, truncateText } from './text.ts';
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -37,12 +58,32 @@ import { sanitize, sanitizeInfo, toAscii } from './text.ts';
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
 const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
-const bump = (r: Risk): Risk => (r === 'low' ? 'med' : 'high');
+
+/**
+ * Anything outside printable ASCII and plain whitespace: exactly what `toAscii` would
+ * fold, drop or replace. A look-alike character is how a path or URL lies to a human
+ * who can only read ASCII, so its presence is a risk in itself (see `spoofable`).
+ */
+const NOT_PLAIN = /[^\x20-\x7e\t\n\r]/u;
+const spoofable = (s: string): boolean => NOT_PLAIN.test(s);
+
+/**
+ * The text as the panel will show it, with every character the ASCII fold would
+ * silently rewrite shown as `?` instead, one per character. `toAscii` alone turns a
+ * fullwidth solidus into a real one, so `github.com/evil` would look like a path on
+ * github.com when the character was something else.
+ */
+function plain(s: string): string {
+  if (!spoofable(s)) return s;
+  let out = '';
+  for (const ch of s) out += NOT_PLAIN.test(ch) ? '?' : ch;
+  return out;
+}
 
 function labelFor(name: string): string {
   // "mcp__github__create_issue" shows its last segment: the panel is 16 characters wide.
   const last = name.startsWith('mcp__') ? name.slice(name.lastIndexOf('__') + 2) : name;
-  return sanitize(last || name, LIMITS.labelMax) || 'tool';
+  return sanitize(plain(last || name), LIMITS.labelMax) || 'tool';
 }
 
 /**
@@ -50,7 +91,7 @@ function labelFor(name: string): string {
  * is deciding about and a plain tail cut would show only the directories.
  */
 function pathSummary(display: string): string {
-  const a = toAscii(display);
+  const a = toAscii(plain(display));
   if (a.length <= LIMITS.summaryMax) return a;
   return '...' + a.slice(a.length - (LIMITS.summaryMax - 3));
 }
@@ -117,25 +158,100 @@ function configComps(comps: string[]): boolean {
   });
 }
 
-const SECRET_DIRS = new Set(['.ssh', '.aws', '.gnupg', '.kube', '.docker', '.azure', '.password-store']);
+const SECRET_DIRS = new Set([
+  '.ssh', '.aws', '.gnupg', '.kube', '.docker', '.azure', '.password-store', '.oci', '.terraform.d', '.ibmcloud', '.bluemix', '.minikube',
+]);
+/** `~/.config/<app>` directories that hold a login. */
+const SECRET_CONFIG_APPS = new Set(['gcloud', 'gh', 'hub', 'doctl', 'rclone', 'op', 'heroku', 'huggingface']);
 const SECRET_FILE_RE = [
   /^\.env(rc)?(\..+)?$/,
-  /^\.(npmrc|netrc|pypirc|git-credentials|pgpass|my\.cnf|s3cfg|boto|htpasswd|vault-token|credentials\.json)$/,
+  /^\.(npmrc|netrc|pypirc|git-credentials|pgpass|my\.cnf|s3cfg|boto|htpasswd|vault-token|dockercfg|terraformrc|yarnrc\.ya?ml)$/,
   /^id_(rsa|dsa|ecdsa|ed25519)(_sk)?$/,
-  /\.(pem|key|p12|pfx|jks|keystore|kdbx)$/,
-  /^credentials(\.json)?$/,
+  /^ssh_host_.*_key$/,
+  /\.(pem|key|p12|pfx|jks|keystore|kdbx|tfstate|tfvars)$/,
+  /(?:^|[._-])credentials(?:\.[\w.]+)?$/, // credentials, .credentials.json, application_default_credentials.json
   /^service-account.*\.json$/,
+  /^\.?token$/,
+  /^secrets?\.(json|ya?ml|toml|env|txt)$/,
+  // A shell or REPL history: every command ever typed, including the ones with a password on them.
+  /^(?:\.?[\w-]*_history|\.history|\.zhistory|\.lesshst|\.viminfo)$/,
 ];
 const ENV_TEMPLATE_RE = /^\.env\.(example|sample|template|dist)$/;
+/** The longest a single file name can be on any file system we run on. */
+const MAX_NAME = 255;
+/** A glob this long is not one anybody typed to find a file: it is asked about rather than matched. */
+const MAX_GLOB = 1024;
 
 /** Secret stores: reading one hands the model credentials, writing one changes who the machine trusts. */
 function sensitiveComps(comps: string[]): boolean {
   for (let i = 0; i < comps.length; i++) {
     const c = comps[i]!.toLowerCase();
+    const next = (comps[i + 1] ?? '').toLowerCase();
     if (SECRET_DIRS.has(c)) return true;
-    if (c === '.config' && ['gcloud', 'gh', 'hub'].includes((comps[i + 1] ?? '').toLowerCase())) return true;
+    if (c === '.config' && SECRET_CONFIG_APPS.has(next)) return true;
+    // `.git/config` can carry a remote URL with a token in it; the rest of `.git` is not a secret.
+    if (c === '.git' && next === 'config') return true;
+    // The personal (git-ignored) settings file is where a project's env and tokens go.
+    if (c === '.claude' && next === 'settings.local.json') return true;
+    if (c === '.claude.json') return true; // OAuth account, MCP server environments
+    // No file system has a name this long, so nothing real hides here; and a few of these patterns
+    // backtrack, which a megabyte of `.credentials.credentials...` must not be able to exploit.
+    if (c.length > MAX_NAME) continue;
     if (ENV_TEMPLATE_RE.test(c)) continue;
     if (SECRET_FILE_RE.some((re) => re.test(c))) return true;
+  }
+  return false;
+}
+
+let rootsFor: { home: string; roots: string[] } | undefined;
+
+/**
+ * Absolute places that are secret stores wherever the project lives. `/proc` is all of
+ * it: `/proc/<pid>/environ` is every secret in a process's environment, and `cmdline`
+ * is every argument it was started with.
+ */
+function secretRoots(home: string): string[] {
+  if (rootsFor?.home === home) return rootsFor.roots;
+  const h = home.replace(/\/+$/, '');
+  const roots = ['/proc', '/etc/shadow', '/etc/gshadow', '/etc/master.passwd', '/etc/sudoers', '/etc/sudoers.d'];
+  for (const d of SECRET_DIRS) roots.push(`${h}/${d}`);
+  for (const a of SECRET_CONFIG_APPS) roots.push(`${h}/.config/${a}`);
+  for (const f of ['.claude.json', '.claude/.credentials.json', '.netrc', '.npmrc', '.pypirc', '.git-credentials', '.pgpass', '.bash_history', '.zsh_history']) roots.push(`${h}/${f}`);
+  rootsFor = { home, roots };
+  return roots;
+}
+
+/** Is this absolute path a secret store, or inside one? */
+function sensitiveAbs(abs: string, home: string): boolean {
+  return secretRoots(home).some((r) => abs === r || abs.startsWith(r + '/'));
+}
+
+/** Is this directory (absolute) a place a recursive search would walk into a secret store from? */
+function reachesSecret(abs: string, home: string): boolean {
+  const dir = abs === '/' ? '/' : abs.replace(/\/+$/, '') + '/';
+  return secretRoots(home).some((r) => r === abs || (r + '/').startsWith(dir));
+}
+
+/**
+ * A glob word such as `/pro?/self/environ` or `/etc/sh*`, matched component by component
+ * against the secret stores, in both directions (it may name something inside one, or a
+ * directory that contains one). Bash's `*` never matches a leading dot, so it does not here.
+ */
+function globHitsSecretRoot(word: string, home: string): boolean {
+  if (!GLOB_CHARS.test(word)) return false;
+  if (word.length > MAX_GLOB) return true;
+  const comps = word.split('/').filter((c) => c !== '' && c !== '.');
+  const res = comps.map((c) => (GLOB_CHARS.test(c) ? globToRegex(c) : undefined));
+  for (const root of secretRoots(home)) {
+    const rc = root.split('/').filter((c) => c !== '');
+    const n = Math.min(comps.length, rc.length);
+    let ok = n > 0;
+    for (let i = 0; i < n && ok; i++) {
+      const re = res[i];
+      if (GLOB_CHARS.test(comps[i]!)) ok = re !== undefined && re.test(rc[i]!) && (!rc[i]!.startsWith('.') || comps[i]!.startsWith('.'));
+      else ok = comps[i]!.toLowerCase() === rc[i]!.toLowerCase();
+    }
+    if (ok) return true;
   }
   return false;
 }
@@ -150,7 +266,14 @@ interface PathInfo {
   comps: string[];
   config: boolean;
   hidden: boolean;
+  /** A secret store, or a glob that could name one. */
   sensitive: boolean;
+  /**
+   * The same without the secret-NAME globs (`*.json` can match `credentials.json`). Bash words
+   * use this one: a shell glob in a command the human taps on is not worth a warning on
+   * every `ls *.json`, while a Glob or Grep that runs unasked has to be stricter.
+   */
+  sensitiveLiteral: boolean;
 }
 
 function expandHome(p: string, home: string): string {
@@ -181,6 +304,7 @@ function inspectPath(raw: string, resolveFrom: string | undefined, baseCwd: stri
     comps = norm.split('/').filter((c) => c !== '' && c !== '.');
   }
   const all = norm.split('/').filter((c) => c !== '' && c !== '.');
+  const literal = sensitiveComps(all) || sensitiveAbs(norm, home) || globHitsSecretRoot(abs ?? norm, home);
   return {
     abs,
     norm,
@@ -188,7 +312,8 @@ function inspectPath(raw: string, resolveFrom: string | undefined, baseCwd: stri
     comps,
     config: configComps(all) || globHitsConfig(raw),
     hidden: comps.some((c) => c.startsWith('.') && c !== '..'),
-    sensitive: sensitiveComps(all) || globHitsSecret(raw),
+    sensitive: literal || globHitsSecret(raw),
+    sensitiveLiteral: literal,
   };
 }
 
@@ -322,10 +447,10 @@ function findSubstitutions(text: string): string[] {
 
 const untick = (s: string): string => s.replace(/\\([$`\\])/g, '$1');
 
-const ANSI_SIMPLE: Record<string, string> = {
+const ANSI_SIMPLE = new Map<string, string>(Object.entries({
   n: '\n', t: '\t', r: '\r', a: '\x07', b: '\b', e: '\x1b', E: '\x1b', f: '\f', v: '\v',
   '\\': '\\', "'": "'", '"': '"', '?': '?',
-};
+}));
 
 /** `$'\x72m'` is `rm` to bash; the escapes are decoded so quoting cannot hide a command name. */
 function decodeAnsiC(s: string): string {
@@ -336,7 +461,7 @@ function decodeAnsiC(s: string): string {
       return cp > 0x10ffff ? '' : String.fromCodePoint(cp);
     }
     if (/[0-7]/.test(c)) return String.fromCharCode(parseInt(e, 8) & 0xff);
-    return ANSI_SIMPLE[c] ?? c;
+    return ANSI_SIMPLE.get(c) ?? c;
   });
 }
 
@@ -633,17 +758,43 @@ function parseScript(src: string, depth: number, ctx: ParseCtx): Seg[] {
 //   - a variable set earlier in the same command (X=/; rm -rf $X) and `cd /; rm -rf *`
 //   - the same command inside bash -c '...', eval '...', $(...), `...`, <(...), (...)
 //   - chains (; && || | newline) and heredoc/here-string bodies fed to a shell
-// NOT caught, by design or because it cannot be known statically:
+//   - download piped into a shell, or into an interpreter that reads its program from stdin
+// Flagged 'high' (the human sees the warning; nothing is refused) because the analyser
+// cannot see what runs:
+//   - a shell or an interpreter doing the work: bash -c, bash script.sh, source, ./script,
+//     python/node/perl/ruby/php with code or a file (only a bare --version is exempt)
+//   - anything that reads the environment (env, printenv, set, export -p, $SOMETHING_TOKEN),
+//     /proc, shell history, ~/.claude.json, .git/config and the other secret stores
 //   - a path or command computed at run time ($(echo /), $(echo rm), a glob that only
-//     the filesystem can resolve), so those are flagged 'high' as "cannot inspect"
-//   - an interpreter doing it (python -c shutil.rmtree, node -e, perl -e)
-//   - a script already on disk, or written first with the Write tool and then run
-//   - download-then-run in two steps (curl -o x; sh x), aliases and shell functions
+//     the filesystem can resolve)
+// NOT caught at all, by design or because it cannot be known statically; each is a row in
+// the characterisation table in test/tools.test.ts, so changing one is a deliberate act:
+//   - an interpreter, script or build tool DOING the damage (python -c shutil.rmtree is
+//     only 'high'), a script already on disk or written with the Write tool then run
+//   - download-then-run in two steps (curl -o x; sh x), base64 into a shell, aliases, functions
+//   - home-directory deletion spelled so that the path is not a literal (rm -rf ~/.[!.]*,
+//     "$(echo ~)", echo ~ | xargs rm -rf, rsync --delete, mv ~ /tmp/x)
+//   - only the TOP level of a system directory is protected: rm -rf /usr/lib is not denied
+//     (prefix matching would also refuse rm -rf /home/me/project)
 //   - symlinks, bind mounts, and relative paths after a cd that is not a literal
 // ---------------------------------------------------------------------------
 
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'mksh']);
-const INTERPRETERS = /^(python[\d.]*|node(js)?|deno|bun|ruby|perl|php|lua|osascript)$/;
+const INTERPRETERS = /^(python[\d.]*|node(js)?|deno|bun|ruby|perl|php|lua|osascript|pwsh|powershell|tsx|ts-node|rscript|julia)$/;
+/** A version or help query runs no program text: the one thing an interpreter or shell may be asked that is not 'high'. */
+const INFO_ONLY_RE = /^(?:-v|-V|-h|-version|-help|--version|--help)$/;
+/** awk programs can run commands (system(), `print | "cmd"`, getline) and read the whole environment (ENVIRON). */
+const AWK_RE = /^(?:awk|gawk|mawk|nawk)$/;
+const AWK_EXEC_RE = /\bsystem\s*\(|\bgetline\b|\|&|\|\s*"|\bENVIRON\b/;
+/** Commands that arrange for code to run LATER, outside any approval this session can see. */
+const SCHEDULERS = new Set(['crontab', 'at', 'batch', 'launchctl', 'systemd-run']);
+/** Programs run by absolute path from these directories are ordinary tools; any other path is a script in the tree or the home directory. */
+const SYSTEM_BIN_RE = /^\/(?:usr\/(?:local\/)?|opt\/homebrew\/)?s?bin\//;
+/** Commands that read file CONTENT recursively: pointed at a directory that contains a secret store, they read it. */
+const SEARCHERS = new Set(['grep', 'egrep', 'fgrep', 'zgrep', 'rg', 'ag', 'ack']);
+const VAR_REF_RE = /\$\{?[!#]?([A-Za-z_][A-Za-z0-9_]*)/g;
+/** TOKEN, SECRET, PASSWORD, API_KEY ... as a whole word of a variable name, or a name ending in _KEY. */
+const SECRET_VAR_RE = /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENTIALS?|APIKEY|API_KEY|PRIVATE_KEY|ACCESS_KEY)(?:_|$)|_KEY$|^KEY$/i;
 const FETCHERS = new Set(['curl', 'wget', 'fetch', 'aria2c']);
 const PRIVILEGE = new Set(['sudo', 'sudoedit', 'doas', 'pkexec', 'su', 'runas']);
 const NETWORK = new Set(['ssh', 'scp', 'sftp', 'nc', 'ncat', 'netcat', 'socat', 'telnet']);
@@ -726,7 +877,7 @@ function catastrophic(raw: string, st: State): boolean {
     // A trailing glob removes the directory's contents, which is as bad as removing it.
     while (comps.length > 0) {
       const last = comps[comps.length - 1]!;
-      if (/^[.*?[\]]+$/.test(last) && /[*?[]/.test(last)) comps.pop();
+      if (/^[.*?[\]!^]+$/.test(last) && /[*?[]/.test(last)) comps.pop();
       else break;
     }
     if (comps.length === 0) return true;
@@ -753,7 +904,12 @@ function skipOpts(words: string[], from: number, withArg: readonly string[] = []
   return i;
 }
 
-const WRAPPERS: Record<string, (w: string[], from: number) => number> = {
+/**
+ * A Map, never a plain object: the key is the command word, which is text from the model, and
+ * `WRAPPERS['__proto__']` on an object literal is `Object.prototype`. That one word used to
+ * make the analyser throw and silently drop every hard-deny that came with it.
+ */
+const WRAPPERS = new Map<string, (w: string[], from: number) => number>(Object.entries({
   sudo: (w, f) => skipOpts(w, f, ['-u', '-g', '-C', '-D', '-h', '-p', '-r', '-t', '-U', '-T', '-R']),
   sudoedit: (w, f) => f,
   doas: (w, f) => skipOpts(w, f, ['-u', '-C']),
@@ -771,7 +927,7 @@ const WRAPPERS: Record<string, (w: string[], from: number) => number> = {
   xargs: (w, f) => skipOpts(w, f, ['-I', '-n', '-P', '-s', '-L', '-d', '-E', '-a', '--max-args', '--max-procs']),
   busybox: (w, f) => f,
   toybox: (w, f) => f,
-};
+}));
 
 /** The index of the word that actually names the program, after env assignments and wrappers. */
 function findCommand(words: string[]): Found {
@@ -786,7 +942,7 @@ function findCommand(words: string[]): Found {
       continue;
     }
     const b = base(w);
-    const skip = WRAPPERS[b];
+    const skip = WRAPPERS.get(b);
     if (skip === undefined) return { idx: i, wrappers };
     wrappers.push(b);
     i = skip(words, i + 1);
@@ -893,6 +1049,30 @@ function ruleOwnership(args: string[], st: State): void {
   if (operands.some((t) => catastrophic(t, st))) noteDeny(st, 'recursive chmod/chown of the root, a system directory or the home directory');
 }
 
+/** `rsync --delete` makes the destination match the source, so aimed at a home directory it deletes the home directory. */
+function ruleRsync(args: string[], st: State): void {
+  if (!args.some((a) => a.startsWith('--delete'))) return;
+  st.high = true;
+  if (args.filter((a) => !a.startsWith('-')).some((t) => catastrophic(t, st))) noteDeny(st, 'rsync --delete into the root, a system directory or the home directory');
+}
+
+/**
+ * Only what is moved AWAY is judged: `mv file ~` puts something in the home directory,
+ * `mv ~ /tmp/x` takes the home directory out from under the account.
+ */
+function ruleMove(args: string[], st: State): void {
+  const operands: string[] = [];
+  let toDir = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === '-t') i++; // the directory after -t is the destination, whatever its position
+    else if (a.startsWith('--target-directory')) toDir = true;
+    else if (!a.startsWith('-') || a === '-') operands.push(a);
+  }
+  const sources = toDir ? operands.slice(1) : operands.slice(0, -1);
+  if (sources.some((t) => catastrophic(t, st))) noteDeny(st, 'moves the root, a system directory or the home directory away');
+}
+
 function ruleFind(args: string[], st: State, depth: number): void {
   const paths: string[] = [];
   let k = 0;
@@ -923,6 +1103,7 @@ function ruleDd(args: string[], st: State): void {
     const m = /^of=(.*)$/s.exec(w);
     if (!m) continue;
     const target = expandVars(m[1]!, st);
+    if (/[$`]/.test(target)) st.high = true; // a target computed at run time may be a disk
     if (target.startsWith('/dev/') && !SAFE_DEV_RE.test(target)) noteDeny(st, 'dd writing to a device file');
   }
 }
@@ -973,6 +1154,14 @@ function analyzeScript(src: string, depth: number, st: State): void {
   for (const seg of segs) analyzeSeg(seg, depth, st);
 }
 
+/**
+ * An interpreter given no program text and no file reads its program from stdin. (Code in
+ * `-c`/`-e` or a script operand is an operand, so a pipe feeding it is only data.)
+ */
+function readsProgramFromStdin(args: string[]): boolean {
+  return args.every((a) => a.startsWith('-')) || args.includes('-');
+}
+
 function analyzePipelines(segs: Seg[], st: State): void {
   const groups = new Map<number, Seg[]>();
   for (const s of segs) {
@@ -990,6 +1179,11 @@ function analyzePipelines(segs: Seg[], st: State): void {
         // A shell reading its script from a pipe: whatever came down it is executed.
         st.high = true;
         if (fetched) noteDeny(st, 'downloaded content piped into a shell');
+      }
+      if (s.piped && fetched && INTERPRETERS.test(cmd) && readsProgramFromStdin(s.words.slice(f.idx + 1))) {
+        // `curl x | python3` is `curl x | sh` in another language.
+        st.high = true;
+        noteDeny(st, 'downloaded content piped into an interpreter');
       }
       if (s.words.some((w) => FETCHERS.has(base(w)))) {
         st.high = true; // curl/wget piped anywhere: out to a server or in from one
@@ -1014,6 +1208,33 @@ function writeTarget(raw: string, st: State): void {
   if (!info.inside || info.hidden || info.sensitive) st.high = true;
 }
 
+/**
+ * Does running this program execute text the analyser never sees? A shell or interpreter
+ * is given code (-c, -e, a file, stdin), `source` and `.` run a file, a path-qualified
+ * command (`./build.sh`, `tools/run`, `~/bin/x`) is a program that lives in the tree or
+ * the home directory, and awk can call system(). Any of them can be the second step of
+ * "write a script with the Write tool, then run it", which is why they are all 'high'.
+ */
+function runsUnseenCode(cmd: string, word: string, operands: string[]): boolean {
+  if (SHELLS.has(cmd) || INTERPRETERS.test(cmd)) return !(operands.length > 0 && operands.every((o) => INFO_ONLY_RE.test(o)));
+  if (cmd === 'source' || cmd === '.') return true;
+  if (AWK_RE.test(cmd)) return operands.some((o) => AWK_EXEC_RE.test(o));
+  return word.includes('/') && !SYSTEM_BIN_RE.test(word);
+}
+
+/** `env`, `printenv`, `set`, `export -p`, `declare -x`, `ps e`: they print every secret in the environment. */
+function dumpsEnvironment(cmd: string, operands: string[], found: Found): boolean {
+  if (cmd === 'printenv') return true;
+  // `env` (or `env -0`, `env A=1`) with no command after it prints the environment.
+  if (found.idx < 0 && found.wrappers.includes('env')) return true;
+  const names = operands.filter((o) => !o.startsWith('-'));
+  if (cmd === 'set') return operands.length === 0;
+  if (cmd === 'export' || cmd === 'readonly') return names.length === 0;
+  if (cmd === 'declare' || cmd === 'typeset') return names.length === 0 || operands.some((o) => /^-[a-zA-Z]*p/.test(o));
+  // BSD-style `ps e` / `ps auxe` appends each process's environment; `ps -e` (all processes) does not.
+  return cmd === 'ps' && names.some((o) => /^[a-zA-Z]+$/.test(o) && o.includes('e'));
+}
+
 function analyzeSeg(seg: Seg, depth: number, st: State): void {
   const words = seg.words.map((w) => expandVars(w, st));
   const found = findCommand(words);
@@ -1028,6 +1249,11 @@ function analyzeSeg(seg: Seg, depth: number, st: State): void {
   if (NETWORK.has(cmd)) st.high = true;
   if (words.some((w) => w.startsWith('--force'))) st.high = true;
   if (st.tooDeep) st.high = true;
+
+  // Code the analyser cannot read, and secrets it cannot let go by unremarked.
+  const operands = found.idx >= 0 ? words.slice(found.idx + 1) : [];
+  if (found.idx >= 0 && runsUnseenCode(cmd, words[found.idx]!, operands)) st.high = true;
+  if (SCHEDULERS.has(cmd) || dumpsEnvironment(cmd, operands, found)) st.high = true;
 
   // Code hidden in strings: bash -c '...', eval '...', and scripts fed in on stdin.
   const isShell = SHELLS.has(cmd);
@@ -1077,7 +1303,9 @@ function analyzeSeg(seg: Seg, depth: number, st: State): void {
       case 'find': ruleFind(args, st, depth); break;
       case 'dd': ruleDd(args, st); break;
       case 'git': ruleGit(args, st); break;
-      case 'cp': case 'mv': case 'ln': case 'docker': case 'npm': case 'yarn': case 'pnpm': case 'brew':
+      case 'rsync': ruleRsync(args, st); break;
+      case 'mv': case 'cp': case 'ln': case 'docker': case 'npm': case 'yarn': case 'pnpm': case 'brew':
+        if (b === 'mv') ruleMove(args, st);
         if (args.some((a) => /^-[a-zA-Z]*f/.test(a) && a !== '--')) st.high = true;
         break;
       default: break;
@@ -1100,21 +1328,33 @@ function analyzeSeg(seg: Seg, depth: number, st: State): void {
     if (st.cwd !== undefined && inspectPath(st.cwd, undefined, undefined, st.home).config) noteDeny(st, CONFIG_REASON);
   }
 
-  // Secret stores named anywhere in the command (cat ~/.ssh/id_rsa, source .env).
-  for (let k = 0; k < words.length; k++) {
-    if (k === found.idx) continue;
-    const w = words[k]!;
+  // Secret stores named anywhere in the command (cat ~/.ssh/id_rsa, source .env, tr -d x < /proc/1/environ).
+  // Input redirects name files too; the command word itself is not a path to a secret.
+  const named = words.filter((_w, k) => k !== found.idx);
+  for (const r of seg.redirects) if (r.op === '<' || r.op === '<>') named.push(r.target);
+  const searches = SEARCHERS.has(cmd);
+  for (const w of named) {
     const v = w.replace(/^[-\w]+=/, '');
-    if (!/\s/.test(v) && v.length <= 512 && !v.startsWith('-') && sensitiveComps(v.split('/'))) st.high = true;
+    if (/\s/.test(v) || v.length > 512 || v.startsWith('-')) continue;
+    for (const alt of braceExpand(v)) {
+      const info = inspectPath(alt, st.cwd, st.baseCwd, st.home);
+      // grep -r pattern ~ walks into ~/.ssh: a search is judged by what is beneath its directory too.
+      if (info.sensitiveLiteral || (searches && info.abs !== undefined && reachesSecret(info.abs, st.home))) st.high = true;
+    }
   }
 
   if (cmd === 'cd' || cmd === 'pushd') st.cwd = nextCwd(words.slice(found.idx + 1).find((w) => !w.startsWith('-')), st);
   else if (cmd === 'popd') st.cwd = undefined;
 }
 
+function mentionsSecretVar(src: string): boolean {
+  for (const m of src.matchAll(VAR_REF_RE)) if (SECRET_VAR_RE.test(m[1]!)) return true;
+  return false;
+}
+
 function analyzeCommand(command: string, baseCwd: string | undefined): State {
   const st: State = {
-    home: homedir(),
+    home: safeHome(),
     baseCwd,
     cwd: baseCwd,
     vars: new Map(),
@@ -1124,6 +1364,8 @@ function analyzeCommand(command: string, baseCwd: string | undefined): State {
     ctx: { nextGroup: 0, tooDeep: false },
   };
   analyzeScript(command, 0, st);
+  // Any reference to a secret-looking variable, wherever it sits (quotes, heredocs, nested -c).
+  if (mentionsSecretVar(command)) st.high = true;
   return st;
 }
 
@@ -1146,44 +1388,123 @@ function finish(name: string, b: Built): ToolView {
   return view;
 }
 
+const raiseTo = (cur: Risk, r: Risk): Risk => (r === 'high' || (r === 'med' && cur === 'low') ? r : cur);
+
 function viewBash(name: string, input: Record<string, unknown>, base: string | undefined): ToolView {
   const command = str(input.command);
   // No command string: nothing to show and nothing verifiable.
   if (command === undefined) return finish(name, { risk: 'high', summary: name });
-  const info = sanitizeInfo(command, LIMITS.summaryMax);
+  const info = sanitizeInfo(plain(command), LIMITS.summaryMax);
   const st = analyzeCommand(command, base);
   let risk: Risk = 'med';
   // Truncated: the human cannot see all of it. Multi-line: structure the one-line summary hides.
-  if (st.high || info.truncated || /[\r\n]/.test(command.trim())) risk = 'high';
+  // Not plain ASCII: the panel shows `?` where the command has a look-alike or invisible character.
+  if (st.high || info.truncated || spoofable(command) || /[\r\n]/.test(command.trim())) risk = 'high';
   // The SDK's own escape hatch: the command runs outside the sandbox the session was configured with.
   if (input.dangerouslyDisableSandbox === true) risk = 'high';
   return finish(name, { risk, summary: info.text, deny: st.deny });
 }
 
-const READERS = new Set(['Read', 'Glob', 'Grep', 'LS', 'NotebookRead']);
+// -- the auto-run set -------------------------------------------------------
+
+/**
+ * THE AUTO-RUN SET. These built-in tools only read, and are the only calls that can ever be
+ * rated 'low', which is what lets the driver run them without a tap. A tool joins this list
+ * only if it cannot change anything, start anything or send anything anywhere; reading is
+ * allowed because what is read goes to the model and the model is the session. 'low' is
+ * further conditional: see `viewReader`. (`LS` and `NotebookRead` are older names that some
+ * CLI versions still use; the current SDK's own list has neither.)
+ */
+export const AUTO_RUN_TOOLS: readonly string[] = ['Read', 'Glob', 'Grep', 'LS', 'NotebookRead'];
+const READERS = new Set(AUTO_RUN_TOOLS);
 const WRITERS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+
+const isMissing = (e: unknown): boolean => {
+  const code = (e as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+};
+
+/** The part of a glob up to its first wildcard component: the directory that really exists. */
+function literalPrefix(abs: string): string {
+  const comps = abs.split('/');
+  const k = comps.findIndex((c) => GLOB_CHARS.test(c));
+  return k < 0 ? abs : comps.slice(0, k).join('/') || '/';
+}
+
+/**
+ * Where a path REALLY lands once symlinks are followed, judged against the real working
+ * directory. A link inside the project that points at ~/.ssh is not inside the project, and
+ * neither is a file about to be created beneath a link to /etc: a path that does not exist
+ * yet is resolved through its nearest directory that does.
+ * `undefined` means "cannot tell" (the cwd itself does not exist), so the lexical answer
+ * stands; 'unknown' means it could not be resolved for a reason that is not absence (a loop,
+ * a name too long, a NUL byte), which is treated as outside.
+ */
+function realInfo(abs: string, cwd: string, home: string): PathInfo | 'unknown' | undefined {
+  let realCwd: string;
+  try {
+    realCwd = realpathSync(cwd);
+  } catch {
+    return undefined;
+  }
+  const tail: string[] = [];
+  let probe = literalPrefix(abs);
+  for (;;) {
+    try {
+      return inspectPath(posix.join(realpathSync(probe), ...tail), undefined, realCwd, home);
+    } catch (e) {
+      const up = posix.dirname(probe);
+      if (!isMissing(e) || up === probe) return isMissing(e) ? undefined : 'unknown';
+      tail.unshift(posix.basename(probe));
+      probe = up;
+    }
+  }
+}
+
+/** `rel` resolved from `start` unless it already names a place of its own. */
+const joinFrom = (start: string, rel: string): string => (rel.startsWith('/') || rel.startsWith('~') ? rel : posix.join(start, rel));
 
 function viewReader(name: string, input: Record<string, unknown>, cwd: string | undefined, home: string): ToolView {
   const target = str(input.file_path) ?? str(input.notebook_path) ?? str(input.path);
   const pattern = str(input.pattern);
   const glob = str(input.glob);
-  const checked = [target, name === 'Glob' ? pattern : undefined, glob].filter((s): s is string => s !== undefined);
 
-  // Reading a secret store is not harmless: what is read is sent to the model.
-  const sensitive = checked.some((p) => inspectPath(p, cwd, cwd, home).sensitive);
-  let risk: Risk = sensitive ? 'high' : 'low';
+  // 'low' means "runs without a tap", so it has to be earned on every count. Anything that
+  // cannot be shown to be a plain read INSIDE the working directory is asked about.
+  let risk: Risk = 'low';
+  if (cwd === undefined) risk = 'med'; // "inside" means nothing without a working directory
+
+  // The places this call touches. A search starts at its path argument, or at the cwd.
+  const searches = name === 'Glob' || name === 'Grep';
+  const start = searches ? (target ?? cwd) : target;
+  const places: { raw: string; nameLike: boolean }[] = [];
+  if (start !== undefined) places.push({ raw: start, nameLike: true });
+  const filter = name === 'Glob' ? pattern : name === 'Grep' ? glob : undefined;
+  if (start !== undefined && filter !== undefined) places.push({ raw: joinFrom(start, filter), nameLike: name === 'Glob' });
+  // A read with nothing to read, or a search with nothing to search for, is malformed: not an auto-run.
+  if (start === undefined || (searches && pattern === undefined)) risk = raiseTo(risk, 'med');
+
+  for (const { raw, nameLike } of places) {
+    const info = inspectPath(raw, cwd, cwd, home);
+    // Reading a secret store is not harmless: what is read is sent to the model.
+    if (info.sensitive) risk = raiseTo(risk, 'high');
+    // A look-alike character makes the path on the panel a different path from the one read.
+    if (nameLike && spoofable(raw)) risk = raiseTo(risk, 'high');
+    // grep -r over a directory that CONTAINS ~/.ssh reads it, though nothing names it.
+    if (name === 'Grep' && raw === start && info.abs !== undefined && reachesSecret(info.abs, home)) risk = raiseTo(risk, 'high');
+    if (!info.inside) risk = raiseTo(risk, 'med');
+    else if (cwd !== undefined && info.abs !== undefined) {
+      const real = realInfo(info.abs, cwd, home);
+      if (real === 'unknown' || (real !== undefined && !real.inside)) risk = raiseTo(risk, 'med');
+      if (real !== undefined && real !== 'unknown' && real.sensitive) risk = raiseTo(risk, 'high');
+    }
+  }
 
   let summary: string;
-  if (name === 'Glob' || name === 'Grep') {
-    summary = target !== undefined && pattern !== undefined ? `${pattern} in ${target}` : (pattern ?? target ?? name);
-    if (pattern === undefined) risk = bump(risk);
-  } else if (target !== undefined) {
-    summary = pathSummary(displayPath(inspectPath(target, cwd, cwd, home), cwd));
-  } else {
-    summary = name;
-    risk = bump(risk);
-  }
-  return finish(name, { risk, summary });
+  if (searches) summary = target !== undefined && pattern !== undefined ? `${pattern} in ${target}` : (pattern ?? target ?? name);
+  else if (target !== undefined) summary = pathSummary(displayPath(inspectPath(target, cwd, cwd, home), cwd));
+  else summary = name;
+  return finish(name, { risk, summary: plain(summary) });
 }
 
 function viewWriter(name: string, input: Record<string, unknown>, cwd: string | undefined, home: string): ToolView {
@@ -1193,8 +1514,32 @@ function viewWriter(name: string, input: Record<string, unknown>, cwd: string | 
   const info = inspectPath(target, cwd, cwd, home);
   const summary = pathSummary(displayPath(info, cwd));
   if (info.config) return finish(name, { risk: 'high', summary, deny: CONFIG_REASON });
-  const risk: Risk = !info.inside || info.hidden || info.sensitive ? 'high' : 'med';
+  let risk: Risk = !info.inside || info.hidden || info.sensitive || spoofable(target) ? 'high' : 'med';
+  // Writing through a link inside the project writes wherever it points.
+  if (cwd !== undefined && info.abs !== undefined) {
+    const real = realInfo(info.abs, cwd, home);
+    if (real !== undefined && real !== 'unknown' && real.config) return finish(name, { risk: 'high', summary, deny: CONFIG_REASON });
+    if (real === 'unknown' || (real !== undefined && (!real.inside || real.sensitive || real.hidden))) risk = 'high';
+  }
   return finish(name, { risk, summary });
+}
+
+// -- the web ------------------------------------------------------------------
+
+/** A path longer than this is not shown in full next to its host, so it cannot be judged. */
+const WEB_PATH_MAX = 64;
+
+/** A host that is this machine or its network: a fetch there reaches things no website should. */
+function privateHost(hostname: string): boolean {
+  const h = hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  if (h === 'localhost' || /\.(?:localhost|local|internal|lan|home|corp)$/.test(h)) return true;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (v4) {
+    const a = Number(v4[1]);
+    const b = Number(v4[2]);
+    return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+  }
+  return h.includes(':') && /^(?:::1?$|f[cd][0-9a-f]{2}:|fe[89ab][0-9a-f]:|::ffff:)/.test(h);
 }
 
 function viewWebFetch(name: string, input: Record<string, unknown>): ToolView {
@@ -1204,42 +1549,113 @@ function viewWebFetch(name: string, input: Record<string, unknown>): ToolView {
     const u = new URL(raw);
     const web = u.protocol === 'http:' || u.protocol === 'https:';
     // The host is the part a human can judge; the parser (not a regex) decides what it is,
-    // so "https://good.com@evil.com/" shows evil.com.
-    return finish(name, { risk: web ? 'med' : 'high', summary: u.host || raw });
+    // so "https://good.com@evil.com/" shows evil.com. The start of the path and the query follow it:
+    // data leaves in them, behind a host that looks harmless.
+    const shown = web ? `${u.host}${u.pathname}${u.search}` : raw;
+    const info = sanitizeInfo(plain(shown), LIMITS.summaryMax);
+    const risky =
+      !web || u.search !== '' || u.username !== '' || u.password !== '' || u.pathname.length > WEB_PATH_MAX ||
+      privateHost(u.hostname) || spoofable(raw) || info.truncated;
+    return finish(name, { risk: risky ? 'high' : 'med', summary: info.text || u.host || raw });
   } catch {
-    return finish(name, { risk: 'high', summary: raw });
+    return finish(name, { risk: 'high', summary: plain(raw) });
   }
 }
 
-/** Fields that are the model describing the call rather than being part of it. */
-const NARRATION_KEYS = new Set([
-  'description', 'title', 'summary', 'reason', 'explanation', 'rationale', 'justification', 'purpose',
-  'intent', 'displayname', 'display_name',
-]);
-const SHORT_FIELD_MAX = 60;
-const WRITER_NAME_RE = /write|edit|create|save|put|append|replace|move|rename|copy|delete|remove|patch|update|touch|mkdir|insert|upload|overwrite|modify|set/i;
+function viewWebSearch(name: string, input: Record<string, unknown>): ToolView {
+  const q = str(input.query);
+  if (q === undefined) return finish(name, { risk: 'med', summary: name });
+  // A search is data leaving: if the panel cannot show all of it, or shows `?` for part of it, say so.
+  const info = sanitizeInfo(plain(q), LIMITS.summaryMax);
+  return finish(name, { risk: info.truncated || spoofable(q) ? 'high' : 'med', summary: info.text });
+}
 
-function viewUnknown(name: string, input: Record<string, unknown>, cwd: string | undefined, home: string): ToolView {
-  let field: string | undefined;
+// -- tools this file does not know ------------------------------------------
+
+/**
+ * The only fields of an UNKNOWN tool's input that are ever shown (compared lower-cased with
+ * `_` and `-` removed, so `file_path`, `filePath` and `FILE-PATH` are one). They say WHAT a call
+ * is aimed at. Everything else -- body, text, content, description, note, prompt -- is the
+ * model's free text, which is exactly where a lie to the human would go, and is never shown:
+ * it is only counted. Credentials (key, token, password) are deliberately not on the list.
+ */
+const IDENT_KEYS = new Set([
+  'url', 'uri', 'href', 'path', 'filepath', 'filename', 'file', 'dir', 'directory', 'command', 'cmd', 'script',
+  'query', 'q', 'sql', 'to', 'cc', 'bcc', 'recipient', 'recipients', 'channel', 'repo', 'repository', 'owner',
+  'id', 'name', 'projectid', 'project', 'table', 'branch', 'ref', 'sha', 'domain', 'host', 'hostname', 'server',
+  'resource', 'user', 'username', 'email', 'address', 'target', 'source', 'destination', 'dest', 'skill', 'taskid',
+]);
+const AGENT_KEYS = new Set(['subagenttype', 'mode', 'model']);
+const FIELD_VALUE_MAX = 48;
+const NAME_SHOWN_MAX = 40;
+
+function fieldText(v: unknown): string | undefined {
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === 'string' || typeof x === 'number')) return v.join(',');
+  return undefined;
+}
+
+/**
+ * `name key=value ... (N fields, M B)`: the tool, the allowlisted fields that fit, and how
+ * much input there was in total. A call with no identifying field at all reads
+ * `name (N fields, M B)`, which says plainly that the panel cannot tell you what it does.
+ */
+function identifySummary(name: string, input: Record<string, unknown>, keys: Set<string>, stats: boolean): string {
+  const n = Object.keys(input).length;
+  let bytes = '?';
+  try {
+    bytes = String(Buffer.byteLength(JSON.stringify(input) ?? '', 'utf8'));
+  } catch {
+    // circular or BigInt: the size is unknown, which the summary says
+  }
+  const suffix = stats ? ` (${n} field${n === 1 ? '' : 's'}, ${bytes} B)` : '';
+  let out = sanitize(plain(name), NAME_SHOWN_MAX) || 'tool';
   for (const [k, v] of Object.entries(input)) {
-    if (typeof v !== 'string' || NARRATION_KEYS.has(k.toLowerCase())) continue;
-    const t = v.trim();
-    if (t !== '' && t.length <= SHORT_FIELD_MAX) {
-      field = `${k}=${t}`;
+    if (!keys.has(k.toLowerCase().replace(/[_-]/g, ''))) continue;
+    const t = fieldText(v);
+    if (t === undefined) continue;
+    const value = sanitize(plain(t), FIELD_VALUE_MAX);
+    if (value === '') continue;
+    const piece = ` ${k.toLowerCase()}=${value}`;
+    const room = LIMITS.summaryMax - suffix.length - out.length;
+    if (piece.length <= room) out += piece;
+    else {
+      if (room > 12) out += truncateText(piece, room);
       break;
     }
   }
+  return out + suffix;
+}
+
+const WRITER_NAME_RE = /write|edit|create|save|put|append|replace|move|rename|copy|delete|remove|patch|update|touch|mkdir|insert|upload|overwrite|modify|set/i;
+
+/** Rated 'high' without exception: nothing here knows what the tool does, only what it was aimed at. */
+function viewUnknown(name: string, input: Record<string, unknown>, cwd: string | undefined, home: string): ToolView {
+  const summary = identifySummary(name, input, IDENT_KEYS, true);
   // A file-writing tool we have never heard of (an MCP filesystem server) that is pointed at
   // Claude Code's configuration is the same attack through a different door.
   if (WRITER_NAME_RE.test(labelFor(name))) {
     for (const v of Object.values(input)) {
       if (typeof v === 'string' && v.length <= 1024 && !/\s/.test(v.trim()) && inspectPath(v.trim(), cwd, cwd, home).config) {
-        return finish(name, { risk: 'high', summary: field ? `${name} ${field}` : name, deny: CONFIG_REASON });
+        return finish(name, { risk: 'high', summary, deny: CONFIG_REASON });
       }
     }
   }
-  const summary = field ? `${name} ${field}` : name;
-  return finish(name, { risk: 'med', summary });
+  return finish(name, { risk: 'high', summary });
+}
+
+/**
+ * Built-in tools that only keep the session's own books (the to-do list, plans, tool lookup).
+ * They still need a tap -- they are not read-only, so they are not in the auto-run set -- but
+ * they are 'med' rather than 'high', because crying wolf on every to-do update teaches the
+ * player to ignore the label that matters.
+ */
+const SESSION_TOOLS = new Set(['TodoWrite', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'ToolSearch', 'EnterPlanMode', 'ExitPlanMode']);
+
+function viewSession(name: string, input: Record<string, unknown>): ToolView {
+  if (name === 'TodoWrite' && Array.isArray(input.todos)) return finish(name, { risk: 'med', summary: `${name} (${input.todos.length} items)` });
+  return finish(name, { risk: 'med', summary: identifySummary(name, input, IDENT_KEYS, false) });
 }
 
 /**
@@ -1249,45 +1665,119 @@ function viewUnknown(name: string, input: Record<string, unknown>, cwd: string |
  */
 const ASKING_MODES = new Set(['default', 'plan']);
 
-function viewAgent(name: string, input: Record<string, unknown>, cwd: string | undefined, home: string): ToolView {
+function viewAgent(name: string, input: Record<string, unknown>): ToolView {
   // The prompt and description are the model's own account of the task, so only the fields that
   // identify WHAT is being started are eligible for the summary.
-  const identity: Record<string, unknown> = {};
-  for (const k of ['subagent_type', 'mode', 'model']) if (typeof input[k] === 'string') identity[k] = input[k];
-  const view = viewUnknown(name, identity, cwd, home);
+  const summary = identifySummary(name, input, AGENT_KEYS, false);
   const mode = input.mode;
-  if (mode === undefined || (typeof mode === 'string' && ASKING_MODES.has(mode))) return view;
-  return { ...view, risk: 'high', deny: 'starts a subagent in a permission mode that does not ask the user' };
+  if (mode === undefined || (typeof mode === 'string' && ASKING_MODES.has(mode))) return finish(name, { risk: 'med', summary });
+  return finish(name, { risk: 'high', summary, deny: 'starts a subagent in a permission mode that does not ask the user' });
 }
 
+// -- tools the device cannot serve ------------------------------------------
+
+/**
+ * Tools that would hang, or answer the model with a lie, on a handheld that has no keyboard,
+ * no multiple-choice screen and no way to wake the session later. They are refused with a
+ * reason the MODEL reads, so it does the useful thing instead of retrying. Each entry is here
+ * because ALLOWING it would be worse than refusing it:
+ *  - AskUserQuestion: the panel cannot show the question, and a tap on ALLOW tells the model
+ *    "the user did not answer", which it reads as an answer.
+ *  - ScheduleWakeup, CronCreate, CronDelete, CronList: they create or manage turns that start
+ *    on their own later; nothing in a voice session is listening for those (and a result with
+ *    no prompt behind it is exactly what the driver now refuses to report).
+ *  - Monitor: streams a background process's output into the session as unprompted turns.
+ * The list is exact tool names from the SDK's own BUILTIN_TOOL_NAMES; an MCP tool that happens
+ * to share a name has a different, prefixed one.
+ */
+const UNSERVED_TOOLS = new Map<string, string>([
+  ['AskUserQuestion', 'This device cannot show multiple-choice questions; ask one short question in your final message instead.'],
+  ['ScheduleWakeup', 'Wake-ups are not available in this voice session; do the work now, or say in your final message what to do later.'],
+  ['CronCreate', 'Scheduled tasks are not available in this voice session; do the work now, or say in your final message what to schedule.'],
+  ['CronDelete', 'Scheduled tasks are not available in this voice session; there is nothing to delete.'],
+  ['CronList', 'Scheduled tasks are not available in this voice session; there is nothing to list.'],
+  ['Monitor', 'Background monitors are not available in this voice session; run it to completion and report in your final message.'],
+]);
+
+/**
+ * The same names as a list, for whoever stops OFFERING them to the model (the driver's
+ * `disallowedTools`): one fact, one place, so the two cannot drift apart.
+ */
+export const UNSERVED_TOOL_NAMES: readonly string[] = [...UNSERVED_TOOLS.keys()];
+
+// -- entry point --------------------------------------------------------------
+
 function describe(name: string, input: Record<string, unknown>, cwd: string | undefined): ToolView {
-  const home = homedir();
+  const unserved = UNSERVED_TOOLS.get(name);
+  if (unserved !== undefined) return finish(name, { risk: 'high', summary: name, deny: unserved });
+  const home = safeHome();
   if (name === 'Bash') return viewBash(name, input, cwd);
-  if (name === 'Agent' || name === 'Task') return viewAgent(name, input, cwd, home);
+  if (name === 'Agent' || name === 'Task') return viewAgent(name, input);
   if (READERS.has(name)) return viewReader(name, input, cwd, home);
   if (WRITERS.has(name)) return viewWriter(name, input, cwd, home);
   if (name === 'WebFetch') return viewWebFetch(name, input);
-  if (name === 'WebSearch') {
-    const q = str(input.query);
-    return finish(name, { risk: 'med', summary: q ?? name });
-  }
+  if (name === 'WebSearch') return viewWebSearch(name, input);
+  if (SESSION_TOOLS.has(name)) return viewSession(name, input);
   return viewUnknown(name, input, cwd, home);
 }
 
-/** Analysis crashed (a stack overflow on absurd nesting, say): unknown, so ask, loudly. */
-function fallbackView(name: string, input: Record<string, unknown>): ToolView {
-  const cmd = name === 'Bash' ? str(input.command) : undefined;
-  return finish(name, { risk: 'high', summary: cmd ?? name });
+/** `os.homedir()` throws when the account has no home; the answer must not become "deny everything". */
+function safeHome(): string {
+  try {
+    return homedir();
+  } catch {
+    return '/nonexistent-home';
+  }
 }
 
-export const describeTool: DescribeTool = (name, input, cwd) => {
-  const n = typeof name === 'string' ? name : String(name);
-  const inp = isRecord(input) ? input : {};
-  // A relative cwd cannot define "inside"; treat it as unknown rather than guess.
-  const base = typeof cwd === 'string' && cwd.startsWith('/') ? posix.normalize(cwd) : undefined;
+/** Why a call whose analysis crashed is refused. The model reads it, so it says what happened. */
+export const ANALYSIS_FAILED = 'the call could not be analysed (an internal error in the bridge), so it is refused';
+
+/**
+ * The view for a call the analyser could not process. It is a DENY, not an ask: a crash on
+ * hostile input must never turn a refusal into something a tired thumb can approve. Nothing
+ * here touches the input, so it cannot throw in turn.
+ */
+function failClosed(name: unknown): ToolView {
+  let label = 'tool';
   try {
-    return describe(n, inp, base);
+    label = labelFor(typeof name === 'string' ? name : String(name));
   } catch {
-    return fallbackView(n, inp);
+    // an object whose toString throws: the generic label stands
   }
-};
+  return { label, risk: 'high', summary: label, deny: ANALYSIS_FAILED };
+}
+
+type Analyser = (name: string, input: Record<string, unknown>, cwd: string | undefined) => ToolView;
+
+/**
+ * The seam that lets a test prove the fail-closed rule with an analyser that throws on
+ * demand. Production uses `describeTool` below, which is this with the real analyser.
+ */
+export function makeDescribeTool(analyse: Analyser): DescribeTool {
+  return (name, input, cwd) => {
+    try {
+      const n = typeof name === 'string' ? name : String(name);
+      const inp = isRecord(input) ? input : {};
+      // A relative cwd cannot define "inside"; treat it as unknown rather than guess.
+      const base = typeof cwd === 'string' && cwd.startsWith('/') ? posix.normalize(cwd) : undefined;
+      return analyse(n, inp, base);
+    } catch {
+      return failClosed(name);
+    }
+  };
+}
+
+export const describeTool: DescribeTool = makeDescribeTool(describe);
+
+/**
+ * The single answer to "may this run without a tap?": only a call rated 'low' and not
+ * refused. The driver's PreToolUse hook asks this (through the server) so that no rule,
+ * settings file or CLI default can skip the device for anything else.
+ */
+export function needsTap(name: string, input: Record<string, unknown>, cwd?: string, describe: DescribeTool = describeTool): boolean {
+  const v = describe(name, input, cwd);
+  // A refused call can never be free, whatever risk its view carries (`finish` makes it high, but this
+  // is the function the driver trusts, so it does not rely on that).
+  return v.deny !== undefined || v.risk !== 'low';
+}

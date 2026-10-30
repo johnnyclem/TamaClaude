@@ -17,12 +17,91 @@
  *    ignored: the union grows, and a new variant must not be able to end a turn.
  *  - Subagent traffic (parent_tool_use_id set) can show activity but can never end the
  *    turn or add to the log; only the main thread speaks for the turn.
+ *  - A turn nobody asked for is never reported as the answer to a prompt. The driver gives
+ *    each prompt a uuid (`begin()`); the CLI echoes it in `user_message_uuids` on every
+ *    frame of the turn it ran for that prompt, and a turn it started on its own (a finished
+ *    background task, a scheduled wake-up) carries no such stamp. Frames and results are
+ *    attributed to the prompt in flight only through that stamp. Measured against the real
+ *    CLI (see test/real-cli.integration.test.ts): the FIRST frame of a turn we asked for is
+ *    always stamped, even a synthetic API-error message, so "unstamped first frame" means
+ *    "not ours".
+ *  - What the pet's owner reads is the CLI's own words. A failed result carries the CLI's
+ *    short message as its text; an interrupt (`terminal_reason` aborted_*) is reported as
+ *    `interrupted`, which the server turns into "Stopped." rather than an error.
  */
 
 import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { DriverEvent } from '../types.ts';
 
 type Rec = Record<string, unknown>;
+
+/**
+ * What the adapter tells the driver: the bridge's own vocabulary plus three signals that only
+ * the driver can act on. They are not part of `DriverEvent` because the server must never see
+ * them: each one is resolved inside the driver (a retry, a fast failure, a log line).
+ */
+export type AdapterEvent =
+  | DriverEvent
+  /** The CLI could not find the transcript of the session it was asked to resume. */
+  | { k: 'resume_failed' }
+  /**
+   * The API call failed and the CLI will try again. `giveUp` is set when retrying cannot
+   * help (a rejected key, a billing problem): the driver ends the turn at once with that
+   * text instead of letting the pet "think" through the CLI's whole backoff.
+   */
+  | { k: 'api_retry'; error: string; status: number | null; attempt: number; max: number; giveUp: string | undefined }
+  /** A result that belongs to a turn nobody here asked for. The driver logs it and moves on. */
+  | { k: 'foreign_result' };
+
+/**
+ * `error` values of an `api_retry` that waiting cannot fix, with the one short sentence the
+ * owner needs. The CLI's own prose for these exists only after its whole retry cycle (about
+ * three minutes for a rejected key, measured), so the sentence comes from the CLI's error
+ * CODE, which arrives with the first retry. Printable ASCII, one line, under the wire limit.
+ */
+const GIVE_UP: ReadonlyMap<string, string> = new Map([
+  ['authentication_failed', 'the API key was rejected. Check ANTHROPIC_API_KEY.'],
+  ['oauth_org_not_allowed', 'this account is not allowed to use the API.'],
+  ['account_on_hold', 'the Claude account is on hold.'],
+  ['verification_required', 'the Claude account needs verification.'],
+  ['billing_error', 'the API reports a billing problem.'],
+  ['invalid_request', 'the API rejected the request.'],
+  ['model_not_found', 'the API does not know this model.'],
+  ['cloud_credential_error', 'the cloud credentials were rejected.'],
+]);
+
+/** The CLI's diagnostics for itself, not a message for a person. */
+const DIAGNOSTIC_PREFIX = '[ede_diagnostic]';
+const ERROR_TEXT_MAX = 300;
+const STALE_RESUME = 'No conversation found with session ID';
+
+/** Which prompts a frame answers, by the stamps the CLI echoes; undefined when it carries none. */
+function stampsOf(msg: Rec): string[] | undefined {
+  const list = msg.user_message_uuids;
+  if (Array.isArray(list)) return list.filter((u): u is string => typeof u === 'string');
+  const one = str(msg.user_message_uuid);
+  return one === undefined ? undefined : [one];
+}
+
+/** The first error string a person could read, or ''. */
+function errorText(msg: Rec): string {
+  const errors = msg.errors;
+  if (!Array.isArray(errors)) return '';
+  for (const e of errors as unknown[]) {
+    if (typeof e === 'string' && e.trim() !== '' && !e.startsWith(DIAGNOSTIC_PREFIX)) return e.trim().slice(0, ERROR_TEXT_MAX);
+  }
+  return '';
+}
+
+function isStaleResume(msg: Rec): boolean {
+  return msg.subtype === 'error_during_execution' && Array.isArray(msg.errors) &&
+    (msg.errors as unknown[]).some((e) => typeof e === 'string' && e.startsWith(STALE_RESUME));
+}
+
+/** A result the CLI wrote for a turn that never ran (a startup failure): no frames, no stamp, no turns. */
+function isZeroedError(msg: Rec): boolean {
+  return msg.is_error === true && (msg.num_turns === 0 || msg.startup_failure_reason !== undefined);
+}
 
 function isRec(v: unknown): v is Rec {
   return typeof v === 'object' && v !== null;
@@ -53,21 +132,44 @@ export class ClaudeAdapter {
    */
   #streaming = new Map<string, Map<number, string>>();
   #session: string | undefined;
+  /**
+   * Prompt attribution. An adapter nobody has called `begin()` on cannot judge ownership, so
+   * it passes everything through (the unit tests of the mapping rules use one); the driver
+   * calls `begin()` before it sends the first prompt, which switches judging on for good.
+   */
+  #bound = false;
+  /** The uuid of the prompt in flight; undefined between prompts, when nothing is awaited. */
+  #expected: string | undefined;
+  /** Whose frames are streaming since the last result: unknown (`idle`), ours, or someone else's. */
+  #turn: 'idle' | 'ours' | 'foreign' = 'idle';
 
   /** How many tools are announced and not yet ended. */
   get openToolCount(): number {
     return this.#open.size;
   }
 
-  map(msg: SDKMessage): DriverEvent[] {
+  /**
+   * A prompt with this uuid is about to be sent. From now until its result, only frames the
+   * CLI stamps with it count as the turn's.
+   */
+  begin(uuid: string): void {
+    this.#bound = true;
+    this.#expected = uuid;
+    // A turn of ours that never produced its result is not the turn of this prompt.
+    if (this.#turn === 'ours') this.#turn = 'idle';
+  }
+
+  map(msg: SDKMessage): AdapterEvent[] {
     if (!isRec(msg)) return [];
     switch (msg.type) {
       case 'system':
-        return msg.subtype === 'init' ? this.#init(msg.session_id) : [];
+        if (msg.subtype === 'init') return this.#init(msg.session_id);
+        if (msg.subtype === 'api_retry') return this.#apiRetry(msg);
+        return [];
       case 'stream_event':
-        return this.#stream(msg.event, msg.parent_tool_use_id);
+        return this.#owns(msg, true) ? this.#stream(msg.event, msg.parent_tool_use_id) : [];
       case 'assistant':
-        return this.#assistant(msg);
+        return this.#owns(msg, true) ? this.#assistant(msg) : [];
       case 'user':
         return this.#user(msg);
       case 'result':
@@ -75,6 +177,23 @@ export class ClaudeAdapter {
       default:
         return [];
     }
+  }
+
+  /**
+   * Does this frame belong to the prompt in flight? Judged from the stamps the CLI echoes;
+   * a frame without one inherits the turn it is in. `canStart` says whether the frame may
+   * open a turn: only assistant and stream frames do, a tool result never starts one.
+   */
+  #owns(msg: Rec, canStart: boolean): boolean {
+    if (!this.#bound) return true;
+    const stamps = stampsOf(msg);
+    if (stamps !== undefined) {
+      this.#turn = this.#expected !== undefined && stamps.includes(this.#expected) ? 'ours' : 'foreign';
+    } else if (this.#turn === 'idle' && canStart) {
+      // The first frame of a turn we asked for is always stamped, so this one started on its own.
+      this.#turn = 'foreign';
+    }
+    return this.#turn === 'ours';
   }
 
   /**
@@ -88,6 +207,22 @@ export class ClaudeAdapter {
     this.#open.clear();
     this.#streaming.clear();
     return out;
+  }
+
+  #apiRetry(msg: Rec): AdapterEvent[] {
+    const error = str(msg.error) ?? 'unknown';
+    const status = typeof msg.error_status === 'number' ? msg.error_status : null;
+    const phrase = GIVE_UP.get(error);
+    return [
+      {
+        k: 'api_retry',
+        error,
+        status,
+        attempt: typeof msg.attempt === 'number' ? msg.attempt : 0,
+        max: typeof msg.max_retries === 'number' ? msg.max_retries : 0,
+        giveUp: phrase === undefined ? undefined : `Claude API error${status === null ? '' : ` ${status}`}: ${phrase}`,
+      },
+    ];
   }
 
   #init(sessionId: unknown): DriverEvent[] {
@@ -204,6 +339,8 @@ export class ClaudeAdapter {
   #user(msg: Rec): DriverEvent[] {
     // On resume the CLI can echo the old conversation; none of it happened this turn.
     if ('isReplay' in msg) return [];
+    // A tool result never opens a turn, and one that belongs to no turn of ours is not ours.
+    if (!this.#owns(msg, false)) return [];
     const message: unknown = msg.message;
     const content: unknown = isRec(message) ? message.content : undefined;
     if (!Array.isArray(content)) return [];
@@ -219,14 +356,35 @@ export class ClaudeAdapter {
     return out;
   }
 
-  #result(msg: Rec): DriverEvent[] {
+  #result(msg: Rec): AdapterEvent[] {
     // The typings give a result no parent, but the invariant is too important to rest on
     // that: a subagent's result must never be taken for the end of the user's turn.
     if (isSub(msg.parent_tool_use_id)) return [];
+
+    // The saved session is gone: no frames, no stamp, and the prompt never ran. The driver
+    // starts over on a fresh session instead of reporting a failure.
+    if (this.#bound && this.#expected !== undefined && this.#turn === 'idle' && isStaleResume(msg)) {
+      return [{ k: 'resume_failed' }];
+    }
+
+    if (!this.#bound) {
+      // Unjudged: every result is the answer.
+    } else if (!this.#isOurResult(msg)) {
+      this.#turn = 'idle';
+      return [{ k: 'foreign_result' }];
+    }
+    this.#turn = 'idle';
+    this.#expected = undefined;
+
     // The turn is over, so nothing can still be running; say so before saying it is done.
-    const out = this.abandon();
+    const out: AdapterEvent[] = this.abandon();
     const subtype = str(msg.subtype) ?? 'unknown';
-    if (subtype === 'success') {
+    const reason = str(msg.terminal_reason);
+    if (reason === 'aborted_streaming' || reason === 'aborted_tools') {
+      // The CLI reports a stop, whoever asked for it, as an error result. To the owner it is
+      // "Stopped.", not "Something went wrong."; the diagnostic in `errors` is not for them.
+      out.push({ k: 'result', ok: false, text: '', subtype: 'interrupted' });
+    } else if (subtype === 'success') {
       out.push({
         k: 'result',
         ok: msg.is_error !== true,
@@ -235,9 +393,23 @@ export class ClaudeAdapter {
       });
     } else {
       // error_max_turns, error_during_execution, ... and any subtype added later: a result
-      // is terminal whatever it is called, and the model produced no answer worth keeping.
-      out.push({ k: 'result', ok: false, text: '', subtype });
+      // is terminal whatever it is called. The CLI's own short sentence is the text; the
+      // server falls back to a generic one when there is none.
+      out.push({ k: 'result', ok: false, text: errorText(msg), subtype });
     }
     return out;
+  }
+
+  /**
+   * Is this result the answer to the prompt in flight? It is when its stamps name it, or when
+   * it has none but the turn so far was ours. A result with neither a stamp nor any frame is
+   * only ours if it is the zeroed error the CLI writes for a turn that never ran.
+   */
+  #isOurResult(msg: Rec): boolean {
+    if (this.#expected === undefined) return false;
+    const stamps = stampsOf(msg);
+    if (stamps !== undefined) return stamps.includes(this.#expected);
+    if (this.#turn === 'ours') return true;
+    return this.#turn === 'idle' && isZeroedError(msg);
   }
 }

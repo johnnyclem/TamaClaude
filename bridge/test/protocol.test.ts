@@ -19,9 +19,10 @@ import {
   decodeAudioFrame, decodeBridgeMsg, decodeDeviceMsg, encodeAudioFrame, encodeBridgeMsg, encodeDeviceMsg,
   isPrintableAscii,
 } from '../src/protocol.ts';
+import { DEFAULTS, MAX_BAD_FRAMES, MAX_PAYLOAD } from '../src/server.ts';
 import {
-  ASK_END_REASONS, BRIDGE_MSG_TYPES, DEVICE_MSG_TYPES, ERR_CODES, FRAME_KIND_MIC, FRAME_KIND_TTS, HELLO_WHYS,
-  LIMITS, PHASES, PROTOCOL_VERSION, RISKS,
+  ASK_END_REASONS, BRIDGE_MSG_TYPES, CLOSE, DEVICE_MSG_TYPES, ERR_CODES, FRAME_KIND_MIC, FRAME_KIND_TTS, HELLO_WHYS,
+  LIMITS, LISTEN_MODES, PHASES, PROTOCOL_VERSION, RISKS,
 } from '../src/types.ts';
 import type { BridgeMsg, DecodeResult, DeviceMsg } from '../src/types.ts';
 
@@ -1109,5 +1110,72 @@ describe('PROTOCOL.md agrees with the code', () => {
     for (const t of ['hello', 'hello_ack', 'state', 'say', 'ask', 'ask_rsp', 'ask_end', 'result', 'ping', 'pong', 'listen', 'stt']) {
       assert.ok(seen.has(t), `the transcript never shows ${t}`);
     }
+  });
+
+  it('every non-frame line of the worked example is an action the replay knows how to perform', () => {
+    // test/server.e2e.test.ts replays the example against a live bridge; an action it did not
+    // know would make that test fail, but this names the contract from this side too.
+    const block = /```transcript\n([\s\S]*?)```/.exec(DOC)![1]!;
+    const actions = new Set(block.split('\n').filter((l) => l.startsWith('#@ ')).map((l) => l.slice(3).split(/\s+/)[0]));
+    assert.deepEqual([...actions].sort(), ['drop', 'mic', 'reconnect', 'wait']);
+  });
+
+  it('the close-code table is CLOSE: the same codes, nothing missing and nothing extra', () => {
+    const rows = tableAfter(section('Transport'), '### Close codes');
+    const documented = rows.map((r) => Number(r[0]));
+    // 1006 is what a device's library reports when no close frame came; nobody sends it, so CLOSE lacks it.
+    assert.equal(rows.find((r) => r[0] === '1006')?.[1], 'nobody');
+    assert.deepEqual(documented.filter((c) => c !== 1006).sort(), Object.values(CLOSE).sort());
+    assert.equal(new Set(documented).size, documented.length, 'a code is listed twice');
+    // The numbers the prose leans on.
+    assert.match(section('Transport'), new RegExp(`above ${MAX_PAYLOAD} bytes`));
+    assert.match(section('Transport'), new RegExp(`up to ${MAX_PAYLOAD} bytes`));
+    assert.equal(MAX_PAYLOAD > LIMITS.deviceFrameMax, true, 'the socket admits more than the protocol, so a long frame is a bad_msg');
+    assert.equal(MAX_BAD_FRAMES, 5);
+    assert.match(DOC, /fifth frame\s+in a\s+row/);
+  });
+
+  it('the timings table is DEFAULTS: every setting documented, every value the same', () => {
+    const rows = tableAfter(section('Keepalive'), 'TIMINGS_TABLE');
+    const unit: Record<string, number> = { s: 1000, min: 60_000, KiB: 1024, '': 1 };
+    const doc = new Map(rows.map((r) => {
+      const m = /^(\d+(?:\.\d+)?)\s*(s|min|KiB)?$/.exec(r[1]!);
+      assert.ok(m, `cannot read the value "${r[1]}" of ${r[0]}`);
+      return [r[0]!, Math.round(Number(m[1]) * unit[m[2] ?? '']!)] as const;
+    }));
+    assert.deepEqual([...doc.keys()].sort(), Object.keys(DEFAULTS).sort(), 'a default is undocumented, or the doc names one that does not exist');
+    for (const [name, value] of Object.entries(DEFAULTS)) assert.equal(doc.get(name), value, name);
+    // The two figures the Keepalive prose states in words.
+    const prose = section('Keepalive');
+    assert.match(prose, new RegExp(`every \\*\\*${DEFAULTS.pingIntervalMs / 1000} seconds\\*\\*`));
+    assert.match(prose, new RegExp(`every ${DEFAULTS.keepaliveCheckMs / 1000} seconds`));
+    assert.match(prose, new RegExp(`more than ${DEFAULTS.deadAfterMs / 1000} seconds`));
+    assert.match(prose, new RegExp(`between ${DEFAULTS.deadAfterMs / 1000} and ${(DEFAULTS.deadAfterMs + DEFAULTS.keepaliveCheckMs) / 1000} seconds`));
+    assert.match(section('Connection lifecycle'), new RegExp(`within \\*\\*${DEFAULTS.helloTimeoutMs / 1000}\\s+seconds\\*\\*`));
+    assert.match(section('Connection lifecycle'), /half a second/);
+    assert.equal(DEFAULTS.authFailDelayMs, 500);
+    assert.match(DOC, new RegExp(`at most \\*\\*${DEFAULTS.maxOpenAsks}\\*\\* asks`));
+  });
+
+  it('the listen modes are the ones the decoder accepts, and only those', () => {
+    for (const m of LISTEN_MODES) assert.equal(decodeDeviceMsg(`{"t":"listen","m":"${m}"}`).ok, true, m);
+    for (const m of ['pause', 'START', '', 'stop ']) assert.equal(decodeDeviceMsg(`{"t":"listen","m":"${m}"}`).ok, false, m);
+    for (const m of LISTEN_MODES) assert.ok(DOC.includes(`\`${m}\``), m);
+  });
+
+  it('the input rules table names a response code that exists, and every err code appears in the error table', () => {
+    const inputs = tableAfter(section('Input rules'), '## Input rules');
+    assert.ok(inputs.length >= 15, 'the input rules table is missing or truncated');
+    // tableAfter() strips the backticks from a cell, so "`err` `busy`" reads "err busy".
+    let mentioned = 0;
+    for (const r of inputs) {
+      for (const m of r[2]!.matchAll(/\berr ([a-z_]+)/g)) {
+        mentioned += 1;
+        assert.ok((ERR_CODES as readonly string[]).includes(m[1]!), `${r[0]}: "${m[1]}" is not an error code`);
+      }
+    }
+    assert.ok(mentioned >= 8, `only ${mentioned} error codes were found in the input rules: the check is not reading the table`);
+    const errors = tableAfter(section('Errors'), '## Errors');
+    assert.deepEqual(errors.map((r) => r[0]).sort(), [...ERR_CODES].sort(), 'the error table lists exactly the error codes');
   });
 });
