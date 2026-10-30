@@ -1,0 +1,1 @@
+{"t":"hello","v":2147483647,"token":"AHOVcjqx4_ELSZgnu18BIPWdkry5~FMTahov29CJQXelsz6-GNUbipw3.DKRYfmt","dev":"dddddddddddddddddddddddddddddddd","fw":"ffffffffffffffff","rate":2147483647,"bits":2147483647,"ch":2147483647}

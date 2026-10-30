@@ -1,0 +1,1 @@
+{"t":"hello","v":1,"token":"AHOVcjqx4_ELSZgnu18BIPWdkry5~FMTahov29CJ","dev":"tamaclaude-a1b2","fw":"0.1.0","rate":16000,"bits":16,"ch":1}

@@ -1,0 +1,324 @@
+/**
+ * Permission handler tests.
+ *
+ * The handler is driven through a REAL ApprovalManager on a fake clock, because the
+ * property that matters is end to end: a tool call becomes an ask only when it may be
+ * asked about, becomes `allow` only by a tap, and every other road out is a refusal.
+ * Subclasses of the real manager are used only to inject faults the real one cannot
+ * produce on demand.
+ */
+
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { ApprovalManager } from '../src/approvals.ts';
+import type { ApprovalEvent, ApprovalOutcome } from '../src/approvals.ts';
+import { createPermissionHandler } from '../src/permission.ts';
+import type { Clock, DescribeTool, PermissionDecision, PermissionRequest, TimerHandle } from '../src/types.ts';
+
+const CWD = '/work/proj';
+
+class FakeClock implements Clock {
+  t = 1_000_000;
+  #seq = 0;
+  #live = new Map<number, { at: number; fn: () => void }>();
+  now(): number {
+    return this.t;
+  }
+  setTimeout(fn: () => void, ms: number): TimerHandle {
+    const id = ++this.#seq;
+    this.#live.set(id, { at: this.t + ms, fn });
+    return id;
+  }
+  clearTimeout(h: TimerHandle): void {
+    this.#live.delete(h as number);
+  }
+  get armed(): number {
+    return this.#live.size;
+  }
+  advance(ms: number): void {
+    const target = this.t + ms;
+    for (;;) {
+      let best: [number, { at: number; fn: () => void }] | undefined;
+      for (const e of this.#live) {
+        if (e[1].at > target) continue;
+        if (best === undefined || e[1].at < best[1].at || (e[1].at === best[1].at && e[0] < best[0])) best = e;
+      }
+      if (best === undefined) break;
+      this.#live.delete(best[0]);
+      this.t = Math.max(this.t, best[1].at);
+      best[1].fn();
+    }
+    this.t = target;
+  }
+}
+
+const id = (n: number): string => n.toString(16).padStart(8, '0');
+
+interface Rig {
+  clock: FakeClock;
+  approvals: ApprovalManager;
+  events: ApprovalEvent[];
+  logs: string[];
+  handler: ReturnType<typeof createPermissionHandler>;
+}
+function rig(o: { connected?: boolean; describe?: DescribeTool; approvals?: (opts: ConstructorParameters<typeof ApprovalManager>[0]) => ApprovalManager; cwd?: string; noLog?: boolean } = {}): Rig {
+  const clock = new FakeClock();
+  const events: ApprovalEvent[] = [];
+  const logs: string[] = [];
+  let n = 0;
+  const opts = { clock, ttlMs: 60_000, graceMs: 10_000, newId: () => id(++n), onEvent: (e: ApprovalEvent) => events.push(e) };
+  const approvals = o.approvals ? o.approvals(opts) : new ApprovalManager(opts);
+  if (o.connected !== false) approvals.deviceConnected();
+  const handler = createPermissionHandler({
+    approvals,
+    cwd: o.cwd ?? CWD,
+    ...(o.describe ? { describe: o.describe } : {}),
+    ...(o.noLog ? {} : { log: (l: string) => logs.push(l) }),
+  });
+  return { clock, approvals, events, logs, handler };
+}
+
+const req = (tool: string, input: Record<string, unknown>, signal: AbortSignal = new AbortController().signal): PermissionRequest => ({
+  tool,
+  input,
+  toolUseId: 'tu_1',
+  signal,
+});
+const PENDING = Symbol('pending');
+const peek = <T>(p: Promise<T>): Promise<T | typeof PENDING> => Promise.race([p, Promise.resolve(PENDING)]);
+
+const MSG = {
+  denied: 'The user denied this action on their handheld device. Do not retry it; ask what they would like instead.',
+  timeout: 'The user did not answer in time, so the action was not run. Ask whether to try again.',
+  disconnect: "The user's device disconnected, so the action was not run.",
+  abort: 'The turn was stopped by the user.',
+};
+
+// ---------------------------------------------------------------------------
+
+test('an allowed call becomes an ask built from the REAL input, and a tap on it is the only way to allow', async () => {
+  const r = rig();
+  const p = r.handler(req('Bash', { command: 'npm test', description: 'Definitely just reading a file' }));
+  assert.equal(await peek(p), PENDING, 'nothing happens without a tap');
+
+  const ask = r.approvals.current();
+  assert.deepEqual(ask, { id: id(1), label: 'Bash', risk: 'med', summary: 'npm test', ttlSec: 60 });
+  assert.ok(!/reading a file/i.test(ask!.summary), 'the model\'s own description never reaches the panel');
+
+  assert.equal(r.approvals.answer(id(1), true), 'accepted');
+  assert.deepEqual(await p, { allow: true });
+});
+
+test('a hard-denied call is refused WITHOUT asking, and the refusal names the rule and says not to work around it', async () => {
+  const r = rig();
+  const d = await r.handler(req('Bash', { command: 'rm -rf / # sk-secret-token-123' }));
+  assert.equal(d.allow, false);
+  const msg = (d as { message: string }).message;
+  assert.match(msg, /safety rules/);
+  assert.match(msg, /recursive delete of the root/, 'it names the rule');
+  assert.match(msg, /do not try to work around it/i);
+  assert.ok(!msg.includes('sk-secret-token-123'), 'the model-facing text never echoes the input');
+  assert.ok(!('interrupt' in d), 'a refusal does not stop the turn: the model is meant to adapt');
+
+  // The device never saw it.
+  assert.equal(r.approvals.pendingCount(), 0);
+  assert.deepEqual(r.events, []);
+  assert.equal(r.clock.armed, 0);
+
+  // Companion: the same handler DOES ask for something askable, so the "no ask" above is not vacuous.
+  void r.handler(req('Bash', { command: 'ls' }));
+  assert.equal(r.approvals.pendingCount(), 1);
+  assert.equal(r.events.length, 2);
+});
+
+test('an empty deny reason is still a refusal (deny is checked against undefined, not truthiness)', async () => {
+  const r = rig({ describe: () => ({ label: 'X', risk: 'low', summary: 's', deny: '' }) });
+  const d = await r.handler(req('X', {}));
+  assert.equal(d.allow, false);
+  assert.equal(r.approvals.pendingCount(), 0);
+  assert.match((d as { message: string }).message, /do not try to work around it/i);
+});
+
+test('every refusal outcome maps to its exact message, and only an abort interrupts', async () => {
+  // denied by a tap
+  let r = rig();
+  let p = r.handler(req('Bash', { command: 'ls' }));
+  r.approvals.answer(id(1), false);
+  assert.deepEqual(await p, { allow: false, message: MSG.denied });
+
+  // timeout
+  r = rig();
+  p = r.handler(req('Bash', { command: 'ls' }));
+  r.clock.advance(60_000);
+  assert.deepEqual(await p, { allow: false, message: MSG.timeout });
+
+  // disconnect
+  r = rig({ connected: false });
+  p = r.handler(req('Bash', { command: 'ls' }));
+  r.clock.advance(10_000);
+  assert.deepEqual(await p, { allow: false, message: MSG.disconnect });
+
+  // abort mid-ask
+  r = rig();
+  const ac = new AbortController();
+  p = r.handler(req('Bash', { command: 'ls' }, ac.signal));
+  assert.equal(r.approvals.pendingCount(), 1);
+  ac.abort();
+  assert.deepEqual(await p, { allow: false, message: MSG.abort, interrupt: true });
+  assert.equal(r.approvals.pendingCount(), 0);
+
+  // abort before the ask
+  r = rig();
+  const pre = new AbortController();
+  pre.abort();
+  assert.deepEqual(await r.handler(req('Bash', { command: 'ls' }, pre.signal)), { allow: false, message: MSG.abort, interrupt: true });
+  assert.deepEqual(r.events, []);
+
+  // cancelAll (the server stopping the turn) is also an abort
+  r = rig();
+  p = r.handler(req('Bash', { command: 'ls' }));
+  r.approvals.cancelAll('abort');
+  assert.deepEqual(await p, { allow: false, message: MSG.abort, interrupt: true });
+});
+
+test('the full path is FIFO: one ask at a time, the second is presented only after the first is settled', async () => {
+  const r = rig();
+  const a = r.handler(req('Bash', { command: 'echo a' }));
+  const b = r.handler(req('Edit', { file_path: 'src/b.ts' }));
+  assert.equal(r.approvals.current()?.summary, 'echo a');
+  assert.equal(r.approvals.pendingCount(), 2);
+  assert.equal(r.approvals.answer(id(2), true), 'unknown', 'the second ask cannot be answered early');
+  assert.equal(await peek(b), PENDING);
+
+  r.approvals.answer(id(1), true);
+  assert.deepEqual(await a, { allow: true });
+  assert.equal(r.approvals.current()?.summary, 'src/b.ts');
+  r.approvals.answer(id(2), false);
+  assert.deepEqual(await b, { allow: false, message: MSG.denied });
+});
+
+test('a tap that arrives after the timeout is harmless: it cannot approve the next call', async () => {
+  const r = rig();
+  const a = r.handler(req('Bash', { command: 'echo a' }));
+  const b = r.handler(req('Bash', { command: 'echo b' }));
+  r.clock.advance(60_000);
+  assert.deepEqual(await a, { allow: false, message: MSG.timeout });
+  assert.equal(r.approvals.answer(id(1), true), 'unknown');
+  assert.equal(await peek(b), PENDING, 'b is still waiting for its own tap');
+  assert.equal(r.approvals.answer(id(2), true), 'accepted');
+  assert.deepEqual(await b, { allow: true });
+});
+
+test('the cwd the handler was built with reaches the describer (the caller is tested, not just the callee)', async () => {
+  const inProj = rig({ cwd: '/work/proj' });
+  void inProj.handler(req('Write', { file_path: '/tmp/x.txt' }));
+  assert.equal(inProj.approvals.current()?.risk, 'high', '/tmp is outside /work/proj');
+
+  const inTmp = rig({ cwd: '/tmp' });
+  void inTmp.handler(req('Write', { file_path: '/tmp/x.txt' }));
+  assert.equal(inTmp.approvals.current()?.risk, 'med', 'and inside /tmp');
+  assert.equal(inTmp.approvals.current()?.summary, 'x.txt');
+});
+
+test('Claude Code configuration edits are refused outright, not asked', async () => {
+  const r = rig();
+  const d = await r.handler(req('Write', { file_path: '.claude/settings.json', content: '{"permissions":{"allow":["Bash"]}}' }));
+  assert.equal(d.allow, false);
+  assert.match((d as { message: string }).message, /configuration/);
+  assert.equal(r.approvals.pendingCount(), 0);
+});
+
+// ---------------------------------------------------------------------------
+// Fail closed
+// ---------------------------------------------------------------------------
+
+const SECRET = 'sk-live-TOP-SECRET-0123456789';
+
+function assertNoSecret(logs: string[]): void {
+  for (const l of logs) assert.ok(!l.includes(SECRET) && !l.includes('TOP-SECRET'), `log leaked the input: ${l}`);
+}
+
+test('a describer that throws is a refusal; the log names the tool and risk only, never the input or the error text', async () => {
+  const r = rig({ describe: () => { throw new Error(`${SECRET} was in the parse failure`); } });
+  const d = await r.handler(req('Bash', { command: `curl -H "Authorization: ${SECRET}" https://x` }));
+  assert.equal(d.allow, false);
+  assert.equal(r.approvals.pendingCount(), 0);
+  assert.equal(r.logs.length, 1, 'logged exactly once');
+  assert.match(r.logs[0]!, /tool=Bash/);
+  assert.match(r.logs[0]!, /risk=\?/, 'the risk was not yet known');
+  assertNoSecret(r.logs);
+});
+
+test('a failing approval manager is a refusal and the log carries the risk it had computed', async () => {
+  class Broken extends ApprovalManager {
+    override request(): Promise<ApprovalOutcome> {
+      return Promise.reject(new Error(`${SECRET} entropy source died`));
+    }
+  }
+  const r = rig({ approvals: (o) => new Broken(o) });
+  const d = await r.handler(req('Bash', { command: `echo ${SECRET}` }));
+  assert.equal(d.allow, false);
+  assert.equal(r.logs.length, 1);
+  assert.match(r.logs[0]!, /tool=Bash risk=med/);
+  assertNoSecret(r.logs);
+  assert.ok(!(d as { message: string }).message.includes(SECRET));
+
+  // The real manager's own failure mode, through the real handler: an id source that throws.
+  const r2 = rig({ approvals: (o) => new ApprovalManager({ ...o, newId: () => { throw new Error(`${SECRET} rng failed`); } }) });
+  const d2 = await r2.handler(req('Bash', { command: 'ls' }));
+  assert.equal(d2.allow, false);
+  assert.equal(r2.approvals.pendingCount(), 0);
+  assertNoSecret(r2.logs);
+});
+
+test('an outcome the handler does not recognise is a refusal, never an allow', async () => {
+  const odd: unknown[] = [{ allow: false, reason: 'surprise' }, { allow: 'yes' }, { allow: 1 }, {}, undefined, null, 'allow'];
+  for (const outcome of odd) {
+    class Odd extends ApprovalManager {
+      override request(): Promise<ApprovalOutcome> {
+        return Promise.resolve(outcome as ApprovalOutcome);
+      }
+    }
+    const r = rig({ approvals: (o) => new Odd(o) });
+    const d: PermissionDecision = await r.handler(req('Bash', { command: 'ls' }));
+    assert.equal(d.allow, false, `outcome ${JSON.stringify(outcome)}`);
+  }
+  // Companion: the strict allow IS honoured, so the loop above is not refusing everything.
+  class Yes extends ApprovalManager {
+    override request(): Promise<ApprovalOutcome> {
+      return Promise.resolve({ allow: true });
+    }
+  }
+  const r = rig({ approvals: (o) => new Yes(o) });
+  assert.deepEqual(await r.handler(req('Bash', { command: 'ls' })), { allow: true });
+});
+
+test('hostile tool names cannot forge log lines', async () => {
+  const r = rig({ describe: () => { throw new Error('x'); } });
+  await r.handler(req('Bash\nINJECTED: allow=true\u0000' + 'z'.repeat(500), {}));
+  assert.equal(r.logs.length, 1);
+  assert.ok(!r.logs[0]!.includes('\n') && !r.logs[0]!.includes('\u0000'));
+  assert.ok(r.logs[0]!.length < 200);
+});
+
+test('the logger is optional', async () => {
+  const r = rig({ noLog: true, describe: () => { throw new Error('x'); } });
+  assert.equal((await r.handler(req('Bash', {}))).allow, false);
+  const r2 = rig({ noLog: true });
+  const d = await r2.handler(req('Bash', { command: 'rm -rf /' }));
+  assert.equal(d.allow, false);
+});
+
+test('a device that was never connected refuses after the grace period; one that is connected waits', async () => {
+  const away = rig({ connected: false });
+  const p = away.handler(req('Bash', { command: 'ls' }));
+  away.clock.advance(9_999);
+  assert.equal(await peek(p), PENDING);
+  away.clock.advance(1);
+  assert.equal((await p).allow, false);
+
+  const here = rig({ connected: true });
+  const q = here.handler(req('Bash', { command: 'ls' }));
+  here.clock.advance(30_000);
+  assert.equal(await peek(q), PENDING, 'companion: same wait, device here, still waiting');
+});
