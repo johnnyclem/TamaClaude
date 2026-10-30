@@ -1676,6 +1676,8 @@ function plantFilterRepo(rig: Rig): void {
     return path;
   };
   git('init', '-q');
+  // A clone has an `origin` remote, and the CLI asks about it with different commands than for a repository without one.
+  git('remote', 'add', 'origin', 'https://example.invalid/r.git');
   writeFileSync(join(rig.cwd, '.gitattributes'), '*.txt filter=pwn\n');
   writeFileSync(join(rig.cwd, 'a.txt'), 'one\n');
   git('add', '-A');

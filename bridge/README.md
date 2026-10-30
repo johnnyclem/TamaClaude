@@ -248,6 +248,10 @@ names, directory names, backup suffixes, links, look-alike characters), and a ru
 heuristic that will never be complete: `config/database.yml` is read freely, and so is a secret in any file nobody
 thought to list. Somebody who prefers safety to convenience should start the bridge with `--ask-all`.
 
+One consequence you may meet on macOS, where `/tmp` and `/var` are symbolic links: if `--cwd` is, or sits under, a link,
+the CLI hands the bridge the real paths, they are not recognised as inside the working directory, and EVERY read asks.
+That is the safe direction, not a hole. Start the bridge with the real path (`realpath <dir>`) to get the free read back.
+
 - **Every call that is not refused asks the device, a `Read` inside the working directory included.** The driver's
   hook answers `ask` for all of it, so neither an allow rule nor the CLI's own auto-allow can skip the tap, and the
   panel shows the read like any other call (risk `low`, unless something about the path makes it more). A call the
@@ -341,11 +345,13 @@ Read this before trusting the bridge with a machine you care about.
   the device saw no ask). The driver therefore sets the CLI's own switch for those commands,
   `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`, in the child's environment and in the pinned settings, and `--pass-env`
   refuses the name. With it, the same repository's filter does not run, none of the commands that build the context
-  (`status`, `log`, `config`) is started, and the first request carries no git status. **What that costs** is the
+  (`status`, `log`, and a `config` listing of the repository's settings) is started, and the first request carries no git status. **What that costs** is the
   branch, the status and the recent commits in the prompt, which a voice session hardly needs; Claude can still run
-  `git status` itself, as a `Bash` call you are asked about. **What it does not stop:** the CLI still runs three
-  read-only git commands of its own (`ls-files --error-unmatch` on its local settings file, `remote` and
-  `remote get-url origin`); they hash no file, and the test that plants a clean filter, a file-system monitor and a
+  `git status` itself, as a `Bash` call you are asked about. **What it does not stop:** the CLI still runs a few
+  read-only git commands of its own: `ls-files --error-unmatch` on its local settings file, then ones that read the
+  remote's name and URL. In a repository with no remote that is three commands (`remote` and `remote get-url origin`
+  besides the first); in a clone, which has an `origin` remote, it is four (`remote get-url origin`,
+  `config --get remote.origin.url` and `remote get-url --push origin` besides the first). They hash no file, and the test that plants a clean filter, a file-system monitor and a
   hooks directory in the repository saw none of them run a program. A `git` command that YOU approve reads the same
   `.git/config`, and the panel shows `git status`, not the filter it would run (see "What a tap does and does not
   cover"). `--git-context` turns the CLI's commands back on, prints a boxed warning in the banner, and the filter

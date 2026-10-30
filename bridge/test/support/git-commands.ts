@@ -9,11 +9,21 @@
  */
 
 /**
- * What the CLI still runs with CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS set (measured on 2.1.314): all three read-only, an
- * index lookup for its own local settings file and the remote's name and URL. None hashes a working-tree file, so none applies
- * a filter. These are the arguments after the CLI's own `-c` hardening options, joined by single spaces.
+ * What the CLI still runs with CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS set (measured on 2.1.314), all read-only: an index lookup
+ * for its own local settings file, and the remote's name and URL. Which ones depend on the repository: with NO remote it
+ * runs `ls-files`, `remote` and `remote get-url origin` (three); in a clone, which has an `origin` remote, it runs
+ * `ls-files`, `remote get-url origin`, `config --get remote.origin.url` and `remote get-url --push origin` (four). None
+ * hashes a working-tree file, so none applies a filter. These are the arguments after the CLI's own `-c` hardening options,
+ * joined by single spaces. The real-CLI fixture has an `origin` remote, because a clone is the common case and the one a
+ * list measured only on a remote-less repository got wrong.
  */
-export const GIT_STILL_RUNS: readonly string[] = ['ls-files --error-unmatch -- :(icase).claude/settings.local.json', 'remote', 'remote get-url origin'];
+export const GIT_STILL_RUNS: readonly string[] = [
+  'ls-files --error-unmatch -- :(icase).claude/settings.local.json',
+  'remote',
+  'remote get-url origin',
+  'config --get remote.origin.url',
+  'remote get-url --push origin',
+];
 
 /** The commands the switch stops, and the control run must show the CLI starting: they build the git context in the prompt. */
 export const GIT_CONTEXT_COMMANDS: readonly string[] = ['status', 'log', 'config'];

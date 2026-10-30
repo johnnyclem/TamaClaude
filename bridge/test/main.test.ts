@@ -2018,8 +2018,11 @@ test('G2/D25: the README states what the git switch stops, what it does not, and
   // Which commands the switch stops, and which it does not: both lists are the reviewed ones the real-CLI suite holds to the CLI.
   for (const c of GIT_CONTEXT_COMMANDS) assert.ok(part.includes(`\`${c}\``), `the README does not name ${c} as a command the switch stops`);
   for (const c of GIT_STILL_RUNS) assert.ok(part.includes(`\`${readmeSpelling(c)}\``), `the README does not name \`${readmeSpelling(c)}\` as a command that still runs`);
-  assert.match(part, /the CLI still runs three\s+read-only git commands of its own/);
-  assert.equal(GIT_STILL_RUNS.length, 3, 'the sentence says three');
+  assert.match(part, /the CLI still runs a few\s+read-only git commands of its own/);
+  // ...and says how many, per repository: three without a remote, four in a clone. The reviewed list is their union (five spellings).
+  assert.match(part, /In a repository with no remote that is three commands/);
+  assert.match(part, /in a clone, which has an `origin` remote, it is four/);
+  assert.equal(GIT_STILL_RUNS.length, 5, 'the union of the three-command and the four-command set');
   // And what a write to the git files is rated: asked about, not refused (a tapped write is the other road to a hostile .git/config).
   for (const f of ['.git/config', '.git/hooks/pre-commit', '.gitattributes']) {
     const w = describeTool('Write', { file_path: f, content: 'x' }, '/work/project');
