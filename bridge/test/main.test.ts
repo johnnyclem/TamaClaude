@@ -27,6 +27,7 @@ import {
   bridgeSuppliesMemory,
   CLI_FREE_TOOLS,
   ConfigError,
+  gitContextWarning,
   hardDenyFor,
   installShutdown,
   isLoopbackHost,
@@ -44,7 +45,7 @@ import {
   USAGE,
 } from '../src/main.ts';
 import type { Config, Io, RunDeps } from '../src/main.ts';
-import { AUTO_MEMORY_SWITCH, buildChildEnv, CHILD_ENV_NAMES, CHILD_ENV_PREFIXES, DEFAULT_STALL_MS, NEVER_PASS } from '../src/drivers/claude.ts';
+import { AUTO_MEMORY_SWITCH, buildChildEnv, CHILD_ENV_NAMES, CHILD_ENV_PREFIXES, claudeDriverFactory, DEFAULT_STALL_MS, GIT_SWITCH, NEVER_PASS } from '../src/drivers/claude.ts';
 import type { ClaudeDriverConfig, ManagedLockStatus } from '../src/drivers/claude.ts';
 import { inspectProjectMemory, MEMORY_FILES, MEMORY_MAX_BYTES } from '../src/memory.ts';
 import type { ProjectMemoryReport } from '../src/memory.ts';
@@ -57,6 +58,12 @@ import { CLOSE, LIMITS } from '../src/types.ts';
 import type { DriverFactory } from '../src/types.ts';
 import { ScriptedStt } from '../src/stt.ts';
 import { FAKE_SCENARIOS } from '../src/drivers/fake.ts';
+import { ApprovalManager } from '../src/approvals.ts';
+import type { ApprovalEvent } from '../src/approvals.ts';
+import { createPermissionHandler } from '../src/permission.ts';
+import { decodeBridgeMsg, encodeBridgeMsg } from '../src/protocol.ts';
+import { cliToolCall, fakeSdk, settle } from './support/fake-sdk.ts';
+import { GIT_CONTEXT_COMMANDS, GIT_STILL_RUNS, readmeSpelling } from './support/git-commands.ts';
 
 /**
  * Everything a test starts that outlives it if its own cleanup does not run: servers `run()` brought up, and the child
@@ -527,7 +534,10 @@ test('--pass-env: names are validated, split on commas, repeatable; the secrets 
   // V13: the names are the DRIVER's list (it is what the driver applies), so a name it refuses is refused here, at start-up,
   // with its reason -- not accepted and then dropped later with a log line. The literal list is typed out so that a name
   // removed from the driver's list fails here too (the driver's own test pins the same list).
-  const EXPECTED = ['BRIDGE_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS', 'CLAUDE_CODE_DISABLE_WORKFLOWS', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY'];
+  const EXPECTED = [
+    'BRIDGE_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS', 'CLAUDE_CODE_DISABLE_WORKFLOWS', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY',
+    'CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS',
+  ];
   assert.deepEqual([...NEVER_PASS].sort(), [...EXPECTED].sort());
   for (const name of EXPECTED) {
     refuses(real('--pass-env', name), KEYENV, new RegExp(`--pass-env ${name} is refused: .{20,}`), name);
@@ -563,6 +573,16 @@ test('V13: the list of names --pass-env refuses IS the driver\'s list, every nam
     const named = usage.includes(name) || (name.startsWith('CLAUDE_CODE_DISABLE_') && usage.includes('CLAUDE_CODE_DISABLE_*'));
     assert.ok(named, `${name} is refused but the usage text does not say so`);
   }
+  // ...and the wildcard is not a bare "some switches": it says what each of them keeps off. A switch added to the driver's list
+  // without a phrase here fails, and a phrase dropped from the usage text (a mutant did exactly that for git) fails too.
+  const keepsOff: Record<string, string> = {
+    CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: 'background work',
+    CLAUDE_CODE_DISABLE_WORKFLOWS: 'workflows',
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: "the CLI's own memory",
+    CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS: 'its git commands',
+  };
+  assert.deepEqual(Object.keys(keepsOff).sort(), [...NEVER_PASS].filter((n) => n.startsWith('CLAUDE_CODE_DISABLE_')).sort(), 'every switch the driver sets has its phrase');
+  for (const [name, phrase] of Object.entries(keepsOff)) assert.ok(usage.includes(phrase), `the usage text does not say that ${name} keeps ${phrase} off`);
 });
 
 test('--model and --max-turns: checked, passed on, shown in the banner, and meaningless in fake mode', () => {
@@ -917,6 +937,26 @@ test('M3: run() gives the driver exactly what buildClaudeConfig makes -- every f
   assert.notEqual(underRoot.needsAsk?.('Read', { file_path: '/srv/other/file' }), got.needsAsk?.('Read', { file_path: '/srv/other/file' }));
 });
 
+test('G2/D26 M3: run() hands the driver --git-context and --ask-all, a tap rule that honours the second, and prints both in the banner', async () => {
+  const projectRead = join(ROOT, 'src', 'app.ts');
+  const strict = await seen(real('--port', '0', '--cwd', ROOT, '--git-context', '--ask-all'));
+  assert.equal(strict.claude.length, 1);
+  assert.equal(strict.claude[0]!.gitContext, true, 'run() passed --git-context on');
+  assert.equal(strict.claude[0]!.needsAsk?.('Read', { file_path: projectRead }), true, 'and a tap rule that asks about a Read in the project');
+  assert.match(strict.out, /GIT CONTEXT IS ON/);
+  assert.match(strict.out, /no tap {2}nothing \(--ask-all/);
+  // Companion: the same run without the flags hands over the safe defaults, so the line above could have failed.
+  const normal = await seen(real('--port', '0', '--cwd', ROOT));
+  assert.equal(normal.claude[0]!.gitContext, false);
+  assert.equal(normal.claude[0]!.needsAsk?.('Read', { file_path: projectRead }), false);
+  assert.doesNotMatch(normal.out, /GIT CONTEXT IS ON|--ask-all/);
+  // Each flag alone moves only its own field.
+  const gitOnly = (await seen(real('--port', '0', '--cwd', ROOT, '--git-context'))).claude[0]!;
+  assert.deepEqual([gitOnly.gitContext, gitOnly.needsAsk?.('Read', { file_path: projectRead })], [true, false]);
+  const askOnly = (await seen(real('--port', '0', '--cwd', ROOT, '--ask-all'))).claude[0]!;
+  assert.deepEqual([askOnly.gitContext, askOnly.needsAsk?.('Read', { file_path: projectRead })], [false, true]);
+});
+
 test('M3: run() gives the server exactly what buildServerOptions makes, and the driver factory it built, untouched', async () => {
   const argv = real('--port', '0', '--cwd', ROOT, '--ask-ttl-sec', '45', '--grace-sec', '20', '--allow-local-device', '--token', SUPPLIED, '--state-dir', '/var/state/x');
   const s = await seen(argv);
@@ -1073,21 +1113,232 @@ test('the banner puts how the memory was read beside the file list, and a note c
   assert.match(echoedSkip[0]!, /^ {10}not used: CLAUDE\.md is odd/, 'a reason cannot start a banner line of its own either');
 });
 
-test('R4/R5: the banner states what is switched off and what is NOT covered, and each statement is held to the child environment', () => {
+test('R4/G2: the banner states what is switched off, and each statement is held to the child environment', () => {
   const text = renderBanner(cfg(real(), KEYENV), ['ws://x/']).join('\n');
   const flat = text.replace(/\s+/g, ' ');
   // R4 (D20): the claim "the CLI's own memory is off" is true because the driver sets this variable. The banner and the README say it;
   // this is the line that makes the sentence stop being true if the variable goes.
   assert.equal(buildChildEnv({}, 'k', []).env[AUTO_MEMORY_SWITCH], '1', 'the child is told to keep its own memory off');
   assert.match(flat, /the CLI's own auto-memory is off/);
-  // R5: git is NOT covered, and the banner says so on every real-mode start. If the driver ever turns the CLI's git commands off,
-  // this assertion fails and the banner and the README sentence must be changed together (they would otherwise understate).
-  assert.equal(buildChildEnv({}, 'k', []).env['CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS'], undefined, 'git is not switched off: update the banner and the README "git" bullet if this changes');
-  assert.match(flat, /git NOT covered: a filter in the repository's own \.git\/config can run a program when Claude starts \(git reads it\)\. Use --cwd only for a repository whose \.git directory you trust; a clone you made yourself does not bring one\./);
-  // Fake mode runs no git and no tools: neither statement applies.
-  assert.doesNotMatch(renderBanner(cfg(fake()), ['ws://x/']).join('\n'), /NOT covered|auto-memory/);
+  // G2 (D25): the claim "git context off" is true because the driver sets THIS variable unless --git-context was given. The sentence
+  // names the commands the switch stops; the real-CLI suite records them, and this ties the banner to the variable it depends on.
+  assert.equal(buildChildEnv({}, 'k', []).env[GIT_SWITCH], '1', 'the child is told to keep the CLI\'s git commands off');
+  assert.match(
+    flat,
+    /git context off: Claude Code skips git status and git log at start-up, so a filter in the repository's own \.git\/config cannot run a program then; Claude is not told the branch, the status or the recent commits \(--git-context\)/,
+  );
+  assert.doesNotMatch(flat, /NOT covered|GIT CONTEXT IS ON/, 'the old sentence (the bridge cannot stop it) and the opt-in warning are not in the default banner');
+  // Fake mode runs no git and no tools: none of it applies.
+  assert.doesNotMatch(renderBanner(cfg(fake()), ['ws://x/']).join('\n'), /git context|auto-memory|GIT CONTEXT/);
   // The banner is for a terminal: every line is printable ASCII.
   for (const line of text.split('\n')) assert.match(line, /^[\x20-\x7e]*$/);
+});
+
+// ---------------------------------------------------------------------------
+// G2/D25 --git-context and D26 --ask-all
+// ---------------------------------------------------------------------------
+
+test('G2/D26: --git-context and --ask-all are two separate switches, both off by default, both for the real Claude only', () => {
+  const state = (c: Config): [boolean, boolean] => [c.gitContext, c.askAll];
+  assert.deepEqual(state(cfg(real(), KEYENV)), [false, false], 'the safe defaults');
+  assert.deepEqual(state(cfg(real('--git-context'), KEYENV)), [true, false]);
+  assert.deepEqual(state(cfg(real('--ask-all'), KEYENV)), [false, true]);
+  assert.deepEqual(state(cfg(real('--git-context', '--ask-all'), KEYENV)), [true, true], 'they compose');
+  assert.deepEqual(state(cfg(real('--ask-all', '--setting-sources', 'project', '--pass-env', 'SSH_AUTH_SOCK', '--max-turns', '3'), KEYENV)), [false, true], 'and with the rest');
+  // A scripted Claude has no git and no reads: a strict mode that is silently ignored would be false comfort, so it is refused.
+  refuses(['--fake-claude', '--git-context'], {}, /--git-context only applies to the real Claude/);
+  refuses(['--fake-claude', '--ask-all'], {}, /--ask-all only applies to the real Claude/);
+  assert.deepEqual(state(cfg(fake())), [false, false]);
+  // They are switches, not options with a value.
+  refuses(real('--git-context=no'), KEYENV, /--git-context/);
+  refuses(real('--ask-all=false'), KEYENV, /--ask-all/);
+  // --help needs neither.
+  assert.equal(cfg(['--help', '--ask-all']).help, true);
+});
+
+test('G2/D25: --git-context prints a boxed warning that says what it allows; the default prints one line saying git context is off; fake mode neither', () => {
+  const on = renderBanner(cfg(real('--git-context'), KEYENV), ['ws://x/']);
+  const flat = on.join('\n');
+  assert.match(flat, /WARNING {2}GIT CONTEXT IS ON \(--git-context\)/);
+  assert.match(flat, /Claude Code will run git in the working directory when it starts/);
+  assert.match(flat, /reads the repository's own \.git\/config, and a filter defined there can run a program with\s+no question asked, BEFORE the device is asked about anything/);
+  assert.match(flat, /it does not turn off filters/);
+  assert.match(flat, /Use --cwd only for a repository whose \.git directory you trust/);
+  assert.doesNotMatch(flat.replace(/\s+/g, ' '), /git context off/, 'the default line is replaced, not repeated');
+  // The block is a block: bar, text, bar -- the same shape as the settings warning, so neither is lost among the one-line warnings.
+  const bars = on.flatMap((l, i) => (/^ {2}={76}$/.test(l) ? [i] : []));
+  const heading = on.findIndex((l) => /GIT CONTEXT IS ON/.test(l));
+  assert.equal(bars.length, 2);
+  assert.ok(bars[0]! < heading && heading < bars[1]!, 'the heading sits between the two bars');
+  for (const line of on) assert.match(line, /^[\x20-\x7e]*$/, 'printable ASCII, for a terminal');
+  assert.deepEqual(cfg(real('--git-context'), KEYENV).warnings.filter((w) => /git/i.test(w)), [], 'the block is not also one of the one-line warnings');
+  assert.deepEqual(gitContextWarning({ gitContext: false }), []);
+  assert.ok(gitContextWarning({ gitContext: true }).length > 5, 'the helper the banner uses is the block itself');
+  // Companions: the default says it is off, once; fake mode says nothing about git.
+  const off = renderBanner(cfg(real(), KEYENV), ['ws://x/']).join('\n');
+  assert.equal([...off.replace(/\s+/g, ' ').matchAll(/git context off/g)].length, 1);
+  assert.doesNotMatch(off, /GIT CONTEXT IS ON/);
+  assert.doesNotMatch(renderBanner(cfg(fake()), ['ws://x/']).join('\n'), /git|GIT/);
+  // It does not disturb the settings warning, which is a block of its own.
+  const both = renderBanner(cfg(real('--git-context', '--setting-sources', 'project'), KEYENV), ['ws://x/']).join('\n');
+  assert.match(both, /GIT CONTEXT IS ON/);
+  assert.match(both, /THE REPOSITORY'S OWN SETTINGS ARE ON/);
+});
+
+test('D26: under --ask-all the banner says that NOTHING runs without a tap; by default it still names the one tool that does', () => {
+  const strict = renderBanner(cfg(real('--ask-all'), KEYENV), ['ws://x/']).join('\n');
+  const line = strict.split('\n').find((l) => l.includes('no tap')) ?? '';
+  assert.match(line, /no tap {2}nothing \(--ask-all, strict mode\): every call asks the device first, a Read inside the working directory included/);
+  assert.doesNotMatch(line, /through no symbolic link|credential store/, 'the sentence about which reads are free is gone');
+  const normal = renderBanner(cfg(real(), KEYENV), ['ws://x/']).join('\n').split('\n').find((l) => l.includes('no tap')) ?? '';
+  assert.match(normal, new RegExp(`no tap {2}${CLI_FREE_TOOLS.join(', ')} inside the working directory`));
+  assert.doesNotMatch(normal, /--ask-all/);
+  for (const l of strict.split('\n')) assert.match(l, /^[\x20-\x7e]*$/);
+  assert.doesNotMatch(renderBanner(cfg(fake()), ['ws://x/']).join('\n'), /ask-all|no tap/);
+});
+
+test('G2/D26: buildClaudeConfig hands the driver both switches; the tap rule is the describer\'s by default and "everything" under --ask-all, and the veto is the same either way', () => {
+  const env = { ANTHROPIC_API_KEY: KEY };
+  const plain = buildClaudeConfig(cfg(real(), env), env);
+  const git = buildClaudeConfig(cfg(real('--git-context'), env), env);
+  const strict = buildClaudeConfig(cfg(real('--ask-all'), env), env);
+  assert.deepEqual([plain.gitContext, git.gitContext, strict.gitContext], [false, true, false]);
+
+  const free = ['Read', { file_path: '/work/project/src/app.ts' }] as const;
+  assert.equal(plain.needsAsk?.(free[0], { ...free[1] }), false, 'by default a Read inside the project runs without a tap');
+  assert.equal(git.needsAsk?.(free[0], { ...free[1] }), false, '--git-context does not touch the tap rule');
+  // Every tool the bridge could ever rate low, plus the rest: all ask.
+  for (const tool of [...AUTO_RUN_TOOLS, 'Bash', 'Write', 'Edit', 'WebFetch', 'mcp__x__y', 'Agent', 'ToolSearch', 'Surprise']) {
+    assert.equal(strict.needsAsk?.(tool, { file_path: '/work/project/src/app.ts', pattern: 'x', command: 'ls', path: '/work/project' }), true, `${tool} asks under --ask-all`);
+  }
+  assert.equal(strict.needsAsk?.('Read', {}), true, 'and a malformed input too');
+  // The veto is untouched: a refused call is still refused, and refusing comes first in the driver (see the hook test below).
+  for (const [tool, input] of probes('/work/project')) assert.equal(strict.hardDeny?.(tool, input), plain.hardDeny?.(tool, input), `veto for ${tool}`);
+  assert.match(strict.hardDeny?.('Bash', { command: 'rm -rf ~' }) ?? '', /recursive delete/);
+  // The function itself: the second argument is the only thing that differs.
+  assert.equal(needsAskFor('/work/project', true)('Read', { file_path: '/work/project/a' }), true);
+  assert.equal(needsAskFor('/work/project', false)('Read', { file_path: '/work/project/a' }), false);
+  assert.equal(needsAskFor('/work/project')('Read', { file_path: '/work/project/a' }), false, 'the default is the describer\'s answer');
+});
+
+/** The real driver, configured by main.ts's own builder, over the scripted SDK: what the CLI would be given, and who the device was asked. */
+async function realDriverFor(argv: string[], parentEnv: NodeJS.ProcessEnv = { PATH: '/usr/bin' }): Promise<{ options: import('@anthropic-ai/claude-agent-sdk').Options; asked: string[]; close: () => Promise<void> }> {
+  const sdk = fakeSdk();
+  const asked: string[] = [];
+  const dir = mkdtempSync(join(tmpdir(), 'main-driver-'));
+  const driver = claudeDriverFactory(buildClaudeConfig(cfg(real(...argv), KEYENV), KEYENV), {
+    query: sdk.query,
+    env: parentEnv,
+    settingsDir: dir,
+    checkManagedLock: () => Promise.resolve({ effective: true, missing: [], displacedBy: [] }),
+  })({
+    cwd: '/work/project',
+    log: () => {},
+    onEvent: () => {},
+    onPermission: (req) => {
+      asked.push(`${req.tool} ${JSON.stringify(req.input)}`);
+      return Promise.resolve({ allow: false, message: 'denied by the test device' });
+    },
+  });
+  driver.prompt('hello');
+  await settle();
+  assert.equal(sdk.queries.length, 1, 'the driver started its query');
+  return {
+    options: sdk.queries[0]!.params.options!,
+    asked,
+    close: async () => {
+      await driver.close();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+test('D26: through the REAL driver and its PreToolUse hook: under --ask-all a Read in the project reaches the device, by default it does not, and a refused call is refused in both', async () => {
+  const read = { file_path: '/work/project/src/app.ts' };
+  const strict = await realDriverFor(['--ask-all']);
+  const normal = await realDriverFor([]);
+  try {
+    // The CLI's pipeline (hook first, then canUseTool), with the CLI's own auto-allow on, as it is for a Read inside the working directory.
+    const asked = await cliToolCall(strict.options, 'Read', read, { autoAllow: true });
+    assert.deepEqual([asked.decision, asked.via], ['deny', 'canUseTool'], 'the call reached canUseTool, i.e. the device, which said no');
+    assert.equal(strict.asked.length, 1, 'the device was asked about a Read in the project');
+    const hookOut = asked.hookOutputs[0] as { hookSpecificOutput?: { permissionDecision?: string } };
+    assert.equal(hookOut.hookSpecificOutput?.permissionDecision, 'ask', 'the hook answered ask, which beats the CLI\'s auto-allow');
+
+    // Companion: the same call under the default is left to the CLI and never reaches the device -- so the line above could have failed.
+    const free = await cliToolCall(normal.options, 'Read', read, { autoAllow: true });
+    assert.deepEqual([free.decision, free.via], ['allow', 'cli-auto-allow']);
+    assert.equal(normal.asked.length, 0, 'by default the same Read needs no tap');
+
+    // Every tool the bridge could rate low asks under --ask-all.
+    for (const tool of AUTO_RUN_TOOLS) {
+      const r = await cliToolCall(strict.options, tool, { file_path: '/work/project/a', pattern: 'x', path: '/work/project' }, { autoAllow: true });
+      assert.equal(r.via, 'canUseTool', `${tool} was not put to the device under --ask-all`);
+    }
+
+    // A refused call is refused by the hook in BOTH modes, and the device never sees it.
+    const before = strict.asked.length;
+    for (const d of [strict, normal]) {
+      const refused = await cliToolCall(d.options, 'Bash', { command: 'rm -rf ~' }, { autoAllow: true });
+      assert.deepEqual([refused.decision, refused.via], ['deny', 'hook']);
+    }
+    assert.equal(strict.asked.length, before, '--ask-all does not turn a refusal into a question');
+    assert.equal(normal.asked.length, 0);
+  } finally {
+    await strict.close();
+    await normal.close();
+  }
+});
+
+test('D26: a Read in the project that --ask-all puts to the player is a real ask rated low, with its path, that the wire carries and PROTOCOL.md says a device may receive', async () => {
+  // The whole road a strict-mode read takes after the hook: the driver's permission callback is the real handler, over the real
+  // approval queue; what comes out is what the server would encode for the device.
+  const events: ApprovalEvent[] = [];
+  const approvals = new ApprovalManager({ ttlMs: 60_000, graceMs: 1000, onEvent: (e) => events.push(e) });
+  approvals.deviceConnected();
+  const handler = createPermissionHandler({ approvals, cwd: '/work/project' });
+  const input = { file_path: '/work/project/src/app.ts' };
+  assert.equal(needsAskFor('/work/project', true)('Read', input), true);
+  const outcome = handler({ tool: 'Read', input, toolUseId: 't1', signal: new AbortController().signal });
+  try {
+    const ask = events.find((e) => e.k === 'ask');
+    assert.ok(ask?.k === 'ask', 'the read became an ask');
+    assert.deepEqual([ask.ask.label, ask.ask.risk], ['Read', 'low']);
+    assert.match(ask.ask.summary, /src\/app\.ts/);
+    const frame = encodeBridgeMsg({ t: 'ask', id: ask.ask.id, tl: ask.ask.label, risk: ask.ask.risk, sum: ask.ask.summary, ttl: ask.ask.ttlSec });
+    const back = decodeBridgeMsg(frame);
+    assert.ok(back.ok && back.msg.t === 'ask' && back.msg.risk === 'low', 'and the frame with risk "low" is one a device decodes');
+    // Only a tap lets it through: the read ends when the player taps ALLOW, not before.
+    assert.equal(approvals.answer(ask.ask.id, true), 'accepted');
+    assert.deepEqual(await outcome, { allow: true });
+  } finally {
+    // A failed assertion above must not leave a 60 s ask timer holding the whole run open.
+    approvals.cancelAll('abort');
+  }
+  // PROTOCOL.md says the same, in the two places it used to say "the only calls that run without a tap" and "rarely or never".
+  const protocol = readFileSync(new URL('../PROTOCOL.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
+  assert.match(protocol, /A bridge started with `--ask-all` \(its strict mode\) asks about these too, so for that bridge the list is empty and every call that is not refused is put to the player/);
+  assert.match(protocol, /The exception is a bridge started with `--ask-all`: it puts even a read inside the project to the player, so it sends `risk: low` for those/);
+});
+
+test('G2/D25: through the REAL driver, the child gets the git switch unless --git-context, and the pinned file agrees with it', async () => {
+  const pinnedEnv = (o: import('@anthropic-ai/claude-agent-sdk').Options): Record<string, string> =>
+    (JSON.parse(readFileSync(o.settings as string, 'utf8')) as { env: Record<string, string> }).env;
+  // The settings source makes the driver write its pinned file; the child's own environment is what the CLI runs with.
+  const off = await realDriverFor(['--setting-sources', 'project']);
+  const on = await realDriverFor(['--setting-sources', 'project', '--git-context']);
+  const dflt = await realDriverFor([], { PATH: '/usr/bin', [GIT_SWITCH]: '0' });
+  try {
+    assert.equal(off.options.env?.[GIT_SWITCH], '1');
+    assert.equal(pinnedEnv(off.options)[GIT_SWITCH], '1');
+    assert.equal(on.options.env?.[GIT_SWITCH], undefined, '--git-context leaves it off the child...');
+    assert.equal(GIT_SWITCH in pinnedEnv(on.options), false, '...and out of the pinned file');
+    assert.equal(dflt.options.env?.[GIT_SWITCH], '1', 'whatever the operator\'s own shell holds');
+  } finally {
+    await off.close();
+    await on.close();
+    await dflt.close();
+  }
 });
 
 test('D15: --turn-stall-sec: a whole number of seconds, 0 turns it off, real mode only, and the driver gets milliseconds', async () => {
@@ -1555,6 +1806,13 @@ test('V8/D17/D18: what the README says disqualifies a Read from running without 
     assert.equal(rate(name).risk, 'high', name);
   }
   assert.equal(rate('.git/config').risk, 'high');
+  // "`.git/config` and its twins": every git path the sentence names is a secret store (`<name>` stands for any directory name),
+  // and the sentence's last clause is true -- the rest of a git directory is read like any file.
+  const gitPaths = [...bullet.matchAll(/`(\.git\/[^`]+)`/g)].map((m) => m[1]!.replace(/<name>/g, 'x'));
+  assert.ok(gitPaths.length >= 6, `the README names the git files a Read of which asks: ${gitPaths.join(', ')}`);
+  for (const f of gitPaths) assert.equal(rate(f).risk, 'high', `${f}: named in the README as a credential store`);
+  assert.match(bullet, /the\s+rest of `\.git` is an ordinary read/);
+  assert.equal(rate('.git/HEAD').risk, 'low', 'control: a git file that is not a login is free');
   // "no look-alike characters".
   assert.notEqual(rate('\u0430.txt').risk, 'low', 'a Cyrillic a in the name');
   // "no pile of wildcards": the numbers in the sentence are the boundary of the rule.
@@ -1581,7 +1839,7 @@ test('V8/D17: "what a tap does and does not cover" is what the describer does', 
   t.after(() => rmSync(outside, { recursive: true, force: true }));
   writeFileSync(join(outside, 'o.txt'), 'x');
   symlinkSync(outside, join(root, 'out'));
-  const part = readmeBetween('### What a tap does and does not cover', '### Repository settings are off by default');
+  const part = readmeBetween('### What a tap does and does not cover', '### Asking about everything (`--ask-all`)');
   const d = (tool: string, input: Record<string, unknown>): ReturnType<typeof describeTool> => describeTool(tool, input, root);
 
   assert.ok(part.includes(`a panel that holds ${LIMITS.summaryMax} characters`));
@@ -1741,24 +1999,71 @@ test('V8: the banner example in the README is the banner a fake-mode bridge prin
   assert.equal(shown[0], `TamaClaude bridge ${(JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version}`);
 });
 
-test('R5: the README states the git limit in so many words, and every statement in it is about the program as it is', () => {
-  const part = readmeBetween("- **git reads the repository's own configuration when Claude starts", '- **Wildcards are not expanded');
-  assert.match(part, /and the bridge cannot stop it/);
-  assert.match(part, /it does not\s+turn off \*filters\*/);
-  assert.match(part, /`filter\.<name>\.clean` program written in the repository's `\.git\/config` can run at that moment, with no ask/);
+test('G2/D25: the README states what the git switch stops, what it does not, and what --git-context allows -- and every statement is about the program as it is', () => {
+  const part = readmeBetween("- **Git context is OFF by default; with `--git-context`", '- **Wildcards are not expanded');
+  // The switch is named, and it is the one the driver sets (derived, so a rename of either side fails here).
+  assert.ok(part.includes(`\`${GIT_SWITCH}=1\``), 'the README names the switch');
+  assert.equal(buildChildEnv({}, 'k', []).env[GIT_SWITCH], '1', '...and the driver really sets it');
+  assert.equal(buildChildEnv({}, 'k', [], { gitContext: true }).env[GIT_SWITCH], undefined, '...except under --git-context');
+  assert.match(part, /`--pass-env`\s+refuses the name/);
+  assert.equal(NEVER_PASSED.has(GIT_SWITCH), true, '...which --pass-env really does');
+  // What the old text claimed and no longer holds.
+  assert.doesNotMatch(READ_FLAT, /and the bridge cannot stop it/);
+  assert.doesNotMatch(READ_FLAT, /the driver does not set it/);
+  // The mechanism, in so many words.
+  assert.match(part, /it does not turn off \*filters\*/);
+  assert.match(part, /`filter\.<name>\.clean` program written in the repository's `\.git\/config` runs while git hashes a file/);
   assert.match(part, /a `git clone` you made yourself does not copy configuration/);
-  assert.match(part, /\*\*So `--cwd` belongs only on a repository whose `\.git` directory you trust\.\*\*/);
-  // The two things it says about the program: the CLI's git switch is not set, and a write to .git/config asks but is not refused.
-  assert.ok(part.includes('`CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS`; the driver does not set it'));
-  assert.equal(buildChildEnv({}, 'k', []).env['CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS'], undefined, 'update the README bullet and the banner together if this changes');
+  assert.match(part, /\*\*Use `--cwd` only on a repository whose `\.git` directory you trust when you pass it\.\*\*/);
+  // Which commands the switch stops, and which it does not: both lists are the reviewed ones the real-CLI suite holds to the CLI.
+  for (const c of GIT_CONTEXT_COMMANDS) assert.ok(part.includes(`\`${c}\``), `the README does not name ${c} as a command the switch stops`);
+  for (const c of GIT_STILL_RUNS) assert.ok(part.includes(`\`${readmeSpelling(c)}\``), `the README does not name \`${readmeSpelling(c)}\` as a command that still runs`);
+  assert.match(part, /the CLI still runs three\s+read-only git commands of its own/);
+  assert.equal(GIT_STILL_RUNS.length, 3, 'the sentence says three');
+  // And what a write to the git files is rated: asked about, not refused (a tapped write is the other road to a hostile .git/config).
   for (const f of ['.git/config', '.git/hooks/pre-commit', '.gitattributes']) {
     const w = describeTool('Write', { file_path: f, content: 'x' }, '/work/project');
     assert.equal(w.risk, 'high', `${f}: rated high`);
     assert.equal(w.deny, undefined, `${f}: asked about, not refused`);
   }
-  assert.match(part, /`\.git\/config`, `\.git\/hooks\/\*`\s+or `\.gitattributes` is rated `high` and asked about; it is not refused/);
-  // The banner carries the same warning on every real-mode start.
-  assert.match(renderBanner(cfg(real(), KEYENV), ['ws://x/']).join('\n'), /git {5}NOT covered/);
+  assert.match(part, /`\.git\/config`, `\.git\/hooks\/\*` or `\.gitattributes` is rated\s+`high` and asked about; it is not refused/);
+  // The flag row and the usage text agree with the program: off by default, and the banner carries the block when on.
+  assert.equal(flagRows().get('--git-context')?.[0], 'off');
+  assert.equal(cfg(real(), KEYENV).gitContext, false);
+  assert.match(flagRows().get('--git-context')?.[1] ?? '', /\*\*opt-in\*\*/);
+  assert.match(USAGE.replace(/\s+/g, ' '), /--git-context OPT-IN: let Claude Code run git in the working directory when it starts/);
+  assert.match(renderBanner(cfg(real('--git-context'), KEYENV), ['ws://x/']).join('\n'), /GIT CONTEXT IS ON \(--git-context\)/);
+});
+
+test('D26: the README says what --ask-all does and what it costs, and every statement is about the program as it is', () => {
+  const part = readmeBetween('### Asking about everything (`--ask-all`)', '### Repository settings are off by default');
+  // Why it exists: the heuristic, in so many words. If the rule ever stopped being name-based this sentence has to go.
+  assert.match(part, /a rule that works from names is a\s+heuristic that will never be complete/);
+  assert.match(part, /Somebody who prefers safety to convenience should start the bridge with `--ask-all`/);
+  // What it does: every call, the tap-free read included; the hook is what makes it so; a refusal stays a refusal.
+  assert.match(part, /\*\*Every call that is not refused asks the device, a `Read` inside the working directory included\.\*\*/);
+  assert.match(part, /driver's\s+hook answers `ask` for all of it/);
+  assert.match(part, /A call the\s+bridge refuses outright \(the hard-deny list\) is still refused without being asked about/);
+  const needsAsk = buildClaudeConfig(cfg(real('--ask-all'), KEYENV), KEYENV).needsAsk;
+  for (const tool of AUTO_RUN_TOOLS) assert.equal(needsAsk?.(tool, { file_path: '/work/project/a' }), true, `${tool}: asks under --ask-all`);
+  // It composes with the flags the README names, and it is real-mode only: both claims are the parser's.
+  for (const flag of ['--git-context', '--setting-sources', '--pass-env', '--max-turns']) assert.ok(part.includes(`\`${flag}\``), `${flag} is named as composing`);
+  assert.deepEqual(
+    [cfg(real('--ask-all', '--git-context', '--setting-sources', 'project', '--pass-env', 'SSH_AUTH_SOCK', '--max-turns', '5'), KEYENV).askAll],
+    [true],
+    'and all of them really parse together with it',
+  );
+  assert.match(part, /it is real-mode only/);
+  refuses(['--fake-claude', '--ask-all'], {}, /--ask-all only applies to the real Claude/);
+  // The cost, with the one number derived from the server's default.
+  assert.ok(part.includes(`each with its own ${DEFAULTS.askTtlMs / 1000} seconds`), 'the time one ask is open');
+  // The places that point at it: the flag row, the tap-free bullet and the "reads are free" limit.
+  assert.equal(flagRows().get('--ask-all')?.[0], 'off');
+  assert.equal(cfg(real(), KEYENV).askAll, false, 'and "off" is what the program does');
+  assert.match(flagRows().get('--ask-all')?.[1] ?? '', /\*\*strict mode\*\*/);
+  assert.match(READ_FLAT, /\*\*With `--ask-all` not even that one does:\*\* see "Asking about everything" below/);
+  assert.match(READ_FLAT, /\*\*Reads inside the project are free\*\* \(unless you start with `--ask-all`, which exists because of this\)/);
+  assert.match(USAGE.replace(/\s+/g, ' '), /--ask-all STRICT MODE: every tool call asks the device, a Read inside the working directory included/);
 });
 
 test('installShutdown: a signal closes the server then exits 0; a second signal forces exit 1', async () => {

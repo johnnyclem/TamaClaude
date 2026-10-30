@@ -42,7 +42,7 @@ import { after, test } from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { Options, query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
@@ -61,13 +61,15 @@ import {
   STALLED_TEXT,
 } from '../src/drivers/claude.ts';
 import type { ClaudeDriverConfig } from '../src/drivers/claude.ts';
+import { hardDenyFor, needsAskFor } from '../src/main.ts';
 import { loadProjectMemory } from '../src/memory.ts';
 import { composeSystemAppend, MEMORY_BEGIN, MEMORY_END } from '../src/voice-prompt.ts';
 import { summarizeForDevice } from '../src/text.ts';
-import { describeTool, UNSERVED_TOOL_NAMES } from '../src/tools.ts';
+import { UNSERVED_TOOL_NAMES } from '../src/tools.ts';
 import { LIMITS } from '../src/types.ts';
 import type { DriverEvent, PermissionDecision, PermissionRequest, SessionDriver } from '../src/types.ts';
 import { FakeAnthropic, say, useTool } from './support/fake-anthropic.ts';
+import { GIT_CONTEXT_COMMANDS, GIT_STILL_RUNS } from './support/git-commands.ts';
 import type { FakeReply, FakeRequest } from './support/fake-anthropic.ts';
 import { REAL_CLI_VERIFIED_SDK } from './support/sdk-version.ts';
 
@@ -78,9 +80,18 @@ const BRIDGE_TOKEN = 'bridge-token-that-must-not-reach-the-model';
 /** The CLI's switch for its own memory, spelled out here (not imported) so a rename in the driver cannot take the test with it. */
 const AUTO_MEMORY_VAR = 'CLAUDE_CODE_DISABLE_AUTO_MEMORY';
 const AUTO_MEMORY_SENTINEL = 'AUTO-MEMORY-INDEX-SENTINEL-7f3a';
+/** The CLI's switch for its own git commands, spelled out here (not imported) so a rename in the driver cannot take the test with it. */
+const GIT_SWITCH_VAR = 'CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS';
+/** The real git, found once: the scenarios that build a repository need it, and are skipped without it. */
+const GIT_BIN = ((): string => {
+  const r = spawnSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' });
+  return r.status === 0 ? r.stdout.trim() : '';
+})();
+const GIT_SKIP = SKIP !== false ? SKIP : GIT_BIN === '' ? 'git is not installed here' : false;
 
 /** Real CLI processes are slow to start; a scenario that hangs should fail, not stall the run. */
 const T = { skip: SKIP, timeout: 90_000 };
+const GIT_T = { skip: GIT_SKIP, timeout: 90_000 };
 /** How long one prompt may take before a scenario fails instead of waiting (shortened when hunting for regressions). */
 const TURN_MS = Number(process.env.BRIDGE_REAL_CLI_TURN_MS ?? 60_000);
 
@@ -125,8 +136,10 @@ interface RigOpts {
   reuse?: Rig;
   /** The fake device never answers an ask (it stays open until the driver cancels it). */
   hold?: boolean;
-  /** Use the bridge's real rules for hardDeny / needsAsk, as main.ts does. */
+  /** Use the bridge's real rules for hardDeny / needsAsk, as main.ts does (`hardDenyFor`, `needsAskFor`). */
   realRules?: boolean;
+  /** The same rules with the strict mode (`--ask-all`) on: every call that is not refused asks. Implies `realRules`. */
+  askAll?: boolean;
   interruptGraceMs?: number;
   /** Extra variables the OPERATOR gives the child: set in the parent environment AND named in passEnv. */
   operatorEnv?: Record<string, string>;
@@ -210,13 +223,8 @@ async function startRig(t: TestContext, o: RigOpts = {}): Promise<Rig> {
   const logs: string[] = [];
   const asked: PermissionRequest[] = [];
   let waiter: (() => void) | undefined;
-  const rules =
-    o.realRules === true
-      ? {
-          hardDeny: (tool: string, input: Record<string, unknown>) => describeTool(tool, input, cwd).deny,
-          needsAsk: (tool: string, input: Record<string, unknown>) => describeTool(tool, input, cwd).risk !== 'low',
-        }
-      : {};
+  // The functions main.ts itself hands the driver, so the rig runs the bridge's wiring and not a copy of it.
+  const rules = o.realRules === true || o.askAll === true ? { hardDeny: hardDenyFor(cwd), needsAsk: needsAskFor(cwd, o.askAll === true) } : {};
   const driver = claudeDriverFactory(
     {
       apiKey: KEY,
@@ -685,6 +693,8 @@ interface PinCase {
   realRules?: boolean;
   /** Plant something outside the working directory (the home directory is the rig's), once the rig exists. */
   prepare?: (rig: Rig) => void;
+  /** The scenario builds a git repository, so it cannot run on a machine without git. */
+  needsGit?: boolean;
   fired: (o: Observed) => boolean;
 }
 
@@ -891,6 +901,15 @@ const PIN_CASES: Record<string, PinCase> = {
       return JSON.stringify([req?.body?.system, req?.body?.messages]).includes(AUTO_MEMORY_SENTINEL);
     },
   },
+  // The CLI's own git commands (G2/D25): a repository that can set `env` could switch them back on, and with them the clean
+  // filter in its own .git/config. The scenario (plantFilterRepo) and its measurements are in the G2/D25 section below.
+  [GIT_SWITCH_VAR]: {
+    pin: GIT_SWITCH_VAR,
+    repo: () => ({ env: { [GIT_SWITCH_VAR]: '0' } }),
+    prepare: (rig) => plantFilterRepo(rig),
+    needsGit: true,
+    fired: marker('m-gitfilter'),
+  },
   CLAUDE_CODE_DISABLE_WORKFLOWS: {
     pin: 'CLAUDE_CODE_DISABLE_WORKFLOWS',
     neutralise: ['disableWorkflows'],
@@ -1012,7 +1031,7 @@ test('every pinned name has a control run or a stated reason it has none, in bot
 });
 
 for (const [name, c] of Object.entries(PIN_CASES)) {
-  test(`pin ${name}: the repository\'s setting does nothing; with this pin off, it does`, T, async (t) => {
+  test(`pin ${name}: the repository\'s setting does nothing; with this pin off, it does`, c.needsGit === true ? GIT_T : T, async (t) => {
     const [guarded, control] = await Promise.all([observe(t, c, 'guarded'), observe(t, c, 'control')]);
     assert.equal(guarded, false, `${name}: the exploit fired with the pin in place`);
     assert.equal(control, true, `${name}: CONTROL: the exploit did not fire with the pin off, so this test proves nothing`);
@@ -1023,7 +1042,7 @@ test('D10: with the default (no settings sources) and EVERY other guard off, non
   // The pins, the policy lock and the hook all removed: only the empty source list remains.
   // In batches: thirty-odd real CLI processes at once would measure the machine, not the driver.
   const outcomes: (readonly [string, boolean])[] = [];
-  const entries = Object.entries(PIN_CASES);
+  const entries = Object.entries(PIN_CASES).filter(([, c]) => c.needsGit !== true || GIT_BIN !== '');
   for (let i = 0; i < entries.length; i += 6) {
     outcomes.push(...(await Promise.all(entries.slice(i, i + 6).map(async ([name, c]) => [name, await observe(t, c, 'default')] as const))));
   }
@@ -1591,4 +1610,184 @@ test('D22/V3: an upstream error that echoes a key that is NOT sk- shaped reaches
   // The placeholder is the control (as in K7): the driver writes it only where it removed something, so the CLI's own
   // text really did carry both the configured key and the short Authorization value.
   assert.equal(r.text.split('[redacted]').length - 1, 2);
+});
+
+// ---------------------------------------------------------------------------
+// G2/D25: the CLI's own start-up git commands
+// ---------------------------------------------------------------------------
+
+/**
+ * With NO settings loaded the CLI still runs `git` in the working directory as it starts, to put the branch, the status
+ * and the recent commits in the prompt. Git reads the repository's own `.git/config`, and a `filter.<name>.clean` program
+ * written there runs while git hashes a file that differs from its index entry: a program of the repository's choosing,
+ * run before any tool call exists for the device to be asked about. The CLI turns off git's hooks and its file-system
+ * monitor for those commands (`-c core.hooksPath=/dev/null -c core.fsmonitor=`); it does not turn off filters. The switch
+ * that stops the commands which build the context is CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS (found in the bundled binary,
+ * measured by a red team, then here).
+ *
+ * Three runs of one scenario: the driver's default (nothing runs), the control with the switch taken off the child's
+ * environment (the filter runs), and the operator's explicit opt-in (`gitContext: true`, which is the control by choice).
+ * A `git` that comes first on the PATH the child is given records every command the CLI starts, so the claim is about
+ * what the CLI RAN and not about what it was seen to print.
+ */
+
+/** The control: the same child environment WITHOUT the switch, which is how the CLI behaves by default. */
+const withGitCommands: OptionTweak = (o) => {
+  const env = { ...(o.env ?? {}) };
+  delete env[GIT_SWITCH_VAR];
+  return { ...o, env };
+};
+
+/** `git -c a=b -C dir status --short` -> `status --short`: the options before the subcommand are the CLI's hardening, not the news. */
+function gitSubcommand(line: string): string {
+  const words = line.split(' ');
+  let i = 0;
+  while (i < words.length && (words[i] === '-c' || words[i] === '-C' || words[i] === '--no-optional-locks')) i += words[i] === '--no-optional-locks' ? 1 : 2;
+  return words.slice(i).join(' ');
+}
+
+interface GitObservation {
+  /** The repository's clean filter ran (it creates a file). */
+  filterRan: boolean;
+  /** Any OTHER program the repository's `.git/config` and hooks name ran: the file-system monitor, a hook. */
+  otherProgramRan: string[];
+  /** The git commands the CLI started, as `status --short` and the like. */
+  commands: string[];
+  /** The first request told the model about the branch and the status. */
+  gitContextInPrompt: boolean;
+}
+
+/**
+ * A repository that arrived WITH its `.git` directory: an attribute for text files, a clean filter in `.git/config`
+ * that creates `m-gitfilter` in the working directory, a tracked file that differs from its index entry (which is what
+ * makes `git status` hash it, through the filter), and the other places a repository can name a program for git to run
+ * on a read-only command (a file-system monitor, a hooks directory with the hooks that fire when the index changes).
+ */
+function plantFilterRepo(rig: Rig): void {
+  const git = (...args: string[]): void => {
+    const r = spawnSync(GIT_BIN, ['-C', rig.cwd, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], {
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH ?? '', HOME: rig.home, GIT_CONFIG_NOSYSTEM: '1' },
+    });
+    assert.equal(r.status, 0, `git ${args.join(' ')} failed: ${r.stderr}`);
+  };
+  const program = (path: string, marker: string): string => {
+    writeFileSync(path, `#!/bin/sh\ntouch ${join(rig.cwd, marker)}\ncat\n`, { mode: 0o755 });
+    return path;
+  };
+  git('init', '-q');
+  writeFileSync(join(rig.cwd, '.gitattributes'), '*.txt filter=pwn\n');
+  writeFileSync(join(rig.cwd, 'a.txt'), 'one\n');
+  git('add', '-A');
+  git('commit', '-q', '-m', 'init');
+  const hooks = join(rig.home, 'hooks');
+  mkdirSync(hooks, { recursive: true });
+  for (const hook of ['post-index-change', 'reference-transaction', 'fsmonitor-watchman', 'post-checkout', 'pre-auto-gc']) program(join(hooks, hook), 'm-githook');
+  appendFileSync(
+    join(rig.cwd, '.git', 'config'),
+    `[core]\n\tfsmonitor = ${program(join(rig.home, 'fsmonitor.sh'), 'm-gitfsmonitor')}\n\thooksPath = ${hooks}\n` +
+      `[filter "pwn"]\n\tclean = ${program(join(rig.home, 'filter.sh'), 'm-gitfilter')}\n\tsmudge = cat\n`,
+  );
+  // A different file with an old modification time: its stat no longer matches the index entry, so git hashes the content.
+  writeFileSync(join(rig.cwd, 'a.txt'), 'uno\n');
+  const past = new Date(Date.now() - 86_400_000);
+  utimesSync(join(rig.cwd, 'a.txt'), past, past);
+}
+
+async function gitObserved(t: TestContext, over: { tweak?: OptionTweak; cfg?: Partial<ClaudeDriverConfig> } = {}): Promise<GitObservation> {
+  // `git` first on the PATH the child is given: it records its arguments and runs the real one.
+  const shims = scratch('rc-gitshim-');
+  const log = join(shims, 'calls.log');
+  writeFileSync(join(shims, 'git'), `#!/bin/sh\nprintf '%s\\n' "$*" >> ${log}\nexec ${GIT_BIN} "$@"\n`, { mode: 0o755 });
+  const rig = await startRig(t, {
+    parentEnv: { PATH: `${shims}:${process.env.PATH ?? ''}` },
+    ...(over.tweak !== undefined ? { tweak: over.tweak } : {}),
+    ...(over.cfg !== undefined ? { cfg: over.cfg } : {}),
+  });
+  plantFilterRepo(rig);
+  rig.api.enqueue({ blocks: [say('hi')] });
+  await rig.turn('hello');
+  // The CLI's start-up commands may still be finishing when the answer arrives.
+  await wait(800);
+  const req = rig.api.mainRequests[0]!;
+  const prompt = JSON.stringify([req.body?.system, req.body?.messages]);
+  return {
+    filterRan: rig.exists('m-gitfilter'),
+    otherProgramRan: ['m-gitfsmonitor', 'm-githook'].filter((m) => rig.exists(m)),
+    commands: existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter((l) => l !== '').map(gitSubcommand) : [],
+    gitContextInPrompt: prompt.includes('# gitStatus'),
+  };
+}
+
+const contextCommands = (o: GitObservation): string[] => o.commands.filter((c) => GIT_CONTEXT_COMMANDS.includes(c.split(' ')[0]!));
+const unexpectedCommands = (o: GitObservation): string[] => o.commands.filter((c) => !GIT_STILL_RUNS.includes(c));
+
+test('G2/D25: by default the CLI starts none of the git commands that build the context, so a clean filter in .git/config never runs and the prompt has no git status; the control shows all of it otherwise', GIT_T, async (t) => {
+  const [guarded, control] = await Promise.all([gitObserved(t), gitObserved(t, { tweak: withGitCommands })]);
+  assert.equal(guarded.filterRan, false, 'the repository\'s clean filter ran with the switch set');
+  assert.deepEqual(guarded.otherProgramRan, [], 'a program the repository\'s .git/config or hooks name ran with the switch set');
+  assert.deepEqual(unexpectedCommands(guarded), [], 'the CLI started a git command that is not on the reviewed list');
+  assert.equal(guarded.gitContextInPrompt, false, 'the first request still carried the git status');
+
+  // CONTROL: without the switch the same CLI runs git at start-up, the repository's filter runs with it, and the model is told.
+  assert.equal(control.filterRan, true, 'CONTROL: the exploit did not fire without the switch, so this test proves nothing');
+  assert.ok(contextCommands(control).length >= 2, `CONTROL: the CLI started the context commands (status, log): ${control.commands.join(' | ')}`);
+  assert.equal(control.gitContextInPrompt, true, 'CONTROL: and the first request carries the git context');
+  // The recorder works, and the reviewed list is real: the commands the switch does not stop are seen in the control too.
+  assert.ok(control.commands.some((c) => GIT_STILL_RUNS.includes(c)), 'CONTROL: the three read-only commands are among those recorded');
+});
+
+test('G2/D25: the operator\'s explicit opt-in (gitContext) is the control by choice: the CLI runs git and the filter runs', GIT_T, async (t) => {
+  const optIn = await gitObserved(t, { cfg: { gitContext: true } });
+  assert.equal(optIn.filterRan, true, 'with --git-context the repository\'s filter runs: this is what the banner warns about');
+  assert.ok(contextCommands(optIn).length >= 2);
+  assert.equal(optIn.gitContextInPrompt, true, 'and the model is told the branch and status, which is what the operator asked for');
+});
+
+// ---------------------------------------------------------------------------
+// D26: --ask-all, the strict mode
+// ---------------------------------------------------------------------------
+
+/**
+ * By default the one call the CLI would run on its own, a `Read` inside the working directory, is left to it (the driver's
+ * hook says nothing) and the device is never asked. Under `--ask-all` the tap rule says yes for everything, the hook answers
+ * `ask`, and the CLI puts even that read to the device. The rules are main.ts's own (`hardDenyFor`, `needsAskFor`), the
+ * ones `run()` hands the driver, so this measures the strict mode and not a test's idea of it.
+ */
+test('D26: under --ask-all a Read of an ordinary file in the project reaches the device; by default it does not; a refused call is refused either way', T, async (t) => {
+  const sentinel = 'ORDINARY-FILE-SENTINEL-4471';
+  const files = { 'notes.txt': sentinel };
+  const read = (cwd: string): FakeReply[] => [{ blocks: [useTool('Read', { file_path: join(cwd, 'notes.txt') })] }, { blocks: [say('done')] }];
+  const sawFile = (r: Rig): boolean => JSON.stringify(toolResultTexts(r.api.mainRequests[1])).includes(sentinel);
+
+  const strict = await startRig(t, { files, askAll: true });
+  strict.api.enqueue(...read(strict.cwd));
+  await strict.turn('read the notes');
+  assert.deepEqual(strict.asked.map((a) => a.tool), ['Read'], 'the device was asked about a Read of an ordinary file in the project');
+  assert.equal(sawFile(strict), false, 'and it said no, so the file never reached the model');
+
+  // The same ask, answered yes: the strict mode only moves the decision to the person, it does not forbid the read.
+  const allowed = await startRig(t, { files, askAll: true, decide: () => ({ allow: true }) });
+  allowed.api.enqueue(...read(allowed.cwd));
+  await allowed.turn('read the notes');
+  assert.equal(allowed.asked.length, 1);
+  assert.equal(sawFile(allowed), true, 'a tap on ALLOW lets the read through');
+
+  // CONTROL: by default (the same real rules, strict mode off) the Read is left to the CLI, runs, and the device hears nothing.
+  const normal = await startRig(t, { files, realRules: true });
+  normal.api.enqueue(...read(normal.cwd));
+  await normal.turn('read the notes');
+  assert.deepEqual(normal.asked, [], 'CONTROL: by default nobody is asked, so the test above could see the difference');
+  assert.equal(sawFile(normal), true, 'CONTROL: and the model got the file');
+
+  // A refused call stays refused under --ask-all and never reaches the device. (A write into the CLI's own configuration:
+  // had the refusal failed, the fake device's "yes" would only have written a file into the throwaway project.)
+  const refused = await startRig(t, { askAll: true, decide: () => ({ allow: true }) });
+  refused.api.enqueue(
+    { blocks: [useTool('Write', { file_path: join(refused.cwd, '.claude', 'settings.local.json'), content: '{}' })] },
+    { blocks: [say('done')] },
+  );
+  await refused.turn('configure yourself');
+  assert.deepEqual(refused.asked, [], 'a call the bridge refuses outright is not turned into a question');
+  assert.equal(refused.exists('.claude/settings.local.json'), false, 'and it did not run');
 });

@@ -582,3 +582,145 @@ test('R3: a pile of wildcards in a path reaches the device at high, at once, thr
   // 14 of these froze the bridge for 12 seconds; this is a backstop against a regression to that, not a measurement.
   assert.ok(Date.now() - started < 2_000, `took ${Date.now() - started} ms`);
 });
+
+// ---------------------------------------------------------------------------
+// G1/D24 through the CALLER. The exploit is "the model calls Read on a git directory's file": through the real CLI three such
+// Reads (a submodule's config, a worktree's, `.git/config.worktree`) returned canary tokens with no ask. tools.test.ts holds the
+// layout table for the RULE; these go through what the driver's hook and the permission handler do with it.
+// ---------------------------------------------------------------------------
+
+function gitRoot(): { proj: string; done: () => void } {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'perm-git-')));
+  const proj = join(root, 'proj');
+  const put = (rel: string, text = 'x'): void => {
+    mkdirSync(join(proj, rel, '..'), { recursive: true });
+    writeFileSync(join(proj, rel), text);
+  };
+  for (const f of ['.git/config', '.git/config.worktree', '.git/modules/sub/config', '.git/worktrees/w/config.worktree', '.git/remotes/origin', '.git/branches/origin']) {
+    put(f, '[remote "origin"]\n url = https://u:CANARY-TOKEN@example.invalid/x\n');
+  }
+  put('.git/HEAD', 'ref: refs/heads/main\n');
+  put('sub/.git', 'gitdir: ../.git/modules/sub\n');
+  put('src/a.ts');
+  return { proj, done: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+test('G1/D24: a Read of a submodule\'s, a worktree\'s or the shared worktree config reaches the device at high; the files beside them are still free', async () => {
+  const { proj, done } = gitRoot();
+  try {
+    const needsAsk = needsAskFor(proj);
+    for (const f of ['.git/HEAD', 'src/a.ts', 'sub/.git']) assert.equal(needsAsk('Read', { file_path: f }), false, `control: ${f} is free`);
+    const secrets: [string, string][] = [
+      ['.git/config', '.git/config'],
+      ['.git/config.worktree', '.git/config.worktree'],
+      ['.git/modules/sub/config', '.git/modules/sub/config'],
+      ['.git/worktrees/w/config.worktree', '.git/worktrees/w/config.worktree'],
+      ['.git/remotes/origin', '.git/remotes/origin'],
+      ['.git/branches/origin', '.git/branches/origin'],
+      ['sub/.git/config', 'sub/.git/config -> .git/modules/sub/config'],
+    ];
+    for (const [file, summary] of secrets) {
+      for (const input of [{ file_path: file }, { file_path: join(proj, file) }]) {
+        assert.equal(needsAsk('Read', input), true, `${JSON.stringify(input)}: the hook must ask`);
+        assert.equal(hardDenyFor(proj)('Read', input), undefined, 'a read is asked about, never refused');
+      }
+      const r = rig({ cwd: proj });
+      const p = r.handler(req('Read', { file_path: file }));
+      assert.equal(await peek(p), PENDING, `${file}: it waits for a tap`);
+      assert.deepEqual(r.approvals.current(), { id: id(1), label: 'Read', risk: 'high', summary, ttlSec: 60 });
+      assert.equal(r.approvals.answer(id(1), false), 'accepted');
+      assert.deepEqual(await p, { allow: false, message: MSG.denied });
+    }
+  } finally {
+    done();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// D26 (--ask-all), the unit-level half. `needsAskFor(cwd, true)` is what main.ts hands the driver's PreToolUse hook in strict mode, and
+// the hook asks for anything that is not an explicit `false`. Whether the hook itself does is the driver's test; what is pinned here is
+// that the answer is yes for every call, that the handler then really puts a rated-low call in front of the human (it never auto-allows),
+// and that the strict mode only ever ADDS asks: a hard-denied call is still refused without one.
+// ---------------------------------------------------------------------------
+
+const FREE_CALLS: [string, Record<string, unknown>][] = [
+  ['Read', { file_path: 'src/a.ts' }], ['NotebookRead', { notebook_path: 'src/n.ipynb' }], ['LS', { path: 'src' }],
+  ['Glob', { pattern: 'src/*.ts' }], ['Grep', { pattern: 'x' }], ['Grep', { pattern: 'x', path: 'src', glob: '*.ts' }],
+];
+
+test('D26: in strict mode the hook asks for every call, including the Reads inside the project that are free by default', () => {
+  const { proj, done } = gitRoot();
+  try {
+    const normal = needsAskFor(proj);
+    const strict = needsAskFor(proj, true);
+    for (const [tool, input] of FREE_CALLS) {
+      assert.equal(normal(tool, input), false, `control: ${tool} ${JSON.stringify(input)} is free by default, so the strict answer below is the mode and not the call`);
+      assert.equal(strict(tool, input), true, `${tool} ${JSON.stringify(input)}`);
+      assert.equal(needsTap(tool, input, proj), false, 'and the rule itself still rates it free: strict mode is a policy on top of it');
+    }
+    // Strict is never LESS strict: whatever is asked by default is asked here, over a spread of calls.
+    const spread: [string, Record<string, unknown>][] = [
+      ...FREE_CALLS, ['Bash', { command: 'ls' }], ['Bash', { command: 'rm -rf /' }], ['Write', { file_path: 'a.ts', content: 'x' }], ['Edit', { file_path: '.claude/settings.json' }],
+      ['Read', { file_path: '.git/config' }], ['Read', { file_path: '/etc/hosts' }], ['WebFetch', { url: 'https://example.com' }], ['mcp__s__t', { path: 'x' }],
+      ['Agent', { prompt: 'x' }], ['TodoWrite', { todos: [] }], ['Nope', {}], ['', {}],
+    ];
+    for (const [tool, input] of spread) {
+      if (normal(tool, input)) assert.equal(strict(tool, input), true, `${tool}: asked by default, so asked in strict mode`);
+    }
+    assert.equal(spread.filter(([t, i]) => strict(t, i)).length, spread.length, 'and in strict mode that is every one of them');
+    // Hostile shapes: no input, no cwd worth anything, an input that is not an object. The answer does not depend on the analyser at all.
+    for (const bad of [undefined, null, 'x', 7, [], { file_path: 7 }] as unknown[]) {
+      assert.equal(strict('Read', bad as Record<string, unknown>), true, JSON.stringify(bad));
+    }
+    assert.equal(needsAskFor('relative/cwd', true)('Read', { file_path: 'a' }), true);
+    // The default stays the default: the second parameter is opt-in.
+    assert.equal(needsAskFor(proj, false)('Read', { file_path: 'src/a.ts' }), false);
+  } finally {
+    done();
+  }
+});
+
+test('D26: a free call that the strict hook sends to the handler is put to the device, rated low, and runs only on a tap', async () => {
+  const { proj, done } = gitRoot();
+  try {
+    for (const [tool, input] of FREE_CALLS) {
+      const r = rig({ cwd: proj });
+      const p = r.handler(req(tool, input));
+      assert.equal(await peek(p), PENDING, `${tool}: waits for a tap`);
+      const ask = r.approvals.current()!;
+      assert.equal(ask.risk, 'low', `${tool}: the label stays honest, it is rated low and asked anyway`);
+      assert.equal(ask.label, tool);
+      assert.equal(r.approvals.answer(id(1), true), 'accepted');
+      assert.deepEqual(await p, { allow: true });
+      // A denial is a refusal like any other.
+      const d = rig({ cwd: proj });
+      const q = d.handler(req(tool, input));
+      d.approvals.answer(id(1), false);
+      assert.deepEqual(await q, { allow: false, message: MSG.denied });
+    }
+  } finally {
+    done();
+  }
+});
+
+test('D26: strict mode only adds asks: a hard-denied call is refused by the same rule, with no ask, and no setting of the hook changes that', async () => {
+  const { proj, done } = gitRoot();
+  try {
+    const denied: [string, Record<string, unknown>][] = [
+      ['Bash', { command: 'rm -rf /' }], ['Write', { file_path: '.claude/settings.local.json', content: '{}' }], ['Edit', { file_path: '.mcp.json', old_string: 'a', new_string: 'b' }],
+      ['Skill', { skill: 'x' }],
+    ];
+    for (const [tool, input] of denied) {
+      // The driver runs hardDeny BEFORE needsAsk, so the strict policy is never consulted for these: pin both halves.
+      assert.notEqual(hardDenyFor(proj)(tool, input), undefined, `${tool}: refused by the hook's veto`);
+      const r = rig({ cwd: proj });
+      const d = await refused(r, req(tool, input), tool);
+      assert.equal(d.allow, false);
+      assert.equal(r.approvals.pendingCount(), 0, `${tool}: the device never saw it`);
+    }
+    // And a call that is merely free is not on that list: the veto is not the strict mode in disguise.
+    for (const [tool, input] of FREE_CALLS) assert.equal(hardDenyFor(proj)(tool, input), undefined, `${tool} is not refused`);
+  } finally {
+    done();
+  }
+});

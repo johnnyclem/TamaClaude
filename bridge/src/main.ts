@@ -34,6 +34,13 @@
  * call exists for the device to be asked about. So the bridge reads the project's CLAUDE.md
  * ITSELF and hands the model plain text (src/memory.ts); `project` and `local` remain as an
  * explicit opt-in that prints a loud warning.
+ *
+ * TWO MORE SWITCHES FOLLOW THE SAME RULE (safe unless asked, said out loud when asked). `--git-context` lets the CLI run
+ * git in the working directory when it starts, which reads the repository's own `.git/config` and so lets a clean filter
+ * written there run a program with no ask; off by default (the driver sets the CLI's switch for it), a boxed warning when on.
+ * `--ask-all` is the strict mode for somebody who prefers safety to convenience: the tap rule answers yes for every call,
+ * so even the one read the CLI would run on its own is put to the device, because the names that keep a read tap-free are a
+ * heuristic that will never be complete. Both are real-mode only.
  */
 
 import { randomBytes } from 'node:crypto';
@@ -41,7 +48,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { homedir, networkInterfaces } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
-import { AUTO_MEMORY_SWITCH, checkManagedLock, claudeDriverFactory, DEFAULT_STALL_MS, NEVER_PASS } from './drivers/claude.ts';
+import { AUTO_MEMORY_SWITCH, checkManagedLock, claudeDriverFactory, DEFAULT_STALL_MS, GIT_SWITCH, NEVER_PASS } from './drivers/claude.ts';
 import type { ClaudeDriverConfig, ManagedLockStatus } from './drivers/claude.ts';
 import { fakeDriverFactory } from './drivers/fake.ts';
 import { inspectProjectMemory, MEMORY_MAX_BYTES } from './memory.ts';
@@ -102,6 +109,13 @@ export interface Config {
    * repository the operator trusts like its build scripts; see the file header and the banner.
    */
   settingSources: SettingSource[];
+  /**
+   * OPT-IN (`--git-context`): the CLI runs git in the working directory when it starts, which reads the repository's own
+   * `.git/config`, and a clean filter defined there can run a program with no ask. DEFAULT: off; see the file header.
+   */
+  gitContext: boolean;
+  /** STRICT MODE (`--ask-all`): every call that is not refused asks the device, a Read inside the working directory included. */
+  askAll: boolean;
   /** Things the person should know before trusting the setup. Printed in the banner. */
   warnings: string[];
 }
@@ -169,7 +183,7 @@ Claude
                          process's environment stays behind. A name the bridge sets
                          itself is refused here (BRIDGE_TOKEN, ANTHROPIC_API_KEY and
                          the CLAUDE_CODE_DISABLE_* switches that keep background work,
-                         workflows and the CLI's own memory off).
+                         workflows, the CLI's own memory and its git commands off).
   --setting-sources <l>  OPT-IN: Claude Code settings files to read, a comma list of user,
                          project, local, or none (the default, and the only safe setting
                          for a repository you do not trust). With none, the bridge reads
@@ -178,12 +192,25 @@ Claude
                          when Claude starts, change its environment and redirect its
                          traffic before you are asked about anything; the bridge blocks
                          the ways it knows of, which is best effort.
+  --git-context          OPT-IN: let Claude Code run git in the working directory when it
+                         starts, so the prompt carries the branch, the status and the recent
+                         commits. Off by default, because git then reads the repository's own
+                         .git/config, and a filter defined there can run a program before you
+                         are asked about anything. Only for a --cwd whose .git directory you
+                         trust (a clone you made yourself does not bring one; an archive or a
+                         copied folder does). Without it Claude is not told the branch or the
+                         status, which a voice session hardly needs.
   --state-dir <dir>      where the session id is kept (default
                          $XDG_STATE_HOME/tamaclaude-bridge or
                          ~/.local/state/tamaclaude-bridge)
   --new-session          forget the saved session and start a fresh conversation
 
 Approvals
+  --ask-all              STRICT MODE: every tool call asks the device, a Read inside the
+                         working directory included. By default that one read runs with no
+                         tap unless the path looks like a credential store, and what looks
+                         like one is decided by file names, which will never be complete.
+                         Choose this when safety matters more to you than convenience.
   --ask-ttl-sec <n>      seconds the player has to answer one ask (default 90)
   --grace-sec <n>        seconds an open ask survives a lost connection (default 15)
 
@@ -246,6 +273,8 @@ export function parseConfig(argv: string[], env: Record<string, string | undefin
         'grace-sec': { type: 'string' },
         'turn-stall-sec': { type: 'string' },
         'setting-sources': { type: 'string' },
+        'git-context': { type: 'boolean' },
+        'ask-all': { type: 'boolean' },
         help: { type: 'boolean', short: 'h' },
       },
     }));
@@ -282,6 +311,8 @@ export function parseConfig(argv: string[], env: Record<string, string | undefin
     graceSec: 15,
     turnStallSec: DEFAULT_STALL_MS / 1000,
     settingSources: [],
+    gitContext: flag('git-context'),
+    askAll: flag('ask-all'),
     warnings: [],
   };
   if (base.help) return base;
@@ -297,7 +328,7 @@ export function parseConfig(argv: string[], env: Record<string, string | undefin
   base.turnStallSec = parseIntFlag('--turn-stall-sec', str('turn-stall-sec'), DEFAULT_STALL_MS / 1000, 0, 3600);
   base.settingSources = parseSettingSources(str('setting-sources'));
 
-  const claudeOnly = ['pass-env', 'model', 'max-turns', 'turn-stall-sec'].filter((k) => values[k] !== undefined);
+  const claudeOnly = ['pass-env', 'model', 'max-turns', 'turn-stall-sec', 'git-context', 'ask-all'].filter((k) => values[k] !== undefined);
   if (fakeClaude && claudeOnly.length > 0) {
     throw new ConfigError(`--${claudeOnly[0]} only applies to the real Claude, not together with --fake-claude.`);
   }
@@ -422,6 +453,7 @@ export const NEVER_PASSED_WHY: ReadonlyMap<string, string> = new Map([
   ['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS', 'the bridge turns background work off for a voice session and nothing may turn it back on'],
   ['CLAUDE_CODE_DISABLE_WORKFLOWS', 'the Workflow tool starts background agents whatever the other switches say, so the bridge turns it off and nothing may turn it back on'],
   [AUTO_MEMORY_SWITCH, "the bridge switches the CLI's own memory off (what an earlier session left in ~/.claude would be read with no tap) and nothing may turn it back on"],
+  [GIT_SWITCH, "the bridge keeps the CLI's own git commands off, because git runs a filter written in the repository's .git/config; the only way to turn them on is --git-context, which says so"],
 ]);
 
 /** Every name the child is never given, with the reason the operator is told: the driver's list, explained. */
@@ -548,16 +580,35 @@ function memoryLines(config: Config, info: BannerInfo): string[] {
 }
 
 /**
- * What the bridge cannot stop, said on every start: git itself reads the repository's `.git/config` when Claude Code
- * starts (a status, a log), and a clean filter defined there runs a program. The CLI turns off git's hooks and its file-system
- * monitor for those commands; it does not turn off filters, and nothing here can: it happens before any tool call exists
- * for the device to be asked about. The source of such a config is a repository that arrived WITH its `.git` directory
- * (an archive, a copied folder) or a `.git/config` edited by a call somebody tapped; `git clone` does not copy configuration.
+ * The warning printed when git context is switched on (`--git-context`). A block, like the settings warning: it is the other
+ * switch that lets a repository's own files run a program before any call exists for the device to be asked about. Git reads
+ * `.git/config` for every command the CLI then runs, and a `filter.<name>.clean` defined there runs while git hashes a file
+ * that differs from its index entry. The CLI turns off git's hooks and file-system monitor for those commands, and not
+ * filters. The source of such a config is a repository that arrived WITH its `.git` directory (an archive, a copied folder)
+ * or a `.git/config` edited by a call somebody tapped; `git clone` does not copy configuration.
  */
-function gitLines(): string[] {
+export function gitContextWarning(config: Pick<Config, 'gitContext'>): string[] {
+  if (!config.gitContext) return [];
+  const bar = '  ' + '='.repeat(76);
   return [
-    "  git     NOT covered: a filter in the repository's own .git/config can run a program when Claude starts (git reads it).",
-    '          Use --cwd only for a repository whose .git directory you trust; a clone you made yourself does not bring one.',
+    bar,
+    '  WARNING  GIT CONTEXT IS ON (--git-context)',
+    '           Claude Code will run git in the working directory when it starts (a status, a log). Git',
+    "           reads the repository's own .git/config, and a filter defined there can run a program with",
+    '           no question asked, BEFORE the device is asked about anything. Claude Code turns off git\'s',
+    '           hooks and file-system monitor for those commands; it does not turn off filters.',
+    '           Use --cwd only for a repository whose .git directory you trust: a clone you made yourself',
+    '           does not bring one, an archive or a copied folder does.',
+    bar,
+  ];
+}
+
+/** What the banner says about git on every real-mode start: the block above when it is on, one line saying it is off otherwise. */
+function gitLines(config: Pick<Config, 'gitContext'>): string[] {
+  if (config.gitContext) return gitContextWarning(config);
+  return [
+    "  git     context off: Claude Code skips git status and git log at start-up, so a filter in the repository's own",
+    '          .git/config cannot run a program then; Claude is not told the branch, the status or the recent commits (--git-context)',
   ];
 }
 
@@ -591,8 +642,10 @@ export function renderBanner(config: Config, urls: readonly string[], info: Bann
       `  devices ${config.allowLocalDevice ? 'on this machine AND elsewhere' : 'only on other machines (a device on this machine is refused)'}`,
     );
     lines.push(
-      `  no tap  ${CLI_FREE_TOOLS.join(', ')} inside the working directory, through no symbolic link and not a credential store ` +
-        '(a search or a listing is a Bash call and asks); every other call asks the device first',
+      config.askAll
+        ? '  no tap  nothing (--ask-all, strict mode): every call asks the device first, a Read inside the working directory included'
+        : `  no tap  ${CLI_FREE_TOOLS.join(', ')} inside the working directory, through no symbolic link and not a credential store ` +
+            '(a search or a listing is a Bash call and asks); every other call asks the device first',
     );
     lines.push(
       config.settingSources.length === 0
@@ -601,7 +654,7 @@ export function renderBanner(config: Config, urls: readonly string[], info: Bann
         : `  settings ${config.settingSources.join(', ')} (OPT-IN, see the warning below)`,
     );
     lines.push(...memoryLines(config, info));
-    lines.push(...gitLines());
+    lines.push(...gitLines(config));
     lines.push(
       config.turnStallSec === 0
         ? '  stall   a turn is never ended for silence (--turn-stall-sec 0)'
@@ -635,8 +688,14 @@ export function hardDenyFor(cwd: string): (tool: string, input: Record<string, u
  * The driver's "must this go to the device?" question: the same single answer the rest of the
  * bridge uses, so the SDK's hook, the permission handler and the README cannot disagree
  * about which calls run without a tap.
+ *
+ * `askAll` is the strict mode (`--ask-all`): the answer is yes for EVERY call, the tap-free Read inside the working
+ * directory included. The driver's hook consults `hardDeny` first, so a refused call is still refused without being
+ * asked about; this only removes the calls the bridge's naming rules let through. Name-based secret detection is a
+ * heuristic that will never be complete, and this is the way out of depending on it.
  */
-export function needsAskFor(cwd: string): (tool: string, input: Record<string, unknown>) => boolean {
+export function needsAskFor(cwd: string, askAll = false): (tool: string, input: Record<string, unknown>) => boolean {
+  if (askAll) return () => true;
   return (tool, input) => needsTap(tool, input, cwd);
 }
 
@@ -655,7 +714,8 @@ export function buildClaudeConfig(config: Config, env: Record<string, string | u
     apiKey: (env['ANTHROPIC_API_KEY'] ?? '').trim(),
     settingSources: config.settingSources,
     hardDeny: hardDenyFor(config.cwd),
-    needsAsk: needsAskFor(config.cwd),
+    needsAsk: needsAskFor(config.cwd, config.askAll),
+    gitContext: config.gitContext,
     passEnv: config.passEnv,
     stallMs: config.turnStallSec * 1000,
     ...(mem !== undefined && mem.text !== '' ? { projectMemory: mem.text } : {}),

@@ -33,6 +33,7 @@ import {
   CHILD_ENV_PREFIXES,
   claudeDriverFactory,
   DEFAULT_STALL_MS,
+  GIT_SWITCH,
   KEY_MIN_LENGTH,
   NEVER_PASS,
   PIN_COMMAND_KEYS,
@@ -1737,6 +1738,7 @@ const EXPECTED_PIN_LISTS = {
   commandObjectKeys: ['statusLine', 'fileSuggestion', 'subagentStatusLine'],
   neverPassed: [
     'BRIDGE_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS', 'CLAUDE_CODE_DISABLE_WORKFLOWS', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY',
+    'CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS',
   ],
   childPrefixes: ['LC_', 'XDG_'],
 } as const;
@@ -1799,6 +1801,7 @@ test('D23: no passEnv entry can undo what the driver sets: every name on the nev
   assert.equal(env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, '1');
   assert.equal(env.CLAUDE_CODE_DISABLE_WORKFLOWS, '1');
   assert.equal(env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1');
+  assert.equal(env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS, '1', 'the CLI\'s own git commands stay off whatever the operator\'s shell or --pass-env says');
   // Companion: a name that is NOT on the list, passed the same way, does arrive -- the refusals above are the list's doing.
   assert.equal(buildChildEnv({ MY_OPT_IN: 'x' }, KEY, ['MY_OPT_IN']).env.MY_OPT_IN, 'x');
 });
@@ -1821,6 +1824,77 @@ test('R4/D20: the CLI\'s own memory is switched off in the child, whatever the o
   await begin(opt);
   const pinned = JSON.parse(readFileSync(opt.options().settings as string, 'utf8')) as { env: Record<string, string> };
   assert.equal(pinned.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1');
+});
+
+// -- G2 / D25: the CLI's own git commands ------------------------------------------------------------------------
+
+test('G2/D25: the switch is the CLI\'s own name, and it is set to 1 in the child by default, whatever the operator\'s shell or --pass-env says', () => {
+  // The name is the CLI's, not ours: a typo here would switch nothing off and no unit test would notice. The real-CLI suite
+  // (G2/D25) proves the effect of THIS name; this pins the spelling the driver sets.
+  assert.equal(GIT_SWITCH, 'CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS');
+  assert.equal(buildChildEnv({}, KEY).env[GIT_SWITCH], '1', 'set by default');
+  for (const shell of ['0', 'false', '', '1']) {
+    assert.equal(buildChildEnv({ [GIT_SWITCH]: shell }, KEY).env[GIT_SWITCH], '1', `the allowlist does not carry the operator's ${JSON.stringify(shell)}`);
+    const passed = buildChildEnv({ [GIT_SWITCH]: shell }, KEY, [GIT_SWITCH]);
+    assert.equal(passed.env[GIT_SWITCH], '1', `--pass-env cannot carry ${JSON.stringify(shell)} either`);
+    assert.deepEqual(passed.refused, [GIT_SWITCH], 'and the refusal is reported');
+  }
+  assert.ok(NEVER_PASS.has(GIT_SWITCH));
+});
+
+test('G2/D25: gitContext is the one way to leave the switch off the child -- and nothing else leaks it back in', () => {
+  const on = buildChildEnv({ [GIT_SWITCH]: '1' }, KEY, [GIT_SWITCH], { gitContext: true });
+  assert.ok(!(GIT_SWITCH in on.env), 'with git context the switch is absent from the child');
+  assert.deepEqual(on.refused, [GIT_SWITCH], 'a --pass-env of the name is still refused: the opt-in is the flag, not the variable');
+  // Only an explicit true: undefined, false and anything else keep the CLI\'s git commands off.
+  for (const v of [undefined, false] as const) assert.equal(buildChildEnv({}, KEY, [], { gitContext: v }).env[GIT_SWITCH], '1', String(v));
+  assert.equal(buildChildEnv({}, KEY, [], {}).env[GIT_SWITCH], '1');
+  // Nothing else about the environment changed with it: the other switches and the key are the same.
+  const off = buildChildEnv({ PATH: '/bin' }, KEY).env;
+  const optIn = buildChildEnv({ PATH: '/bin' }, KEY, [], { gitContext: true }).env;
+  assert.deepEqual({ ...off, [GIT_SWITCH]: undefined }, { ...optIn, [GIT_SWITCH]: undefined });
+});
+
+test('G2/D25: the pinned settings carry the switch unless git context was asked for, and a repository cannot say otherwise', () => {
+  assert.equal(pinnedSettings({}).env[GIT_SWITCH], '1', 'pinned by default');
+  assert.equal(pinnedSettings({ [GIT_SWITCH]: '0' }).env[GIT_SWITCH], '1', 'and not the child\'s to change');
+  assert.ok(!(GIT_SWITCH in pinnedSettings({}, true).env), 'with git context the pin is gone: it would undo the operator\'s choice');
+  assert.ok(!(GIT_SWITCH in pinnedSettings({ [GIT_SWITCH]: '1' }, true).env), 'whatever the child holds');
+  assert.equal(pinnedSettings({}, false).env[GIT_SWITCH], '1');
+});
+
+test('G2/D25: through the driver, the child\'s environment and the pinned file agree, in both modes', async () => {
+  const pinnedEnv = (h: Harness): Record<string, string> => (JSON.parse(readFileSync(h.options().settings as string, 'utf8')) as { env: Record<string, string> }).env;
+  // Default: the switch is on the child and in the file a settings source makes the driver write.
+  const off = harness({ cfg: { settingSources: ['project'] } });
+  await begin(off);
+  assert.equal(off.options().env![GIT_SWITCH], '1');
+  assert.equal(pinnedEnv(off)[GIT_SWITCH], '1');
+  assert.ok(!off.logs.some((l) => /git context is on/i.test(l)), 'and the default says nothing about git');
+  // Opt-in: absent from both, and the log says what was chosen, once.
+  const on = harness({ cfg: { settingSources: ['project'], gitContext: true } });
+  const q = await begin(on);
+  assert.ok(!(GIT_SWITCH in on.options().env!));
+  assert.ok(!(GIT_SWITCH in pinnedEnv(on)));
+  assert.equal(on.logs.filter((l) => /git context is on/i.test(l)).length, 1);
+  assert.match(on.logs.find((l) => /git context is on/i.test(l)) ?? '', /\.git\/config can run a program with no question asked/);
+  // A second query (the CLI went away between turns) does not repeat the warning, and is built the same way.
+  q.push(resultOk('done'));
+  await settle();
+  q.end();
+  await settle();
+  await begin(on, 'again');
+  assert.equal(on.logs.filter((l) => /git context is on/i.test(l)).length, 1);
+  assert.ok(!(GIT_SWITCH in on.options(1).env!), 'the second query is built the same way');
+  // With no settings source there is no pinned file at all, and the child's environment alone decides.
+  const bare = harness({ cfg: { gitContext: true } });
+  await begin(bare);
+  assert.ok(!(GIT_SWITCH in bare.options().env!));
+  assert.equal(bare.options().settings, undefined);
+  // `gitContext: false` is the default spelled out.
+  const explicit = harness({ cfg: { gitContext: false } });
+  await begin(explicit);
+  assert.equal(explicit.options().env![GIT_SWITCH], '1');
 });
 
 test('the pinned environment forces the two background switches and the public API, whatever the operator passed', () => {

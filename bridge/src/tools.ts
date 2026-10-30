@@ -47,7 +47,7 @@
  * (see "COVERAGE" below); the tests exercise both columns so the list cannot rot.
  */
 
-import { lstatSync, readlinkSync, realpathSync } from 'node:fs';
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, readlinkSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { posix } from 'node:path';
 import type { DescribeTool, Risk, ToolView } from './types.ts';
@@ -333,12 +333,28 @@ export const SECRET_LISTS = {
     '.tamaclaude-token', '.local/state/tamaclaude-bridge',
   ],
   /**
-   * `<dir>/<name>` (lower case, compared case-insensitively): the second is a secret only beneath the first. `.git/config`
-   * can carry a remote URL with a token in it (the rest of `.git` is not a secret); the personal, git-ignored settings
-   * file is where a project's env and tokens go; the macOS keychains live under Library. A pair, not a home-relative
-   * root, so a glob such as `~/*` is not a warning only because `Library` is a directory that contains one.
+   * `<dir>/<name>` (lower case, compared case-insensitively): the second is a secret only beneath the first. The
+   * personal, git-ignored settings file is where a project's env and tokens go; the macOS keychains live under Library.
+   * A pair, not a home-relative root, so a glob such as `~/*` is not a warning only because `Library` is a directory
+   * that contains one. (Git's own files are `gitDirNames`: a pair only ever matched the name right after `.git`, and
+   * that is how `.git/modules/<name>/config` came to be free to read while `.git/config` was not.)
    */
-  pairs: [['.git', 'config'], ['.claude', 'settings.local.json'], ['library', 'keychains']],
+  pairs: [['.claude', 'settings.local.json'], ['library', 'keychains']],
+  /**
+   * What a git directory keeps its logins and its URLs in. A remote URL can carry a token (`https://user:TOKEN@host/x`, or an
+   * `http.extraheader` a CI checkout wrote), so each of these is a secret store when it comes AFTER a git directory's name
+   * anywhere in the path, at any depth and whatever stands between them:
+   *   .git/config                              the repository's own
+   *   .git/config.worktree                     the per-worktree one
+   *   .git/modules/<name>/config               a submodule's (its git directory lives inside the superproject's)
+   *   .git/worktrees/<name>/config.worktree    a linked worktree's
+   *   .git/remotes/<name>, .git/branches/<name>  the legacy remote definitions, one URL per file
+   *   .git/credentials                         what `credential.helper store --file` writes
+   * The rest of a git directory (HEAD, refs, objects, logs, hooks) is not a secret and stays free to read. "A git
+   * directory's name" is `.git` or a bare repository's `<project>.git`; a git directory that has neither (a separate git
+   * dir, a submodule's absorbed one reached by its real name) is found by what it contains, see `gitDirSecret` in `makeLander`.
+   */
+  gitDirNames: ['config', 'config.worktree', 'credentials', 'remotes', 'branches'],
   /** `.<name>` dotfiles that carry a login. */
   dotfiles: [
     'npmrc', 'netrc', 'pypirc', 'git-credentials', 'pgpass', 'my.cnf', 's3cfg', 'boto', 'htpasswd', 'vault-token', 'dockercfg', 'terraformrc',
@@ -521,11 +537,71 @@ function configComps(comps: string[]): boolean {
 /** The longest a single file name can be on any file system we run on. */
 const MAX_NAME = 255;
 
-/** Secret stores: reading one hands the model credentials, writing one changes who the machine trusts. */
-function sensitiveComps(comps: string[]): boolean {
+// -- git directories --------------------------------------------------------------------------------
+//
+// THE RULE IS "AFTER A GIT DIRECTORY", NOT "RIGHT AFTER `.git`". It was `['.git', 'config']`, a pair that only matches
+// the component immediately following `.git`, so `.git/modules/<name>/config` (a submodule's remote URL and any
+// extraheader a CI checkout wrote), `.git/config.worktree` and `.git/worktrees/<name>/config.worktree` were free to Read
+// with no tap while `.git/config` was rated high: one rule enforced for one layout and not for its twins. Once a git
+// directory's name has been seen, any LATER component that is one of `gitDirNames` (or a backup of one) is the secret.
+
+const GIT_DIR_NAMES: ReadonlySet<string> = new Set(SECRET_LISTS.gitDirNames);
+
+/** `.git`, or a bare repository's `<project>.git`: a component beneath which git keeps its own files. Lower case in, as everywhere. */
+const isGitDirName = (c: string): boolean => c === '.git' || (c.length > '.git'.length && c.endsWith('.git'));
+
+/** Is this (lower-case) file name one of the files a git directory keeps logins in, or a backup of one (`config.bak`)? */
+function isGitInner(c: string): boolean {
+  return GIT_DIR_NAMES.has(c) || backupBases(c).some((b) => GIT_DIR_NAMES.has(b));
+}
+
+/**
+ * Could this glob component name a git directory? `.g*`, `.gi?`, `.git*` can be `.git`; `*.git` can be a bare repository.
+ * A pattern that matches `x.git` and `x.gitz` alike (`*`, `*.*`) constrains nothing and is not read as one: `*\/config`
+ * is a search for config directories, not for git's.
+ */
+function globCouldBeGitDir(comp: string): boolean {
+  const toks = compileGlob(comp);
+  if (toks === undefined) return false;
+  return (comp.startsWith('.') && runGlob(toks, '.git')) || (runGlob(toks, 'x.git') && !runGlob(toks, 'x.gitz'));
+}
+
+/**
+ * `comps` (from `skip` on) contains a git directory's name followed by a glob or a name that could be one of its secret
+ * files: `.g?t/config`, `.git/c*`, `.git/modules/*\/config`. Matched, never expanded (the same rule as every glob here).
+ * `word` is the text the components came from, and a word nobody typed (`tooWild`) is not matched: it is rated high elsewhere.
+ */
+function globHitsGitDir(comps: readonly string[], skip: number, word: string): boolean {
+  if (!GLOB_CHARS.test(word) || tooWild(word)) return false;
+  let inGit = false;
+  for (let i = skip; i < comps.length; i++) {
+    const c = comps[i]!;
+    const wild = GLOB_CHARS.test(c);
+    if (inGit) {
+      if (!wild) {
+        if (isGitInner(c.toLowerCase())) return true;
+      } else {
+        const toks = compileGlob(c);
+        if (toks !== undefined && SECRET_LISTS.gitDirNames.some((n) => runGlob(toks, n))) return true;
+      }
+    }
+    if (!inGit) inGit = wild ? globCouldBeGitDir(c) : isGitDirName(c.toLowerCase());
+  }
+  return false;
+}
+
+/**
+ * Secret stores: reading one hands the model credentials, writing one changes who the machine trusts.
+ * `skip` is where the part of the path INSIDE the working directory starts: a git directory's name ABOVE the working
+ * directory (a project that lives under `repo.git/`) does not turn every `config/` of the project into a secret.
+ */
+function sensitiveComps(comps: string[], skip = 0): boolean {
+  let inGit = false;
   for (let i = 0; i < comps.length; i++) {
     const c = comps[i]!.toLowerCase();
     const next = (comps[i + 1] ?? '').toLowerCase();
+    const afterGit = inGit;
+    if (i >= skip && isGitDirName(c)) inGit = true;
     if (SECRET_DIRS.has(c) || SECRET_PROJECT_DIRS.has(c)) return true;
     if (c === '.config' && SECRET_CONFIG_APPS.has(next)) return true;
     for (const [a, b] of SECRET_LISTS.pairs) if (c === a && next === b) return true;
@@ -535,6 +611,7 @@ function sensitiveComps(comps: string[]): boolean {
     const isFile = i === comps.length - 1;
     // The name itself, and every name it may be a backup or an editor copy of.
     const names = [c, ...backupBases(c)];
+    if (afterGit && names.some((n) => GIT_DIR_NAMES.has(n))) return true;
     if (names.includes('.claude.json')) return true; // OAuth account, MCP server environments
     for (const name of names) {
       if (ENV_TEMPLATE_RE.test(name)) continue;
@@ -644,6 +721,11 @@ interface PathInfo {
   inside: boolean;
   /** Components relative to the session cwd when inside it, otherwise all of them. */
   comps: string[];
+  /**
+   * How many leading components of the absolute path are the working directory itself (0 when the path is not inside it). A git
+   * directory's name ABOVE the working directory says nothing about the files beneath it.
+   */
+  skip: number;
   config: boolean;
   hidden: boolean;
   /** A secret store, or a glob that could name one. */
@@ -684,12 +766,14 @@ function inspectPath(raw: string, resolveFrom: string | undefined, baseCwd: stri
     comps = norm.split('/').filter((c) => c !== '' && c !== '.');
   }
   const all = norm.split('/').filter((c) => c !== '' && c !== '.');
-  const lit = sensitiveComps(all) || sensitiveAbs(norm, home) || globHitsSecretRoot(abs ?? norm, home);
+  const skip = abs !== undefined && baseCwd !== undefined && inside ? all.length - comps.length : 0;
+  const lit = sensitiveComps(all, skip) || sensitiveAbs(norm, home) || globHitsSecretRoot(abs ?? norm, home) || globHitsGitDir(all, skip, raw);
   return {
     abs,
     norm,
     inside,
     comps,
+    skip,
     config: configComps(all) || globHitsConfig(raw),
     hidden: comps.some((c) => c.startsWith('.') && c !== '..'),
     sensitive: lit || globHitsSecret(raw),
@@ -717,6 +801,10 @@ function displayPath(info: PathInfo, baseCwd: string | undefined): string {
 // and a normaliser's), and what it lands on is judged by the same rules as what it says. A path that
 // goes through a link is never rated 'low': whatever the link's target, the panel would otherwise show
 // the human a place other than the one that is read or written, so it says both.
+//
+// A `.git` POINTER FILE (`gitdir: ../.git/modules/sub`, what a submodule checkout, a linked worktree and
+// `--separate-git-dir` have instead of a directory) is a link in all but name: the kernel stops at it (ENOTDIR), git goes on in
+// the directory it names. When a path continues below such a file, the walk continues there too, and the path counts as linked.
 //
 // What is NOT done: a wildcard component is matched against the secret lists, never EXPANDED against
 // the file system, so a pattern that merely could match a link (`g?/config` with a link `g0`) is not
@@ -756,7 +844,7 @@ const MAX_WALK_STEPS = 1024;
 interface Walk {
   /** The place the path lands: absolute, with no link in it. */
   real: string;
-  /** At least one link was followed on the way (links in the working directory's own prefix do not count). */
+  /** At least one link was followed on the way (links in the working directory's own prefix do not count), or a `.git` pointer file. */
   linked: boolean;
   /** A loop, a path too deep to walk, an error that is not plain absence, or the work bound ran out. */
   broken: boolean;
@@ -765,6 +853,37 @@ interface Walk {
 interface Resolver {
   /** Walk `comps` (names, `.` and `..`) starting from `base`, a real absolute directory. Never throws. */
   walk(base: string, comps: readonly string[]): Walk;
+  /** What `abs` is (from the cache when this analysis has already asked), or undefined when the work bound ran out. */
+  kind(abs: string): Kind | undefined;
+}
+
+/** A `.git` pointer file is one short line (`gitdir: <path>`); nothing past this is read. */
+const POINTER_MAX = 4096;
+
+/**
+ * The target of a `.git` pointer file, or undefined when `path` is not one. O_NONBLOCK and an fstat first: a FIFO or a device
+ * named `.git` in a hostile project must not park the bridge's only thread in open(2) or read(2).
+ */
+function readGitdirPointer(path: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW);
+    if (!fstatSync(fd).isFile()) return undefined;
+    const buf = Buffer.alloc(POINTER_MAX);
+    const n = readSync(fd, buf, 0, POINTER_MAX, 0);
+    const first = buf.toString('utf8', 0, n).split(/\r?\n/, 1)[0] ?? '';
+    return /^gitdir:[ \t]*(.+?)[ \t]*$/.exec(first)?.[1];
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // nothing to do about a descriptor that will not close
+      }
+    }
+  }
 }
 
 /**
@@ -783,10 +902,22 @@ function makeResolver(charge?: (units: number) => boolean): Resolver {
     kinds.set(path, k);
     return k;
   };
+  /** `.git` followed by a name that could be a place beneath it (not `..`): the only time a pointer file is worth reading. */
+  const continuesBelow = (pending: readonly string[]): boolean => {
+    for (let i = pending.length - 1; i >= 0; i--) {
+      const n = pending[i]!;
+      if (n === '' || n === '.') continue;
+      return n !== '..';
+    }
+    return false;
+  };
   return {
+    kind: kindOf,
     walk(base, comps) {
       const cur = base.split('/').filter((c) => c !== '');
-      if (comps.length > MAX_WALK_COMPS) return { real: posix.join(base, ...comps.filter((c) => c !== '..')), linked: false, broken: true };
+      if (comps.length > MAX_WALK_COMPS) {
+        return { real: posix.join(base, ...comps.filter((c) => c !== '..')), linked: false, broken: true };
+      }
       const pending: string[] = [];
       for (let i = comps.length - 1; i >= 0; i--) pending.push(comps[i]!);
       let hops = 0;
@@ -823,6 +954,28 @@ function makeResolver(charge?: (units: number) => boolean): Resolver {
               for (let i = tc.length - 1; i >= 0; i--) pending.push(tc[i]!);
               continue;
             }
+          } else if (k.t === 'file' && c.toLowerCase() === '.git' && continuesBelow(pending)) {
+            // A submodule, a linked worktree or a separate git directory has a `.git` FILE, not a directory. The kernel stops there
+            // (ENOTDIR), git does not: it goes on in the directory the file names, and so is the path judged. Whatever the pointer
+            // says is read at most once per analysis and charged like any other file system call.
+            if (charge !== undefined && !charge(1)) {
+              broken = true;
+              gone = true;
+            } else {
+              const target = readGitdirPointer('/' + [...cur, c].join('/'));
+              if (target !== undefined) {
+                linked = true;
+                if (++hops > MAX_HOPS) {
+                  broken = true;
+                  gone = true;
+                } else {
+                  if (target.startsWith('/')) cur.length = 0;
+                  const tc = target.split('/');
+                  for (let i = tc.length - 1; i >= 0; i--) pending.push(tc[i]!);
+                  continue;
+                }
+              }
+            }
           }
         }
         cur.push(c);
@@ -841,6 +994,9 @@ interface Landing {
   info: PathInfo;
 }
 
+/** A path with more candidate names than this under a directory that might be a git directory is not probed any further: it is a secret. */
+const MAX_GIT_PROBES = 8;
+
 interface Lander {
   /**
    * Every place `abs` can land. `abs` is the lexical (normalised) path; `rawAbs` the same with its `..`
@@ -852,6 +1008,11 @@ interface Lander {
   of(abs: string, o?: { rawAbs?: string | undefined }): Landing[];
   /** The working directory's own display of a real path: relative when it lies inside. */
   show(l: Landing): string;
+  /**
+   * Would a recursive SEARCH that starts at this landing walk into a git directory? A directory in or beneath one, or one that
+   * IS one (it holds HEAD and objects), is full of files a search reads, `config` among them; a file is judged by its name alone.
+   */
+  searchesGit(l: Landing): boolean;
 }
 
 function makeLander(rv: Resolver, cwd: string | undefined, home: string): Lander {
@@ -867,6 +1028,31 @@ function makeLander(rv: Resolver, cwd: string | undefined, home: string): Lander
     return realCwd;
   };
   const prefix = cwd === undefined ? undefined : cwd === '/' ? '/' : cwd + '/';
+  /** A git directory holds HEAD and either its objects or (a linked worktree's private one) a pointer to the common directory. */
+  const looksLikeGitDir = (dir: string): boolean => {
+    const at = (name: string): Kind | undefined => rv.kind(`${dir === '/' ? '' : dir}/${name}`);
+    const head = at('HEAD');
+    if (head === undefined) return true; // the work bound ran out: the analysis is being refused, and is not told it was free
+    if (head.t !== 'file' && head.t !== 'link') return false;
+    const objects = at('objects');
+    const common = at('commondir');
+    return objects === undefined || common === undefined || objects.t === 'dir' || common.t === 'file' || common.t === 'link';
+  };
+  /**
+   * Is `w.real` a secret file of a git directory that carries no git NAME (`store/config` beside `store/HEAD` and `store/objects`: a
+   * `--separate-git-dir`, a submodule's absorbed directory reached by its real name)? It is known by what the directory that holds
+   * the file holds. (One called `.git` or `<project>.git` is judged by its name, in `sensitiveComps`, with no file system call.)
+   */
+  const gitDirSecret = (w: Walk, info: PathInfo): boolean => {
+    const comps = w.real.split('/').filter((c) => c !== '');
+    let probes = 0;
+    for (let i = info.skip; i < comps.length; i++) {
+      if (!isGitInner(comps[i]!.toLowerCase())) continue;
+      if (++probes > MAX_GIT_PROBES) return true;
+      if (looksLikeGitDir('/' + comps.slice(0, i).join('/'))) return true;
+    }
+    return false;
+  };
   const land = (v: string): Landing => {
     // The part of the path inside the working directory starts from its real self: a link in the cwd's own
     // prefix (/tmp on macOS) is how the session was started, not something the path goes through.
@@ -876,7 +1062,14 @@ function makeLander(rv: Resolver, cwd: string | undefined, home: string): Lander
         ? rv.walk(rc, v.slice(cwd.length).split('/'))
         : rv.walk('/', v.split('/'));
     // Judged like any path, glob rules included: what a pattern lands on still has the pattern's wildcards in its tail.
-    return { real: w.real, linked: w.linked, broken: w.broken, info: inspectPath(w.real, undefined, rc, home) };
+    const info = inspectPath(w.real, undefined, rc, home);
+    const git = !info.sensitive && gitDirSecret(w, info);
+    return {
+      real: w.real,
+      linked: w.linked,
+      broken: w.broken,
+      info: git ? { ...info, sensitive: true, sensitiveLiteral: true } : info,
+    };
   };
   return {
     of(abs, o = {}) {
@@ -886,7 +1079,7 @@ function makeLander(rv: Resolver, cwd: string | undefined, home: string): Lander
       const seen = new Set<string>();
       for (const v of variants) {
         const l = land(v);
-        const key = `${l.real}\0${l.linked}\0${l.broken}`;
+        const key = `${l.real}\0${l.linked}\0${l.broken}\0${l.info.sensitive}`;
         if (seen.has(key)) continue;
         seen.add(key);
         out.push(l);
@@ -896,6 +1089,12 @@ function makeLander(rv: Resolver, cwd: string | undefined, home: string): Lander
     show(l) {
       const rc = real();
       return l.info.inside && rc !== undefined ? posix.relative(rc, l.real) || '.' : l.real;
+    },
+    searchesGit(l) {
+      if (rv.kind(l.real)?.t !== 'dir') return false;
+      const comps = l.real.split('/').filter((c) => c !== '');
+      for (let i = l.info.skip; i < comps.length; i++) if (isGitDirName(comps[i]!.toLowerCase())) return true;
+      return looksLikeGitDir(l.real);
     },
   };
 }
@@ -2079,7 +2278,7 @@ function analyzeSeg(seg: Seg, depth: number, st: State): void {
       // (/dev/stdout and its siblings are links into /proc by design, and are what they say they are.)
       if (info.abs !== undefined && st.baseCwd !== undefined && !SAFE_DEV_RE.test(alt)) {
         for (const l of st.lander.of(info.abs, { rawAbs: rawAbsOf(alt, st.cwd, st.home) })) {
-          if (l.broken || l.info.sensitiveLiteral || (searches && reachesSecret(l.real, st.home))) st.high = true;
+          if (l.broken || l.info.sensitiveLiteral || (searches && (reachesSecret(l.real, st.home) || st.lander.searchesGit(l)))) st.high = true;
           if (ni < wordCount && !readOnly && l.info.config) noteDeny(st, CONFIG_REASON);
         }
       }
@@ -2297,7 +2496,7 @@ function viewReader(name: string, input: Record<string, unknown>, cwd: string | 
       if (l.linked || l.broken) risk = raiseTo(risk, 'high');
       if (l.info.sensitive) risk = raiseTo(risk, 'high');
       else if (!l.info.inside) risk = raiseTo(risk, 'med');
-      if (name === 'Grep' && isStart && reachesSecret(l.real, home)) risk = raiseTo(risk, 'high');
+      if (name === 'Grep' && isStart && (reachesSecret(l.real, home) || lander.searchesGit(l))) risk = raiseTo(risk, 'high');
       if (l.linked && shown === undefined) shown = l;
     }
   }

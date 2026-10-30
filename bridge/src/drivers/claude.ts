@@ -35,6 +35,14 @@
  *     `# auto memory` section in the system prompt and the text of `projects/<project>/memory/MEMORY.md`
  *     in the first request, written by earlier unbridged sessions and read with no tap. It is switched
  *     off in the child's environment (AUTO_MEMORY_SWITCH), so "no source loaded" means what the banner says.
+ *     A SECOND ONE CAME FROM THE REPOSITORY'S `.git` (measured): at start-up the CLI runs `git` in the working
+ *     directory (a status, a log, a config read) to tell the model the branch and the recent commits. It turns off
+ *     git's hooks and file-system monitor for them and NOT its filters, so a `filter.<name>.clean` program in the
+ *     repository's own `.git/config` ran, with no ask and no settings loaded. The CLI's switch for those commands is
+ *     set by default here (GIT_SWITCH): the cost is the branch, status and commits in the prompt, which a voice
+ *     session hardly needs. Three read-only git commands of its own remain (test/support/git-commands.ts lists them,
+ *     and the real-CLI suite holds the list to the CLI). `gitContext: true` (`--git-context`) is the operator's
+ *     explicit way back.
  *     `settingSources: ['project', 'local']` is an explicit opt-in (`--setting-sources`), and a repository you
  *     do not trust must never be run that way.
  *
@@ -157,6 +165,14 @@ export interface ClaudeDriverConfig {
    */
   projectMemory?: string;
   /**
+   * OPT-IN: let the CLI run `git` in the working directory when it starts, so the prompt carries the branch, the
+   * status and the recent commits. Default false, which sets GIT_SWITCH in the child's environment and in the pinned
+   * settings. On, a `filter.<name>.clean` program in the repository's own `.git/config` can run with no question asked
+   * (the CLI turns off git's hooks and file-system monitor for those commands, not its filters), so it is only for a
+   * repository whose `.git` directory the operator trusts. See the file header.
+   */
+  gitContext?: boolean;
+  /**
    * How long a turn may go without ANY event from the CLI before the driver gives up on it,
    * interrupts, and ends the turn with `{ ok: false, subtype: 'stalled' }`. Paused while a tool
    * is running or a permission request is open, which are quiet for good reasons. Default
@@ -264,9 +280,28 @@ export const CHILD_ENV_PREFIXES: readonly string[] = ['LC_', 'XDG_'];
 export const AUTO_MEMORY_SWITCH = 'CLAUDE_CODE_DISABLE_AUTO_MEMORY';
 
 /**
+ * The variable that stops the CLI's OWN git commands that build the context. Without it, the CLI runs `git status`,
+ * `git log` and `git config user.name` in the working directory as it starts and puts the result in the first request as
+ * the branch, the status and the recent commits. Git reads the repository's `.git/config` for every one of them, and a
+ * `filter.<name>.clean` program defined there runs while git hashes a file that differs from its index entry (the CLI
+ * turns off hooks and the file-system monitor for these commands, and not filters), so a repository that arrived WITH its
+ * `.git` directory could run a program before any tool call existed for the device to be asked about. Measured on the
+ * bundled CLI (test/real-cli.integration.test.ts, with a control run that removes this variable and shows the filter
+ * running and the git context in the prompt; the same scenario with `gitContext: true` is the opt-in).
+ *
+ * WHAT IT DOES NOT STOP, measured the same way: three read-only commands the CLI runs for its own purposes (an index
+ * lookup of its local settings file, the remote's name and URL). They hash no file, so they apply no filter; the test
+ * plants a filter, a file-system monitor and a hooks directory and none of them runs. The reviewed list is
+ * test/support/git-commands.ts, and a command that is not on it fails the real-CLI suite.
+ */
+export const GIT_SWITCH = 'CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS';
+
+/**
  * Names `passEnv` may not carry. The token is the credential that would let the child
  * impersonate the device; the others are set by the driver and an operator must not be
- * able to undo them (the key is the configured one, background work and workflows stay off).
+ * able to undo them (the key is the configured one, background work, workflows, the CLI's own
+ * memory and its own git commands stay off). Git is the operator's to turn on, but only by the
+ * explicit `gitContext` setting, which prints a warning: a bare environment name is not that.
  */
 export const NEVER_PASS: ReadonlySet<string> = new Set([
   'BRIDGE_TOKEN',
@@ -274,6 +309,7 @@ export const NEVER_PASS: ReadonlySet<string> = new Set([
   'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS',
   'CLAUDE_CODE_DISABLE_WORKFLOWS',
   AUTO_MEMORY_SWITCH,
+  GIT_SWITCH,
 ]);
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -283,11 +319,21 @@ export interface ChildEnv {
   refused: string[];
 }
 
+export interface ChildEnvOptions {
+  /** Leave the CLI's own git commands on (`--git-context`). Default false: GIT_SWITCH is set. */
+  gitContext?: boolean;
+}
+
 /**
  * The child's whole environment (the SDK REPLACES it when `env` is set, so nothing is
  * inherited behind this function's back).
  */
-export function buildChildEnv(source: NodeJS.ProcessEnv, apiKey: string, passEnv: readonly string[] = []): ChildEnv {
+export function buildChildEnv(
+  source: NodeJS.ProcessEnv,
+  apiKey: string,
+  passEnv: readonly string[] = [],
+  options: ChildEnvOptions = {},
+): ChildEnv {
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(source)) {
     if (typeof value !== 'string') continue;
@@ -315,6 +361,11 @@ export function buildChildEnv(source: NodeJS.ProcessEnv, apiKey: string, passEnv
   // The CLI's own memory is not the project's memory the bridge hands over (src/memory.ts) and not something
   // the device could be asked about: see AUTO_MEMORY_SWITCH.
   env[AUTO_MEMORY_SWITCH] = '1';
+  // The CLI's own git commands read the repository's `.git/config`, which can run a program (see GIT_SWITCH). Off unless the
+  // operator asked for git context by name. The `delete` is for the other branch: with the context on, nothing above may have
+  // left the switch behind (the allowlist does not carry it and passEnv refuses it, so this is a second barrier).
+  if (options.gitContext === true) delete env[GIT_SWITCH];
+  else env[GIT_SWITCH] = '1';
   return { env, refused };
 }
 
@@ -400,8 +451,9 @@ export interface PinnedSettings {
  *
  *  - `env`: each pinned to what the OPERATOR gave the child, else to nothing (see the PIN_* lists
  *    for the reason each group is there), with ANTHROPIC_BASE_URL defaulting to the public API and
- *    background work and workflows forced off. Proxy URLs can carry a password, which is why this
- *    goes in a 0600 file and not in the command line, where `ps` would show it.
+ *    background work, workflows, the CLI's own memory and (unless `gitContext`) its own git commands forced
+ *    off. Proxy URLs can carry a password, which is why this goes in a 0600 file and not in the command line,
+ *    where `ps` would show it.
  *  - Command-bearing keys, blanked (see PIN_COMMAND_KEYS and PIN_COMMAND_OBJECT_KEYS).
  *  - `disableAllHooks`: a repository's command hooks do not run even when the policy tier is not in
  *    force (measured: SessionStart and UserPromptSubmit hooks ran without it). The driver's own SDK
@@ -430,7 +482,7 @@ export interface PinnedSettings {
  *     headless experiment, but there is no control showing a plugin CAN run there, so it is unmeasured).
  *   `settingSources: []` covers all of these at once, which is why it is the default.
  */
-export function pinnedSettings(childEnv: Readonly<Record<string, string>>): PinnedSettings {
+export function pinnedSettings(childEnv: Readonly<Record<string, string>>, gitContext = false): PinnedSettings {
   const env: Record<string, string> = {};
   for (const name of [...PIN_PROXY_NAMES, ...PIN_PROVIDER_SELECTORS, ...PIN_ENDPOINT_NAMES, ...PIN_CREDENTIAL_NAMES, ...PIN_FEATURE_NAMES, ...PIN_HIJACK_NAMES]) {
     const own = childEnv[name];
@@ -443,6 +495,9 @@ export function pinnedSettings(childEnv: Readonly<Record<string, string>>): Pinn
   // A repository's `env` could otherwise switch the CLI's own memory back on (and `autoMemoryDirectory` point it
   // at any directory the settings name).
   env[AUTO_MEMORY_SWITCH] = '1';
+  // And a repository's `env` could switch the CLI's git commands back on. Not pinned when the operator asked for git context:
+  // a repository that SWITCHES THEM OFF is harmless, and a pin would undo the operator's choice.
+  if (!gitContext) env[GIT_SWITCH] = '1';
   const pinned: PinnedSettings = { env, disableAllHooks: true, disableWorkflows: true, disableSkillShellExecution: true };
   for (const key of PIN_COMMAND_KEYS) pinned[key] = '';
   for (const key of PIN_COMMAND_OBJECT_KEYS) pinned[key] = { type: 'command', command: '' };
@@ -680,6 +735,8 @@ class ClaudeDriver implements SessionDriver {
   #lastActivity = 0;
   /** The "settings are loaded" warning has been logged, and the lock asked about. */
   #warnedSources = false;
+  /** The "git context is on" warning has been logged. */
+  #warnedGit = false;
   /** The pinned settings file, once written, and the directory to remove with it (when ours). */
   #pinFile: string | undefined;
   #pinDir: string | undefined;
@@ -1031,8 +1088,16 @@ class ClaudeDriver implements SessionDriver {
   #buildOptions(run: Run): Options {
     const cfg = this.#cfg;
     const apiKey = cfg.apiKey.trim();
-    const { env, refused } = buildChildEnv(this.#deps.env ?? process.env, apiKey, cfg.passEnv);
+    const gitContext = cfg.gitContext === true;
+    const { env, refused } = buildChildEnv(this.#deps.env ?? process.env, apiKey, cfg.passEnv, { gitContext });
     if (refused.length > 0) this.#log(`ignored environment names that may not be passed: ${refused.join(', ')}`);
+    if (gitContext && !this.#warnedGit) {
+      this.#warnedGit = true;
+      this.#log(
+        'WARNING: git context is on. Claude Code runs git in the working directory when it starts, and a filter in the ' +
+          "repository's own .git/config can run a program with no question asked. Only for a repository whose .git you trust.",
+      );
+    }
     const sources = cfg.settingSources ?? [];
     if ((sources.includes('project') || sources.includes('local')) && !this.#warnedSources) {
       this.#warnedSources = true;
@@ -1079,7 +1144,7 @@ class ClaudeDriver implements SessionDriver {
     // to outrank, and writing them would only cost: a file on disk that can hold a proxy password, a
     // few dozen blank variables in every approved command's environment, and GIT_SSH_COMMAND set to a
     // value that overrides a person's own core.sshCommand. So no file, and no `settings` option.
-    if (sources.length > 0) options.settings = this.#pinFilePath(env);
+    if (sources.length > 0) options.settings = this.#pinFilePath(env, gitContext);
     if (this.#sessionId !== undefined) options.resume = this.#sessionId;
     if (cfg.model !== undefined) options.model = cfg.model;
     if (cfg.maxTurns !== undefined) options.maxTurns = cfg.maxTurns;
@@ -1109,7 +1174,7 @@ class ClaudeDriver implements SessionDriver {
   }
 
   /** Write the pinned settings once and hand the CLI the path. Throws, which fails the start: better than an unpinned key. */
-  #pinFilePath(env: Record<string, string>): string {
+  #pinFilePath(env: Record<string, string>, gitContext: boolean): string {
     if (this.#pinFile !== undefined) return this.#pinFile;
     let dir = this.#deps.settingsDir;
     if (dir === undefined) {
@@ -1117,7 +1182,7 @@ class ClaudeDriver implements SessionDriver {
       this.#pinDir = dir;
     }
     const file = join(dir, 'bridge-settings.json');
-    writeFileSync(file, JSON.stringify(pinnedSettings(env)), { mode: 0o600 });
+    writeFileSync(file, JSON.stringify(pinnedSettings(env, gitContext)), { mode: 0o600 });
     this.#pinFile = file;
     return file;
   }
