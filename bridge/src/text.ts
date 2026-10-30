@@ -142,8 +142,70 @@ const QUOTE = /^\s{0,3}(?:>\s?)+/;
 const HEADING = /^\s{0,3}#{1,6}\s+/;
 const LIST_ITEM = /^\s*(?:[-*+]|\d{1,9}[.)])\s+/;
 const CHECKBOX = /^\[[ xX]\]\s+/;
-const EMPHASIS = /[`*_~|]/g;
 const TERMINAL = /[.!?:;]['")\]]*$/;
+
+// ---------------------------------------------------------------------------
+// Inline markup
+//
+// Markup is removed ONLY where it forms markup. The first version deleted every `*`, `_`, `~`, backtick and
+// pipe, which turned "I removed ~/build" into "I removed /build", "snake_case_name" into "snakecasename" and
+// "5 * 3" into "5 3": a safety-relevant answer reached the device saying the opposite of what it meant. A
+// delimiter counts as markup when it opens or closes a span the way markdown requires:
+//   - `*x*`, `**x**`, `***x***`, `_x_`, `~~x~~`: the opener is at the start of a word and is followed by a
+//     character that is not a space, the closer follows one and ends the word. So `a*b*c`, `snake_case_name`
+//     and `5 * 3` are untouched, and so are `~/build` and `a ~ b` (a single tilde is never markup).
+//   - `__x__`: bold, but only when it holds more than one word. `__init__.py` is a name, and `__main__` too.
+//   - backticks: the code markers go, the code stays.
+//   - a pipe, only in a table row.
+// Every pattern is a bounded repeat anchored to a delimiter, so a line of unmatched openers rescans at most
+// 200 characters from each; and nothing here is `\s+X$`, which is quadratic on a long run of spaces.
+// ---------------------------------------------------------------------------
+
+// A span of emphasis is looked for up to 200 characters long (the `{1,200}` below): a longer one is not worth the rescans.
+const BOLD_ITALIC = /(^|[^\w*\\])\*{3}(?=[^\s*])([^*\n]{1,200}?)(?<=[^\s*\\])\*{3}(?![\w*])/g;
+const BOLD_STAR = /(^|[^\w*\\])\*{2}(?=[^\s*])([^*\n]{1,200}?)(?<=[^\s*\\])\*{2}(?![\w*])/g;
+const ITALIC_STAR = /(^|[^\w*\\])\*(?=[^\s*])([^*\n]{1,200}?)(?<=[^\s*\\])\*(?![\w*])/g;
+const BOLD_UNDER = /(^|[^\w\\])__(?=[^\s_])([^_\n]{1,200}?)(?<=[^\s_\\])__(?!\w)/g;
+const ITALIC_UNDER = /(^|[^\w\\])_(?=[^\s_])([^_\n]{1,200}?)(?<=[^\s_\\])_(?!\w)/g;
+const STRIKE = /(^|[^\w~\\])~~(?=[^\s~])([^~\n]{1,200}?)(?<=[^\s~\\])~~(?![\w~])/g;
+const ESCAPED = /\\([*_~`])/g;
+const MARKUP_CHARS = /[*_~`\\]/;
+
+/**
+ * `text` (already ASCII, single spaces) without the markdown emphasis, strike and code markers that form markup (see above).
+ * Taking a marker out can leave two spaces side by side or a space at an end ("a ` b"), which the panel must not get, so a
+ * changed text is tidied. `final` also turns an escaped marker (`\\*`) into the plain character: it is done ONCE, on the last
+ * pass, because the text goes through this twice (line by line, then as one paragraph) and an unescaped `*` would be read as
+ * emphasis the second time.
+ */
+function stripEmphasis(text: string, final: boolean): string {
+  if (!MARKUP_CHARS.test(text)) return text;
+  let t = text.replace(BOLD_ITALIC, '$1$2').replace(BOLD_STAR, '$1$2').replace(ITALIC_STAR, '$1$2');
+  t = t.replace(BOLD_UNDER, (m: string, pre: string, body: string) => (/\s/.test(body) ? pre + body : m));
+  t = t.replace(ITALIC_UNDER, '$1$2').replace(STRIKE, '$1$2');
+  t = t.replace(/`/g, '');
+  if (final) t = t.replace(ESCAPED, '$1');
+  return t === text ? text : t.replace(/ {2,}/g, ' ').trim();
+}
+
+/**
+ * The closing hashes of an ATX heading ("## Title ##"). A scan, because the obvious `/\s+#+\s*$/` is quadratic on a
+ * line with a long run of spaces and no hash at the end: 100 000 of them took eight seconds.
+ */
+function stripClosingHashes(line: string): string {
+  let end = line.length;
+  while (end > 0 && WS_CHAR.test(line[end - 1]!)) end--;
+  let hashes = end;
+  while (hashes > 0 && line[hashes - 1] === '#') hashes--;
+  if (hashes === end || hashes === 0 || !WS_CHAR.test(line[hashes - 1]!)) return line; // no hashes, or no space before them: part of the text
+  let keep = hashes;
+  while (keep > 0 && WS_CHAR.test(line[keep - 1]!)) keep--;
+  return line.slice(0, keep);
+}
+const WS_CHAR = /\s/;
+
+/** Punctuation that ends a sentence rather than an address. */
+const URL_TRAIL = ".,;:!?)]'\"";
 
 type LineKind = 'plain' | 'heading' | 'list' | 'table';
 
@@ -175,9 +237,11 @@ export function summarizeForDevice(markdown: string, max: number): string {
   s = s.replace(FENCE, '\n\n'); // a paragraph break, so prose either side does not run together
   s = s.replace(MD_LINK, '$1');
   s = s.replace(BARE_URL, (url) => {
-    // The sentence's own punctuation is not part of the address: keep it.
-    const tail = /[.,;:!?)\]'"]+$/.exec(url)?.[0] ?? '';
-    return `a link${tail}`;
+    // The sentence's own punctuation is not part of the address: keep it. (Scanned from the end: the regex that
+    // did this, `[.,;:!?)\]'"]+$`, retried from every character of a long run of dots, and 100 000 took ten seconds.)
+    let k = url.length;
+    while (k > 0 && URL_TRAIL.includes(url[k - 1]!)) k--;
+    return `a link${url.slice(k)}`;
   });
 
   const pieces: Piece[] = [];
@@ -197,7 +261,7 @@ export function summarizeForDevice(markdown: string, max: number): string {
     let kind: LineKind = 'plain';
     if (HEADING.test(line)) {
       kind = 'heading';
-      line = line.replace(HEADING, '').replace(/\s+#+\s*$/, '');
+      line = stripClosingHashes(line.replace(HEADING, ''));
     } else if (LIST_ITEM.test(line)) {
       kind = 'list';
       line = line.replace(LIST_ITEM, '').replace(CHECKBOX, '');
@@ -205,7 +269,8 @@ export function summarizeForDevice(markdown: string, max: number): string {
       kind = 'table';
     }
 
-    const flat = toAscii(line.replace(EMPHASIS, ''));
+    // A pipe is markup only in a table row; everywhere else it is a character the answer meant ("a | b", `ls | grep x`).
+    const flat = stripEmphasis(toAscii(kind === 'table' ? line.replace(/\|/g, ' ') : line), false);
     if (flat === '') continue; // nothing left once the markup is gone
     pieces.push({ text: flat, opens: afterBreak || afterHeading || kind !== 'plain' });
     afterBreak = false;
@@ -220,6 +285,9 @@ export function summarizeForDevice(markdown: string, max: number): string {
     }
     flat += p.text;
   }
+  // A span of emphasis that wrapped onto the next line has its two markers on different lines, so the pass above could not
+  // pair them; they are one paragraph now.
+  flat = stripEmphasis(flat, true);
   if (flat.length <= cap) return flat;
 
   const sentences = flat.split(/(?<=[.!?])\s+/);

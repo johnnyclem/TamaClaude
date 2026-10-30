@@ -31,6 +31,10 @@
  *     Settings type has 180 keys). With no sources, none of the above fired in any experiment.
  *     What a person loses is only the repository's CLAUDE.md, and the bridge supplies that itself
  *     as plain text (src/memory.ts, `projectMemory` below), so the cost is not the instructions.
+ *     ONE THING STILL CAME FROM `~/.claude` WITH NO SOURCES (measured): the CLI's own auto-memory, a
+ *     `# auto memory` section in the system prompt and the text of `projects/<project>/memory/MEMORY.md`
+ *     in the first request, written by earlier unbridged sessions and read with no tap. It is switched
+ *     off in the child's environment (AUTO_MEMORY_SWITCH), so "no source loaded" means what the banner says.
  *     `settingSources: ['project', 'local']` is an explicit opt-in (`--setting-sources`), and a repository you
  *     do not trust must never be run that way.
  *
@@ -148,6 +152,8 @@ export interface ClaudeDriverConfig {
    * This is how the repository's CLAUDE.md reaches the model when no settings are loaded. Pass it
    * only when `settingSources` lacks `'project'`: with that source the CLI loads CLAUDE.md itself
    * (and expands its `@imports`), so the text would arrive twice. '' or unset: no section.
+   * Whatever the text says, it cannot end its own quotation: any line that imitates one of the two marker lines
+   * is replaced where the section is composed (src/voice-prompt.ts `neutraliseMarkers`).
    */
   projectMemory?: string;
   /**
@@ -247,15 +253,27 @@ export const CHILD_ENV_NAMES: ReadonlySet<string> = new Set([
 export const CHILD_ENV_PREFIXES: readonly string[] = ['LC_', 'XDG_'];
 
 /**
+ * The variable that switches the CLI's OWN memory off. With no settings loaded the CLI still keeps one under
+ * `$CLAUDE_CONFIG_DIR/projects/<project>/memory/`: it tells the model about that directory in the system
+ * prompt, puts MEMORY.md in front of it (measured: `# auto memory`, then the index file's text), and tells it
+ * to write there, which the bridge's own rules always refuse. What an earlier, unbridged session left in that
+ * file is therefore read by the model with no tap. The name is the one in the bundled binary and in the
+ * red-team's measurement; test/real-cli.integration.test.ts plants a MEMORY.md and shows it reaching the model
+ * without this variable and not with it.
+ */
+export const AUTO_MEMORY_SWITCH = 'CLAUDE_CODE_DISABLE_AUTO_MEMORY';
+
+/**
  * Names `passEnv` may not carry. The token is the credential that would let the child
  * impersonate the device; the others are set by the driver and an operator must not be
  * able to undo them (the key is the configured one, background work and workflows stay off).
  */
-const NEVER_PASS: ReadonlySet<string> = new Set([
+export const NEVER_PASS: ReadonlySet<string> = new Set([
   'BRIDGE_TOKEN',
   'ANTHROPIC_API_KEY',
   'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS',
   'CLAUDE_CODE_DISABLE_WORKFLOWS',
+  AUTO_MEMORY_SWITCH,
 ]);
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -294,6 +312,9 @@ export function buildChildEnv(source: NodeJS.ProcessEnv, apiKey: string, passEnv
   // The Workflow tool starts background agents whatever the variable above says (measured), and
   // it is also on the unserved list; this removes it from the CLI's own tool set as well.
   env.CLAUDE_CODE_DISABLE_WORKFLOWS = '1';
+  // The CLI's own memory is not the project's memory the bridge hands over (src/memory.ts) and not something
+  // the device could be asked about: see AUTO_MEMORY_SWITCH.
+  env[AUTO_MEMORY_SWITCH] = '1';
   return { env, refused };
 }
 
@@ -419,6 +440,9 @@ export function pinnedSettings(childEnv: Readonly<Record<string, string>>): Pinn
   env.ANTHROPIC_BASE_URL = childEnv.ANTHROPIC_BASE_URL ?? API_BASE_DEFAULT;
   env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS = '1';
   env.CLAUDE_CODE_DISABLE_WORKFLOWS = '1';
+  // A repository's `env` could otherwise switch the CLI's own memory back on (and `autoMemoryDirectory` point it
+  // at any directory the settings name).
+  env[AUTO_MEMORY_SWITCH] = '1';
   const pinned: PinnedSettings = { env, disableAllHooks: true, disableWorkflows: true, disableSkillShellExecution: true };
   for (const key of PIN_COMMAND_KEYS) pinned[key] = '';
   for (const key of PIN_COMMAND_OBJECT_KEYS) pinned[key] = { type: 'command', command: '' };
@@ -581,27 +605,49 @@ const STALE_RESUME_TEXT = 'No conversation found with session ID';
 
 /** What a removed secret is replaced by. Not asterisks: text.ts reads those as markdown and eats them. */
 export const REDACTED = '[redacted]';
+/** The shortest configured key that is removed verbatim. Shorter would shred every message it happens to appear in. */
+export const KEY_MIN_LENGTH = 4;
 /** Key-shaped tokens: the `sk-` family (sk-ant-api03-..., sk-proj-...). `\b` keeps "task-" and "risk-" out. */
 const KEY_SHAPED = /\bsk-[A-Za-z0-9_-]{8,}/g;
-/** An Authorization value a gateway echoed. */
-const AUTH_VALUE = /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{16,}/g;
+/**
+ * The VALUE of a header, a field or a parameter that carries a credential, at any length and with or without a
+ * scheme word in front: `Authorization: Bearer abc`, `"authorization":"Basic Zm9v"`, `Proxy-Authorization: x`,
+ * `x-api-key: k`, `api_key=k`, `access_token: t`. The name is kept so the log still says what was echoed.
+ * The value stops at whitespace, a quote, a bracket or a separator, and may not START with `[`, which keeps
+ * the placeholder itself from being matched again (redacting twice must change nothing).
+ * Linear: a bounded run of blanks around the separator and then one character class, no nesting.
+ */
+const CREDENTIAL_FIELD =
+  /\b((?:proxy-)?authorization|x-api-key|(?:anthropic[-_])?api[-_]?key|x-auth-token|(?:access|auth|refresh|id)[-_]token)(["']?[ \t]{0,8}[:=][ \t]{0,8}["']?)(?:(?:Bearer|Basic|Token|Digest|Negotiate|ApiKey)[ \t]+)?[^\s"'<>,;&()[\]{}]+/gi;
+/** `?token=...` and the like in a URL or a form body that was echoed. */
+const CREDENTIAL_PARAM = /([?&;](?:access_token|auth_token|id_token|refresh_token|token|api[-_]?key|key|password|passwd|secret|sig|signature)=)[^&\s"'<>#]+/gi;
+/**
+ * A scheme word followed by something credential-shaped, with no header name in front. Looser than it used to be
+ * (8 characters, not 16): a base64 `user:pass` is 12. The value must contain a digit, a symbol or a capital after
+ * its first letter, which keeps "Basic installation", "Basic Authentication" and "Token limit" in an answer.
+ */
+const SCHEME_VALUE = /\b(?:Bearer|Basic|Token)[ \t]+(?=[A-Za-z0-9._~+/=-]*(?:[0-9._~+/=-]|[a-z][A-Z]))[A-Za-z0-9._~+/=-]{8,}/g;
 /** Any long run of token characters. Only for error text: in an answer it is mostly commit ids and UUIDs. */
 const LONG_TOKEN = /[A-Za-z0-9_+/=-]{32,}/g;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * Remove from `text` the configured key (verbatim, in every spelling given), key-shaped tokens and
- * echoed Authorization values; at the 'error' level also any long token-looking run. All patterns
- * are linear (a bounded prefix then a character class, no nesting), because this runs on text from
- * the network.
+ * Remove from `text` the configured key (verbatim, in every spelling given, from KEY_MIN_LENGTH characters up,
+ * whatever its shape: a gateway key need not look like `sk-...`), the value of any credential-bearing field
+ * (an Authorization header at any length), key-shaped tokens and echoed scheme values; at the 'error' level also
+ * any long token-looking run. All patterns are linear (a bounded prefix then a character class, no nesting),
+ * because this runs on text from the network, and redacting twice changes nothing more than redacting once.
  */
 export function redactSecrets(text: string, apiKeys: readonly string[], level: 'answer' | 'error'): string {
   let out = text;
   for (const key of new Set(apiKeys)) {
-    // A key of a few characters would shred every message it appears in; real keys are long.
-    if (key.length >= 8) out = out.split(key).join(REDACTED);
+    if (key.length >= KEY_MIN_LENGTH) out = out.split(key).join(REDACTED);
   }
-  out = out.replace(AUTH_VALUE, REDACTED).replace(KEY_SHAPED, REDACTED);
+  out = out
+    .replace(CREDENTIAL_FIELD, `$1$2${REDACTED}`)
+    .replace(CREDENTIAL_PARAM, `$1${REDACTED}`)
+    .replace(SCHEME_VALUE, REDACTED)
+    .replace(KEY_SHAPED, REDACTED);
   // A session id is a UUID, long and token-shaped but not a secret, and the log is more useful with it.
   if (level === 'error') out = out.replace(LONG_TOKEN, (m) => (UUID.test(m) ? m : REDACTED));
   return out;

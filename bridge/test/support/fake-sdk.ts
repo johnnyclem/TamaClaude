@@ -35,16 +35,29 @@ import type { Clock, TimerHandle } from '../../src/types.ts';
 export const SID = 'sess-1';
 export const UUID0 = '00000000-0000-4000-8000-000000000000';
 
+/**
+ * More timers than this fired by ONE `advance()` means a timer is re-arming itself without time passing (or with a
+ * delay far shorter than any real period): the real clock would spin, and this one would loop for ever, hanging the
+ * test run in a way no assertion names (a mutant of the stall watchdog did exactly that). It is thrown instead.
+ */
+export const TIMER_STORM_LIMIT = 2000;
+
 export class FakeClock implements Clock {
   t = 1_000_000;
   #seq = 0;
   #live = new Map<number, { at: number; fn: () => void }>();
+  /** The delay of every `setTimeout` ever made, in order, whether or not it was cleared since. */
+  readonly delays: number[] = [];
+  /** Every timer ever made, cleared or not: a test can run a callback that the real clock had already queued. */
+  readonly history: { ms: number; fn: () => void }[] = [];
   now(): number {
     return this.t;
   }
   setTimeout(fn: () => void, ms: number): TimerHandle {
     const id = ++this.#seq;
     this.#live.set(id, { at: this.t + ms, fn });
+    this.delays.push(ms);
+    this.history.push({ ms, fn });
     return id;
   }
   clearTimeout(h: TimerHandle): void {
@@ -55,6 +68,7 @@ export class FakeClock implements Clock {
   }
   advance(ms: number): void {
     const target = this.t + ms;
+    let fired = 0;
     for (;;) {
       let best: [number, { at: number; fn: () => void }] | undefined;
       for (const e of this.#live) {
@@ -62,6 +76,7 @@ export class FakeClock implements Clock {
         if (best === undefined || e[1].at < best[1].at) best = e;
       }
       if (best === undefined) break;
+      if (++fired > TIMER_STORM_LIMIT) throw new Error(`timer storm: ${fired} timers fired in one advance(${ms}); a timer keeps re-arming itself`);
       this.#live.delete(best[0]);
       this.t = Math.max(this.t, best[1].at);
       best[1].fn();

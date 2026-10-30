@@ -66,6 +66,8 @@ node --disable-sigusr1 src/main.ts --cwd ~/projects/the-repo --host 0.0.0.0 --to
 
 `npm start` is `node --disable-sigusr1 src/main.ts`, so `npm start -- --cwd ... --token-file ...` is the same
 command. The flag is half of a pair: the bridge also refuses the signal in code (see "What is not guaranteed").
+Fake mode installs neither: it runs no commands, so there is nothing for a signal to hijack, and that is why the
+quick start above is `node src/main.ts --fake-claude` without the flag.
 
 An API key is **required** and the bridge says why if it is missing: this project does not
 run a server that a handheld drives on a personal Claude subscription login.
@@ -76,12 +78,28 @@ next start, per working directory; `--new-session` forgets it. Fake mode keeps n
 its made-up ids can never be resumed by a real run.
 
 **The project's own settings are not read.** By default Claude Code is started with no
-repository configuration and none of yours (`--setting-sources none`); see "Repository settings are
-off by default" below for why. What a person usually wants from the repository, its `CLAUDE.md`, is
-given to Claude by the bridge itself, as plain text: `CLAUDE.md` and `.claude/CLAUDE.md` in the working
-directory (a link that leads out of the project, a file that is not UTF-8 text, a file past 40 KB in
-total is not used, and an `@import` line is left as text, not followed). The banner says which files
-were read and whether they were cut.
+repository configuration and none of yours (`--setting-sources none`), and with its own auto-memory
+switched off; see "Repository settings are off by default" below for why. What a person usually wants from
+the repository, its `CLAUDE.md`, is given to Claude by the bridge itself, as plain text: `CLAUDE.md` and
+`.claude/CLAUDE.md` in the working directory, and no other file. What the bridge does with them:
+
+- **No link is followed.** A file that is a symbolic link, one reached through a linked directory (a `.claude`
+  that points elsewhere) and one with more than one hard link are not used, whatever they lead to. The
+  working directory itself may be a link (macOS keeps `/tmp` behind one): the files are then judged against its
+  real path, and the banner says so.
+- **It must be a file that Claude could read without a tap.** The bridge asks the same rule that decides which
+  reads need a tap, so a `CLAUDE.md` that is (or leads to) `.env`, `.git/config` or any other credential store is
+  not used. The same rule means a project under a path with non-ASCII or look-alike characters gets no memory
+  at all; the banner says why.
+- **It is text.** A file that is not UTF-8, holds a NUL byte or is mostly control characters is not used. An
+  `@import` line is left as text, not followed.
+- **Content past 40 KB in total IS used, and cut at 40 KB.** The model is told it has part of a file, and the
+  banner says "CUT at 40 KB".
+- **It cannot close its own quotation.** The text sits between two marker lines under a heading that says it was
+  written by whoever owns the repository and cannot approve anything; a line in it that imitates one of the two
+  marker lines is replaced.
+
+The banner lists the files that were read, and every file that exists and was not used, with the reason.
 
 **A real-mode bridge refuses a device on its own machine.** The commands Claude runs
 execute here, so a process on this machine that learns the token could connect as the
@@ -128,7 +146,7 @@ guaranteed").
 | `--model` | the Claude Code default | the model; a voice session may want a smaller one than the default |
 | `--max-turns` | unlimited | most model turns one prompt may take. Claude reads files inside the project without asking, so with no limit a loop of reads costs API calls until `--turn-stall-sec` or you stop it; setting this is sensible |
 | `--turn-stall-sec` | `300` | end a turn after this many seconds in which Claude showed no sign of life while no tool was running and no ask was open (0 to 3600; `0` never). A running tool or an ask on the panel is not silence |
-| `--pass-env` | none | environment variable names (comma separated, or repeat the flag) that the commands Claude runs may see, on top of the list below. `BRIDGE_TOKEN` is refused |
+| `--pass-env` | none | environment variable names (comma separated, or repeat the flag) that the commands Claude runs may see, on top of the list below. A name the bridge sets itself is refused (`BRIDGE_TOKEN` and four more, listed below) |
 | `--state-dir` | `$XDG_STATE_HOME/tamaclaude-bridge`, else `~/.local/state/tamaclaude-bridge` | where the session id lives (directory 0700, file 0600) |
 | `--new-session` | off | forget the saved session and start a fresh conversation |
 | `--ask-ttl-sec` | `90` | how long the player has to answer one ask (1 to 3600) |
@@ -154,10 +172,13 @@ the claims that carry a list or a number are held to the code by tests (`test/ma
   words cannot grant anything; one ask is shown at a time; an id works once; an answer for an
   ask that has ended is refused, so a late tap can never land on the next question.
 - **Exactly one tool runs without a tap in the Claude Code build this bridge ships with:
-  `Read`, inside the working directory.** Symbolic links are followed (a link out of the project
-  is outside), the path must not be a credential store (`/proc`, `~/.ssh`, `~/.claude.json`,
-  shell histories, `.git/config`, `.claude/settings.local.json`, the bridge's own token file and
-  state directory and the like) and must contain no look-alike characters. **Everything else
+  `Read`, inside the working directory.** A path that goes through a symbolic link is never free: it asks
+  at `high`, and the panel shows both the path given and where it really points. The path must not be a
+  credential store (`/proc`, `~/.ssh`, `~/.claude.json`, shell histories, `.git/config`,
+  `.claude/settings.local.json`, the bridge's own token file and state directory and the like, **and a
+  backup, rotated or editor copy of one**, such as `id_rsa.bak` or `.netrc.old`), must contain no
+  look-alike characters and no pile of wildcards (more than 24 of `*` `?` `[` in one path, or five `*` in a
+  row). **Everything else
   asks the device first**: every `Bash` command (even `ls`; a search or a listing is a `Bash`
   call in this build), every write and edit, `WebFetch`, `WebSearch`, sub-agents, `ToolSearch`
   and every MCP tool. A read outside the working directory asks. The bridge's own rule is
@@ -171,12 +192,7 @@ the claims that carry a list or a number are held to the code by tests (`test/ma
 - **The panel shows the real call.** The label and summary come from the tool's actual input,
   never from the model's description of it, and are reduced to printable ASCII. A character
   that ASCII folding would have disguised is shown as `?` and makes the call at least `high`.
-  **Limits of what 96 characters can show, and what is therefore approved partly blind**: the
-  content of a `Write` or `Edit` is not shown (the path is); an MCP tool shows its target and the
-  size of its input, not all of it; a long `Bash` command is cut and rated `high`; and **a
-  sub-agent's brief is not shown at all**: an `Agent` call shows only the kind of sub-agent, and is
-  rated `high` for that reason. The person who taps ALLOW on it is trusting what the model wrote
-  for the sub-agent, and the sub-agent's own calls ask as usual.
+  What 96 characters can and cannot show is in "What a tap does and does not cover", below.
 - **The model is not offered, and is refused if it asks for, the tools a voice device cannot
   serve:** `AskUserQuestion`, `ScheduleWakeup`, `CronCreate`, `CronDelete`, `CronList`,
   `Monitor`, `Workflow`, `Skill`, `EnterPlanMode`, `ExitPlanMode`, `SendMessage`, `ListAgents`,
@@ -192,6 +208,31 @@ the claims that carry a list or a number are held to the code by tests (`test/ma
   interpreter, a computed path, shell syntax of other shells than bash, plus a little of zsh's),
   and approving is still a judgement the person makes.
 
+### What a tap does and does not cover
+
+A tap on ALLOW is a judgement made on a panel that holds 96 characters. What that panel shows, call by call,
+and what it does not (an approval of any of these is partly blind, and the person who taps is trusting the
+rest):
+
+- **A shell command: the first 96 characters, as written.** A longer command is cut and rated `high`, and so is
+  one with several lines. The panel does not show what a word of it expands to (`$(...)`, a wildcard, a variable)
+  or where a path in it really points: a redirect or `tee` through a symbolic link is rated `high`, but the line
+  still reads as typed.
+- **A file tool (`Read`, `Write`, `Edit` and the like): the path, and nothing else.** The content of a `Write` or an
+  `Edit` is not shown. When the path goes through a symbolic link the panel shows both, as `given -> real` (ASCII,
+  cut in the middle if it is long, always inside the 96 characters), and the call is rated `high`: a write through
+  a link lands somewhere other than where the path says.
+- **A sub-agent: the kind of sub-agent, and no more.** The call is rated `high` because a sub-agent's brief is not
+  shown at all. The person who taps ALLOW is trusting what the model wrote for the sub-agent; the sub-agent's own
+  calls ask as usual.
+- **An MCP tool: its name, the fields that identify its target and the size of its input,** always rated `high`.
+  A web fetch shows the host, path and query.
+- **What an allowed call returns is not covered at all.** A read that needed no tap, and a command you allowed, put
+  file contents and output in front of the model and the API provider. A tap is permission to run a call, not a
+  review of what comes back.
+- **The ratings are patterns, not proof.** `low`, `med` and `high` are the bridge's guess from the text of the call;
+  see "Hard-deny is a backstop, not a guarantee" above.
+
 ### Repository settings are off by default
 
 A repository's `.claude/settings.json` and `settings.local.json` are not a list of preferences.
@@ -202,11 +243,17 @@ and switch features back on, **before any tool call exists for the device to be 
 Blocking the keys that are known to do this (a denylist) was tried first and rots with every
 Claude Code release, so the default is to read **none** of it:
 
-- `--setting-sources none` is the default. No repository file and none of yours (`~/.claude`)
-  changes how Claude runs, so none of the above can happen. The cost is only that the repository's
-  `CLAUDE.md` does not arrive through the CLI; the bridge reads it and hands it over as text
-  (see "Real mode"), headed by a note that it was written by whoever owns the repository and
-  cannot approve anything.
+- `--setting-sources none` is the default. No settings file of the repository and none of yours
+  (`~/.claude`) is loaded, and neither are the hooks, helper programs, MCP servers, skills, plugins and
+  slash commands such files would add, so none of the above can happen. The CLI's own auto-memory
+  (`~/.claude/projects/<project>/memory/MEMORY.md`, which an earlier session run outside the bridge may
+  have written, and which the CLI would otherwise show the model on every request with no tap) is switched
+  off too: the driver sets `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` in the child's environment itself, and
+  `--pass-env` refuses the name. The cost is only that the repository's `CLAUDE.md` does not arrive through
+  the CLI; the bridge reads it and hands it over as text (see "Real mode"), headed by a note that it was
+  written by whoever owns the repository and cannot approve anything. **Two things outside settings
+  files still apply** and are described under "What is not guaranteed": git reads the repository's own
+  `.git/config` when Claude starts, and the bridge's own `CLAUDE.md` text does change how Claude behaves.
 - `--setting-sources project,local` (or any list with `project` or `local`) is an **opt-in** for a
   repository you trust as much as you trust its build scripts. The banner prints a boxed warning
   when it is on. **`none` is the only safe setting for a repository you do not trust.**
@@ -246,17 +293,42 @@ Read this before trusting the bridge with a machine you care about.
   `~/.ssh`, `~/.config/gh`, `~/.npmrc` and the like are reachable by any command you approve (only
   environment variables are held back, see the next section), and the API key is in its
   environment. Approving a command is trusting it with those.
-- **Reads inside the project are free.** The bridge protects named credential stores, not the
-  meaning of a file: `config/database.yml` inside the working directory is read without a tap, and
-  what is read goes to the model. A file in the project (or the `CLAUDE.md` the bridge hands over)
-  can carry instructions aimed at the model; the tap is the defence, and a tap on a summary that
-  cannot show everything is a judgement (see "The panel shows the real call").
+- **Reads inside the project are free.** The bridge protects named credential stores (and the backup,
+  rotated and editor copies of them: `id_rsa.bak` asks), not the meaning of a file: `config/database.yml`
+  inside the working directory is read without a tap, and what is read goes to the model. A file in the
+  project (or the `CLAUDE.md` the bridge hands over) can carry instructions aimed at the model; the tap is the
+  defence, and a tap on a summary that cannot show everything is a judgement (see "What a tap does and does not
+  cover"). A hard link to a credential store has no name that gives it away and is read like any file; so is a
+  file that never ends (a FIFO): a `Read` of one holds the turn until you abort it, because a running tool is not
+  silence to `--turn-stall-sec`.
+- **git reads the repository's own configuration when Claude starts, and the bridge cannot stop it.** Claude
+  Code runs a few `git` commands in the working directory as it starts (a status, a log), before any tool call
+  exists for the device to be asked about. It turns off git's hooks and file-system monitor for them; it does not
+  turn off *filters*, so a `filter.<name>.clean` program written in the repository's `.git/config` can run at that
+  moment, with no ask. (Measured with git itself for the filter; the start-up commands are as a red-team measured
+  them on the bundled CLI, version 2.1.314. The CLI has a switch for its git commands,
+  `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS`; the driver does not set it.) Such a `.git/config` arrives with a repository that came
+  WITH its `.git` directory (an archive, a copied folder) or from a `.git/config` edited by a call somebody
+  tapped; a `git clone` you made yourself does not copy configuration. **So `--cwd` belongs only on a repository
+  whose `.git` directory you trust.** What the bridge does about it: a `Write` to `.git/config`, `.git/hooks/*`
+  or `.gitattributes` is rated `high` and asked about; it is not refused. The banner repeats the warning.
+- **Wildcards are not expanded, and a link a command makes does not exist yet.** A path or a shell word with a
+  wildcard in a directory name (`cat g?/config` where `g0` is a link to `.git`) is rated by its text, not by what
+  the wildcard would match; `ln -s .git g && cat g/config` is judged before the link exists. A shell command is
+  always asked about, with the start of its text shown, which is what stands between these and a read; the
+  rating can be lower than the truth. The text of a command is scanned in time linear in its length, but a command near the
+  1 MiB cap is still slow to analyse (under a second where it was measured), and the bridge does that on the
+  one thread that also serves the device.
+- **A path through a symbolic link asks, so a project laid out as a tree of links asks a lot.** A pnpm-style
+  `node_modules`, or any link inside the project, is `high` for a `Read` even when it leads to an ordinary file.
+  The analysis judges the file system as it is when the call arrives; a link made or changed between that and
+  the run is not seen.
 - **A loop of free reads costs money.** With no `--max-turns` the model can read files inside the
   project without a tap for as long as it likes. `--turn-stall-sec` ends a turn that goes silent,
   not one that is busy.
 - **Secrets can outlive the process.** In an opt-in settings mode the proxy settings (which may
-  contain a password) are written to a private file (`0600`, in a `0700` directory under the temp
-  directory) that is removed when the bridge closes normally. A second signal ("Forced exit"), or
+  contain a password) are written to a private file (readable by your user only, in a directory only your user can enter,
+  under the temp directory) that is removed when the bridge closes normally. A second signal ("Forced exit"), or
   `SIGKILL`, or a crash, leaves it behind. With the default `none` no such file is written.
 - **Hard-deny and the summary are pattern rules,** as said above.
 - **The device does not authenticate the bridge, and `ws://` is plaintext** (below).
@@ -273,6 +345,18 @@ for a gateway. **Only environment variables are withheld:** files under `HOME` a
 above. **The API key itself is visible to any command you approve**, because the CLI passes its
 own environment on.
 
+Five names are set by the bridge and **refused** by `--pass-env` at start-up, with the reason: `BRIDGE_TOKEN`,
+`ANTHROPIC_API_KEY` (always the one from this process), and the three switches the driver sets for itself,
+`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`, `CLAUDE_CODE_DISABLE_WORKFLOWS` and `CLAUDE_CODE_DISABLE_AUTO_MEMORY`.
+
+Two things the allowlist does not decide, both measured by a red-team on the bundled CLI (2.1.314) and
+not re-measured here: **the CLI adds variables of its own** to every command it runs, among them a
+messaging socket and token for its sub-agents (`CLAUDE_CODE_MESSAGING_SOCKET` and
+`CLAUDE_CODE_MESSAGING_TOKEN`, a socket in a directory only your user can enter), so a command you approve
+can talk to that socket; and **with `--pass-env ANTHROPIC_BASE_URL`** (the gateway recipe above) the CLI
+still sent the key to `api.anthropic.com` for a few requests of its own (feature flags, a bootstrap
+call), so a gateway key is not kept from Anthropic by that flag.
+
 ### Who may connect
 
 - **A device on this machine is refused in real mode** (HTTP 403 before any WebSocket) unless
@@ -282,9 +366,9 @@ own environment on.
   cannot use the bridge to guess tokens.
 - **The token** is compared in constant time (as SHA-256 digests, so the length does not leak
   either). A wrong token waits half a second before it is refused, and wrong tokens are counted
-  per address across connections: the first five are answered as usual, the sixth pauses the
-  address for 2 seconds, and each further wrong token doubles the pause up to 5 minutes (restart
-  the bridge to clear it). During a pause even the right token is not looked at. The token is
+  per address across connections: the first five are answered as usual, the sixth is answered as usual too
+  and earns the first pause, 2 seconds, and each further wrong token after a pause doubles it up to 5 minutes
+  (restart the bridge to clear it). During a pause even the right token is not looked at. The token is
   never written to the log.
 - **Connections are capped** (32 in all, 8 per address, whether or not they ever speak), a
   socket must finish its HTTP request within 5 seconds and say `hello` within 10, a device that
@@ -322,7 +406,8 @@ own environment on.
 Verified by tests on every run (`npm test`, no network, no key):
 
 - the protocol codec, the golden fixtures and PROTOCOL.md's numbers, field tables, close codes,
-  timings and worked example (replayed against a live bridge);
+  timings and worked example (replayed against the stock `--fake-claude` bridge, so the document describes
+  a bridge anyone can start);
 - the server end to end on real loopback sockets: the handshake and everything that can go
   wrong in it, takeover, the grace period, keepalive with the shipped timings, push-to-talk
   (including the idle limit on a listen window), abort, and that nothing but a matching `ask_rsp`
@@ -331,9 +416,18 @@ Verified by tests on every run (`npm test`, no network, no key):
   server composed together over a scripted stand-in for the CLI, **built by `main.ts`'s own
   `run()`**, so a one-line regression in the wiring (the veto stripped, the grace period forced,
   a canned recognizer in real mode) fails;
-- `main.ts`: the flags, the banner, and what `run()` hands the driver and the server, field by field;
+- `main.ts`: the flags, the banner, and what `run()` hands the driver and the server, field by field,
+  including that the memory `run()` reads is the memory the driver and the banner are given;
 - the README's flag table, its list of tools that run without a tap, its list of tools that are
-  refused, and the admission numbers.
+  refused, the environment allowlist (in both directions), the names `--pass-env` refuses (one list, the
+  driver's), and the numbers that sit in its prose (the admission numbers, the lockout, the 40 KB and 1 MiB
+  caps, the stall time, the store's file modes, the generated token's length), each compared with the code that
+  has them;
+- the README's central sentences ("The project's own settings are not read", "`--setting-sources none` is the
+  default", what a tap does and does not cover, what disqualifies a read from running without a tap) are
+  matched as text AND exercised: the symbolic link, the credential-store copy, the pile of wildcards and the
+  linked `CLAUDE.md` it describes are made for real and put through the same functions the program uses;
+- the banner example in "Quick start" is the banner a fake-mode bridge prints.
 
 **Not run by `npm test`:** `npm run test:real-cli` (about two minutes, no key, no network) runs the
 real driver over the **real Claude Code CLI bundled with the SDK** against a local fake of the
@@ -345,7 +439,11 @@ trusting a README sentence about the CLI. `npm test` fails when the installed SD
 file was last recorded as passing against, which is the reminder.
 
 **Not verified**: a real turn against `api.anthropic.com` with a real key (the fake API decides
-what a rejected key looks like); the SDK's sandbox auto-allow (no `bubblewrap` here); anything
+what a rejected key looks like); what the bundled CLI runs at start-up beyond what its own test
+shows (the git commands, the messaging socket and the traffic to `api.anthropic.com` under a gateway were
+measured once by a red-team and are described as such above); macOS, where `/tmp` and `/var` are themselves links
+and so should rate `high` for a `Read` rather than `med` (nothing here ran on it, and nothing here ran on a
+case-insensitive file system either); the SDK's sandbox auto-allow (no `bubblewrap` here); anything
 on a real handheld or a real network (no firmware exists yet); whether the bridge's pattern
 rules catch a particular dangerous command (they are a backstop); content-sensitive files
 inside the working directory (`config/database.yml` reads without a tap, only named
@@ -386,7 +484,7 @@ including `SIGTERM`/`SIGINT` and a `SIGUSR1` sent to a real-mode bridge.
 | `src/drivers/fake.ts` | the scripted Claude |
 | `src/voice-prompt.ts` | rules appended to Claude's system prompt for a tiny screen |
 | `src/server.ts` | the WebSocket server: admission, handshake, keepalive, turn lifecycle, push-to-talk, abort |
-| `src/memory.ts` | the project's `CLAUDE.md` as capped plain text for Claude, read by the bridge (a link out of the project, a file that is not text and `@import` are refused) |
+| `src/memory.ts` | the project's `CLAUDE.md` as capped plain text for Claude, read by the bridge: no link followed, nothing a `Read` would ask a tap for, nothing that is not text, and `@import` left as text |
 | `src/store.ts` | the saved session id |
 | `src/stt.ts` | speech-to-text adapters: the default that says "not set up", and a scripted one |
 | `src/main.ts` | flags, the wiring of the real driver and the server, banner, signals |

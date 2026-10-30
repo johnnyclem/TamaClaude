@@ -419,7 +419,7 @@ describe('summarizeForDevice: markdown is removed', () => {
   it('leaves plain numbers and dashes that are not list markers alone', () => {
     assert.equal(sum('Version 1.5 is out. 3 files changed.'), 'Version 1.5 is out. 3 files changed.');
     assert.equal(sum('well-known and -x flag'), 'well-known and -x flag');
-    assert.equal(sum('2 * 3 = 6'), '2 3 = 6'); // the asterisk is emphasis syntax and is dropped, as before
+    assert.equal(sum('2 * 3 = 6'), '2 * 3 = 6'); // a lone asterisk is multiplication, not emphasis (it used to be dropped: "2 3 = 6")
   });
 
   it('closing hashes on an ATX heading are dropped', () => {
@@ -500,6 +500,90 @@ describe('summarizeForDevice: whole sentences, and never over the limit', () => 
   });
 });
 
+describe('V4/D21: markup is removed only where it forms markup', () => {
+  const sum = (md: string, max = 400): string => summarizeForDevice(md, max);
+
+  // The sentence the finding opened with: a safety-relevant answer that reached the device saying the opposite.
+  it('keeps a tilde, an underscore and a lone star that are characters of the answer', () => {
+    const kept: string[] = [
+      'I removed ~/build and ~/.cache/x.',
+      'Bash (rm -rf ~) was refused.',
+      'The home directory is ~.',
+      'Set MY_VAR_NAME=1 and run snake_case_name.',
+      'It is 5 * 3 = 15.',
+      'a ~ b is approximately equal.',
+      'Edit __init__.py and __main__ now.',
+      'Both a*b*c and 2*3*4 are products.',
+      'Use *.ts and *.js files, or src/**/*.ts.',
+      'Pass *args and **kwargs through.',
+      'Run `ls | grep x` then cat a | b.',
+      'Call _private_var and __dunder__.',
+      'Cost: $5 ~ $6 (about 10 % off).',
+      'x ** 2 + y ** 2',
+    ];
+    for (const m of kept) {
+      // Backticks are the one marker that is always removed, and only the code markers: the answer's words stay as written.
+      assert.equal(sum(m), m.replaceAll('`', ''), m);
+    }
+  });
+
+  it('still removes the markup that is markup: paired emphasis, strike, backticks, and pipes in a table row', () => {
+    const cases: [string, string][] = [
+      ['the **bold** word', 'the bold word'],
+      ['the _italic_ word', 'the italic word'],
+      ['the *italic* word', 'the italic word'],
+      ['the __bold__ word', 'the __bold__ word'], // one word between double underscores is a name, not bold (see below)
+      ['the __two words__ here', 'the two words here'],
+      ['the ***both*** here', 'the both here'],
+      ['an ~~old~~ new', 'an old new'],
+      ['**Summary:** all done', 'Summary: all done'],
+      ['**Done.** Next', 'Done. Next'],
+      ['(_note_) and "*quoted*"', '(note) and "quoted"'],
+      ['*several words in italics* end', 'several words in italics end'],
+      ['Run `npm test` and `a_b`.', 'Run npm test and a_b.'],
+      ['\\*literal stars\\* and \\_under\\_', '*literal stars* and _under_'],
+    ];
+    for (const [md, want] of cases) assert.equal(sum(md), want, md);
+    // A pipe is dropped from a table row only; in prose it is a character.
+    assert.equal(sum('| a | b |\n|---|---|\n| 1 | 2 |'), 'a b. 1 2');
+    assert.equal(sum('| ls | grep x |'), 'ls grep x');
+    assert.equal(sum('Use a | b | c here'), 'Use a | b | c here');
+  });
+
+  it('pairs a span that wrapped onto the next line, and does not pair across what is not a word edge', () => {
+    assert.equal(sum('this is **bold\nacross two lines** done'), 'this is bold across two lines done');
+    assert.equal(sum('a *b\nc* d'), 'a b c d');
+    assert.equal(sum('snake_\ncase_name'), 'snake_ case_name', 'a line break inside a name is not a word edge');
+    assert.equal(sum('**Done.**\nNext step'), 'Done. Next step', 'the terminal period is seen once the markers are gone');
+  });
+
+  it('is decided by position, not by the character: every delimiter is ordinary when it is not at a word edge', () => {
+    for (const d of ['*', '_', '~~']) {
+      assert.equal(sum(`a${d}b${d}c`), `a${d}b${d}c`, `${d} inside a word`);
+      assert.equal(sum(`a ${d} b ${d} c`), `a ${d} b ${d} c`, `${d} with spaces around`);
+      assert.equal(sum(`${d}`), `${d}`, `a lone ${d}`);
+      assert.equal(sum(`${d}open only`), `${d}open only`, `${d} never closed`);
+      assert.equal(sum(`close only${d}`), `close only${d}`, `${d} never opened`);
+    }
+    // One end at a word edge and the other inside a word is not a span either, in both directions: a rule on the opener alone
+    // or on the closer alone would still pass the rows above, so each is asked separately.
+    for (const d of ['*', '_', '~~']) {
+      assert.equal(sum(`foo${d}bar${d} baz`), `foo${d}bar${d} baz`, `${d}: the opener is inside a word`);
+      assert.equal(sum(`foo ${d}bar${d}baz`), `foo ${d}bar${d}baz`, `${d}: the closer is inside a word`);
+    }
+    // And the same delimiters do their job at word edges (the companion that keeps the loop above honest).
+    for (const d of ['*', '_', '~~']) assert.equal(sum(`a ${d}b${d} c`), 'a b c', `${d} around a word`);
+  });
+
+  it('never leaves a leading, trailing or doubled space, and never grows the text', () => {
+    for (const md of ['a ` b', '` a', 'a `', '** a **', '_ a _', 'a ** ** b', '~~ ~~', '`` `` ``']) {
+      const out = sum(md);
+      assert.doesNotMatch(out, /^ | $|  /, JSON.stringify(md));
+      assert.ok(out.length <= md.length);
+    }
+  });
+});
+
 describe('summarizeForDevice: hostile and huge input', () => {
   it('stays fast on 200k characters of every markdown shape that tempts a regex into backtracking', () => {
     const shapes: Record<string, string> = {
@@ -528,6 +612,21 @@ describe('summarizeForDevice: hostile and huge input', () => {
       'urls': 'http://a '.repeat(20000),
       'one long url': 'https://' + 'a'.repeat(200000),
       'url dots': 'http://x' + '.'.repeat(200000),
+      // The shapes that WERE quadratic: a run of the characters a regex retried from every position, then something else.
+      'url dots then a letter': 'http://x' + '.'.repeat(200000) + 'y',
+      'url brackets then a letter': 'http://x' + ')'.repeat(200000) + 'y',
+      'heading spaces then a hash': '# a' + ' '.repeat(200000) + '# x',
+      'heading tabs then a hash': '# a' + '\t'.repeat(200000) + '#x',
+      // Unmatched openers of every emphasis kind, each followed by up to the search window of text.
+      'star openers': '**a '.repeat(50000),
+      'single star openers': ' *a'.repeat(66000),
+      'underscore openers': ' _a'.repeat(66000),
+      'double underscore openers': ' __a'.repeat(50000),
+      'tilde openers': ' ~~a'.repeat(50000),
+      'triple star openers': ' ***a'.repeat(40000),
+      'long span without a closer': ' *' + 'a'.repeat(199990),
+      'backticks': '`'.repeat(200000),
+      'escapes': '\\*'.repeat(100000),
       'emoji': '\u{1F600}'.repeat(100000),
       'invisibles': '\u200b'.repeat(200000),
       'plain prose': 'Sentence one is here. '.repeat(10000),

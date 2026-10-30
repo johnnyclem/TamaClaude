@@ -13,17 +13,18 @@
  */
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { describe, it } from 'node:test';
 import {
   decodeAudioFrame, decodeBridgeMsg, decodeDeviceMsg, encodeAudioFrame, encodeBridgeMsg, encodeDeviceMsg,
   isPrintableAscii,
 } from '../src/protocol.ts';
 import { DEFAULT_STALL_MS } from '../src/drivers/claude.ts';
+import { CLI_FREE_TOOLS } from '../src/main.ts';
 import { DEFAULTS, MAX_BAD_FRAMES, MAX_PAYLOAD } from '../src/server.ts';
 import { AUTO_RUN_TOOLS } from '../src/tools.ts';
 import {
-  ASK_END_REASONS, BRIDGE_MSG_TYPES, CLOSE, DEVICE_MSG_TYPES, ERR_CODES, FRAME_KIND_MIC, FRAME_KIND_TTS, HELLO_WHYS,
+  ASK_END_REASONS, AUDIO, BRIDGE_MSG_TYPES, CLOSE, DEVICE_MSG_TYPES, ERR_CODES, FRAME_KIND_MIC, FRAME_KIND_TTS, HELLO_WHYS,
   LIMITS, LISTEN_MODES, PHASES, PROTOCOL_VERSION, RISKS,
 } from '../src/types.ts';
 import type { BridgeMsg, DecodeResult, DeviceMsg } from '../src/types.ts';
@@ -1194,6 +1195,149 @@ describe('PROTOCOL.md agrees with the code', () => {
     assert.match(flat('Transport'), new RegExp(`complete within \\*\\*${secs(DEFAULTS.headersTimeoutMs)} seconds\\*\\*`));
     assert.match(flat('Connection lifecycle'), /half a second/);
     assert.equal(DEFAULTS.authFailDelayMs, 500);
+  });
+
+  it('V8: the sentence that says which of the five calls the shipped CLI offers is CLI_FREE_TOOLS, and the other numbers in the prose are the code\'s', () => {
+    const flat = (title: string): string => section(title).replace(/\s+/g, ' ');
+    const words = ['zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten'];
+    // "offers only `Read` of the five": the names AND the count come from the program (PROTOCOL.md's twin of a README sentence that was pinned).
+    const offered = /offers only ((?:`[A-Za-z]+`(?:, | and )?)+) of the (\w+),/.exec(flat('Security model'));
+    assert.ok(offered, 'the Security model no longer says which of the calls the shipped CLI offers');
+    assert.deepEqual([...offered[1]!.matchAll(/`([A-Za-z]+)`/g)].map((m) => m[1]!).sort(), [...CLI_FREE_TOOLS].sort(), 'PROTOCOL.md and the banner disagree about what needs no tap in this build');
+    assert.equal(offered[2], words[AUTO_RUN_TOOLS.length], 'the count of calls the bridge rates low');
+    assert.match(flat('Security model'), /so a search or a listing there is a `Bash` call and is asked about/);
+
+    // Five undecodable frames in a row, in the close table and in the err prose.
+    assert.equal(MAX_BAD_FRAMES, 5);
+    const nWord = words[MAX_BAD_FRAMES]!;
+    const ordinal = ['zeroth', 'first', 'second', 'third', 'fourth', 'fifth', 'sixth'][MAX_BAD_FRAMES]!;
+    assert.match(DOC, new RegExp(`\\| 1008 \\| bridge \\| ${nWord} undecodable or invalid frames in a row after the handshake \\(the ${ordinal} is answered with`));
+    assert.match(flat('Errors'), new RegExp(`\\(${nWord} undecodable frames in a row\\)`));
+
+    // The utterance ceiling and the frame ceilings, wherever they are repeated in prose.
+    const seconds = LIMITS.utteranceMaxBytes / (AUDIO.rate * (AUDIO.bits / 8) * AUDIO.channels);
+    assert.equal(seconds, 35);
+    assert.equal(DOC.split(String(LIMITS.utteranceMaxBytes)).length - 1, 3, 'the ceiling appears in the limits table, the listen prose and the error table; a fourth copy would be unchecked');
+    assert.match(section('Limits'), new RegExp(`\\(${seconds} s of audio\\)`));
+    assert.match(flat('Device to bridge'), new RegExp(`refuses more than ${LIMITS.utteranceMaxBytes} bytes \\(${seconds} seconds\\)`));
+    assert.match(flat('Errors'), new RegExp(`the utterance passed ${LIMITS.utteranceMaxBytes} bytes`));
+    assert.match(DOC, new RegExp(`One utterance is capped at 30 s on the device and ${seconds} s on the bridge`));
+    assert.match(flat('Errors'), new RegExp(`oversized \\(${LIMITS.deviceFrameMax + 1} to ${MAX_PAYLOAD} bytes\\)`));
+    assert.match(DOC, new RegExp(`one that stopped reading with ${DEFAULTS.maxBufferedBytes / 1024} KiB queued`));
+    // The wrong-token pause: the ceiling in the handshake prose.
+    assert.match(flat('Connection lifecycle'), new RegExp(`up to ${words[DEFAULTS.authLockoutMaxMs / 60_000]} minutes`));
+  });
+
+  it('V8: the numbers PROTOCOL.md repeats in its prose are the code\'s -- a numeric mutation pass found these copies unchecked', () => {
+    const flat = DOC.replace(/\s+/g, ' ');
+    const secs = (ms: number): number => ms / 1000;
+    const bytesPerSecond = AUDIO.rate * (AUDIO.bits / 8) * AUDIO.channels;
+    const frameMs = 20;
+    const copies: Array<[string, string]> = [
+      // frame and payload ceilings
+      [`The protocol's frame limit is ${LIMITS.deviceFrameMax} bytes of text for a message in either direction`, 'frame limit'],
+      [`every frame the bridge sends fits in ${LIMITS.bridgeFrameMax} bytes`, 'bridge frames fit'],
+      [`Above ${MAX_PAYLOAD} the transport closes with ${CLOSE.tooBig}`, 'socket ceiling and its close code'],
+      [`under both ${LIMITS.bridgeFrameMax}-byte limits`, 'both limits'],
+      [`(one kind byte and ${LIMITS.audioPayloadMax} bytes of audio)`, 'audio payload'],
+      [`A receive buffer of ${LIMITS.bridgeFrameMax} bytes for text and ${1 + LIMITS.audioPayloadMax} for binary is always enough`, 'buffers'],
+      [`Audio is ${bytesPerSecond} bytes per second each way. At ${frameMs} ms per frame that is ${1000 / frameMs} frames a second, each ${1 + (bytesPerSecond * frameMs) / 1000} bytes on the wire`, 'audio rates'],
+      [`${LIMITS.audioPayloadMax} | largest audio payload, bytes: ${(1000 * LIMITS.audioPayloadMax) / bytesPerSecond} ms of ${AUDIO.rate / 1000} kHz s16le mono`, 'the payload is 40 ms of audio'],
+      // the token, the id, the integers
+      [`The \`token\` in \`hello\` (${LIMITS.tokenMin} to ${LIMITS.tokenMax} characters)`, 'token length in the security model'],
+      [`${LIMITS.tokenMin} to ${LIMITS.tokenMax} characters; the shared secret`, 'token length in the field table'],
+      [`An ask id is ${LIMITS.idLen} hex characters`, 'ask id length'],
+      [`**at most ${INT_MAX}**`, 'largest integer'],
+      [`largest number is \`${INT_MAX}\`, which fits`, 'largest integer, size budget'],
+      // the audio parameters and the version, in every sentence that repeats them
+      [`\`rate\` is ${AUDIO.rate}, \`bits\` is ${AUDIO.bits} and \`ch\` is ${AUDIO.channels}: otherwise \`why: bad_hello\``, 'audio parameters in the handshake'],
+      [`sample rate of the audio this device sends and accepts; MUST be ${AUDIO.rate}`, 'rate row'],
+      [`bits per sample; MUST be ${AUDIO.bits}`, 'bits row'],
+      [`channels; MUST be ${AUDIO.channels}`, 'ch row'],
+      [`protocol version; MUST be ${PROTOCOL_VERSION}`, 'v row'],
+      [`bridge's protocol version, **${PROTOCOL_VERSION}**: otherwise \`why: version\``, 'version check'],
+      [`the bridge's protocol version (${PROTOCOL_VERSION}), in both forms`, 'v row of hello_ack'],
+      [`The protocol version is the integer \`v\`, currently **${PROTOCOL_VERSION}**`, 'versioning'],
+      // close codes, wherever the prose repeats them
+      [`it closes the connection with ${CLOSE.handshake} (`, 'handshake close in the lifecycle'],
+      [`with ${CLOSE.handshake}. A wrong token is answered only after`, 'handshake close in the handshake'],
+      [`${CLOSE.handshake} and the device SHOULD NOT retry in a loop`, 'handshake close in hello_ack'],
+      [`otherwise ${CLOSE.handshake} |`, 'handshake close in the timings table'],
+      [`closes the old connection with code **${CLOSE.replaced}**`, 'takeover close'],
+      [`A device that is closed with ${CLOSE.replaced} SHOULD NOT reconnect by itself`, 'takeover close, device rule'],
+      [`(a late ${CLOSE.replaced} from a half-open socket)`, 'late takeover close'],
+      // the binary frame section and the summary cap and the bad-frame close, which the first numeric pass left unchecked
+      [`The payload (everything after the kind byte) is **2 to ${LIMITS.audioPayloadMax} bytes and an even number of bytes**`, 'payload range'],
+      [`at most ${LIMITS.audioPayloadMax / 2} samples, which is ${(1000 * LIMITS.audioPayloadMax) / bytesPerSecond} ms`, 'samples in a maximal frame'],
+      [`A frame of ${(bytesPerSecond * frameMs) / 1000} bytes (${frameMs} ms) is a good size, and ${1000 / frameMs} of them make a second of audio. The largest binary frame is ${1 + LIMITS.audioPayloadMax} bytes`, 'a good frame'],
+      [`(cut at ${LIMITS.summaryMax} characters, and a cut or multi-line command is at least \`high\`)`, 'summary cap in the ask prose'],
+      [`and then closed with ${CLOSE.policy}`, 'bad-frame close'],
+      // keepalive, in the three places the prose says it
+      [`**more than ${secs(DEFAULTS.deadAfterMs)} seconds** of silence`, 'silence limit'],
+      [`(more than ${secs(DEFAULTS.deadAfterMs)}, at most ${secs(DEFAULTS.deadAfterMs + DEFAULTS.keepaliveCheckMs)})`, 'drop window'],
+      [`has not heard from the bridge in about ${secs(DEFAULTS.deadAfterMs)} seconds`, 'the device\'s own limit'],
+      [`pinging every ${secs(DEFAULTS.pingIntervalMs)} seconds makes that detectable`, 'the application ping interval'],
+      [`every ${secs(DEFAULTS.keepaliveCheckMs)} seconds`, 'keepalive look'],
+    ];
+    for (const [phrase, what] of copies) assert.ok(flat.includes(phrase), `PROTOCOL.md no longer says (${what}): ${phrase}`);
+
+    // Every integer row of every field table says "0 to `intMax`": 0 and the maximum are accepted, one more is refused, in that field.
+    const samples = [...DEVICE_SAMPLES.map((x) => ({ dir: 'device' as const, ...x })), ...BRIDGE_SAMPLES.map((x) => ({ dir: 'bridge' as const, ...x }))];
+    let integerRows = 0;
+    for (const sample of samples) {
+      const heading = DOC.indexOf(`### \`${sample.msg.t}\``);
+      assert.ok(heading >= 0, `no section for ${sample.msg.t}`);
+      const rest = DOC.slice(heading + 5);
+      const table = rest.slice(0, rest.search(/\n### |\n## /) < 0 ? undefined : rest.search(/\n### |\n## /));
+      for (const row of table.split('\n')) {
+        const cells = row.startsWith('|') ? row.slice(1, -1).split('|').map((c) => c.trim().replace(/`/g, '')) : [];
+        if (cells[1] !== 'integer') continue;
+        integerRows += 1;
+        assert.equal(cells[2], '0 to intMax', `${sample.msg.t}.${cells[0]}`);
+        const field = cells[0]!;
+        const withValue = (n: number): string => JSON.stringify({ ...(sample.msg as Record<string, unknown>), [field]: n });
+        for (const [n, ok] of [[0, true], [INT_MAX, true], [INT_MAX + 1, false]] as const) {
+          const r = dec(sample.dir, withValue(n));
+          assert.equal(r.ok, ok, `${sample.msg.t}.${field} = ${n}: ${r.ok ? 'accepted' : r.msg}`);
+        }
+      }
+    }
+    assert.ok(integerRows >= 10, `only ${integerRows} integer rows were found: the check is not reading the tables`);
+
+    // "at most 15 digits": the decoder's own boundary, observable as a different refusal on each side of it.
+    const digits = Number(/at most (\d+) digits/.exec(flat)?.[1]);
+    assert.ok(digits > String(INT_MAX).length, 'the document states a digit limit');
+    const reason = (n: string): string => {
+      const r = decodeDeviceMsg(`{"t":"ping","n":${n}}`);
+      return r.ok ? 'accepted' : r.msg;
+    };
+    assert.match(reason('9'.repeat(digits)), /out of range/, `${digits} digits are read and found too large`);
+    assert.equal(reason('1'.repeat(digits + 1)), 'bad number', `${digits + 1} digits are not read at all`);
+    assert.equal(reason(String(INT_MAX)), 'accepted');
+
+    // The text sizes: the biggest worst-case frame, and the two "typical" figures, measured on frames the document itself shows.
+    const worstText = Math.max(...[...DOC.matchAll(/^\| `(?:hello|say|listen|ask_rsp|abort|ping|hello_ack|state|stt|ask|ask_end|result|err|pong)` \| (\d+) \|/gm)].map((m) => Number(m[1])));
+    assert.ok(flat.includes(`The largest text frame is ${worstText} bytes`), 'the largest text frame');
+    assert.ok(worstText <= LIMITS.bridgeFrameMax && worstText <= LIMITS.deviceFrameMax);
+    const transcript = /```transcript\n([\s\S]*?)```/.exec(DOC)![1]!.split('\n').filter((l) => l.startsWith('B> '));
+    const typical = (type: string): number => {
+      const sizes = transcript.map((l) => l.slice(3)).filter((w) => w.startsWith(`{"t":"${type}"`)).map((w) => bytes(w));
+      return sizes.reduce((a, b) => a + b, 0) / sizes.length;
+    };
+    const about = (n: number): string => `about ${n} bytes`;
+    const [askAbout, stateAbout] = [/typical `ask` is about (\d+) bytes/.exec(flat)?.[1], /typical `state` about (\d+)\./.exec(flat)?.[1]];
+    assert.ok(askAbout && stateAbout, `${about(0)}: the sentence about typical sizes is gone`);
+    assert.ok(Math.abs(typical('ask') - Number(askAbout)) <= 10, `a typical ask in the worked example is ${typical('ask')} bytes, the document says about ${askAbout}`);
+    assert.ok(Math.abs(typical('state') - Number(stateAbout)) <= 6, `a typical state in the worked example is ${typical('state')} bytes, the document says about ${stateAbout}`);
+
+    // "audio frames of 2, 640 and 1280 bytes in both directions": the fixture files are exactly those sizes.
+    const dir = new URL('../fixtures/', import.meta.url);
+    const audioSizes = [...new Set(readdirSync(dir).filter((f) => /^(?:bridge|device)-audio-.*\.bin$/.test(f)).map((f) => statSync(new URL(f, dir)).size - 1))].sort((a, b) => a - b);
+    assert.deepEqual(audioSizes, [2, (bytesPerSecond * frameMs) / 1000, LIMITS.audioPayloadMax], 'the audio fixtures cover the minimum, 20 ms and the maximum');
+    assert.ok(flat.includes(`audio frames of ${audioSizes[0]}, ${audioSizes[1]} and ${audioSizes[2]} bytes in both directions`));
+    // The device-side cap on an utterance is under the bridge's, as the document says.
+    assert.match(flat, /capped at 30 s on the device and 35 s on the bridge/);
+    assert.ok(30 * bytesPerSecond < LIMITS.utteranceMaxBytes, 'the device cap (30 s) is below the bridge ceiling');
   });
 
   it('the worked transcript is real: each line decodes in its direction and re-encodes to the same bytes', () => {

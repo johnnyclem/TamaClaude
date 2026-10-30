@@ -10,10 +10,14 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { ApprovalManager } from '../src/approvals.ts';
 import type { ApprovalEvent, ApprovalOutcome } from '../src/approvals.ts';
 import { createPermissionHandler } from '../src/permission.ts';
-import { ANALYSIS_FAILED, UNSERVED_TOOL_NAMES, makeDescribeTool, setBridgeSecrets, unservedReason } from '../src/tools.ts';
+import { hardDenyFor, needsAskFor } from '../src/main.ts';
+import { ANALYSIS_FAILED, UNSERVED_TOOL_NAMES, makeDescribeTool, needsTap, setBridgeSecrets, unservedReason } from '../src/tools.ts';
 import type { Clock, DescribeTool, PermissionDecision, PermissionRequest, TimerHandle } from '../src/types.ts';
 
 const CWD = '/work/proj';
@@ -495,4 +499,86 @@ test('M2/M3: the ask for an MCP tool shows its target and its size, rated high; 
   const outside = rig();
   void outside.handler(req('Read', { file_path: '/etc/hosts' }));
   assert.equal(outside.approvals.current()!.risk, 'med', 'outside the cwd it is no longer free');
+});
+
+// ---------------------------------------------------------------------------
+// R1/R3 through the CALLER: the exploit is "the model calls Read on a path". Whether the rule is right
+// (tools.test.ts) says nothing about whether the driver's hook and the permission handler obey it, so these
+// go through the two functions main.ts hands the driver (`needsAskFor`, `hardDenyFor`) and the real handler.
+// ---------------------------------------------------------------------------
+
+function linkRoot(): { proj: string; done: () => void } {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'perm-links-')));
+  const proj = join(root, 'proj');
+  mkdirSync(join(proj, '.git'), { recursive: true });
+  mkdirSync(join(proj, '.claude'), { recursive: true });
+  mkdirSync(join(proj, 'src'), { recursive: true });
+  writeFileSync(join(proj, '.git', 'config'), '[remote "origin"]\n url = https://u:TOKEN@example.invalid/x\n');
+  writeFileSync(join(proj, '.claude', 'settings.local.json'), '{}');
+  writeFileSync(join(proj, 'src', 'a.ts'), 'x');
+  symlinkSync('.git', join(proj, 'g[0]'));
+  symlinkSync('.claude', join(proj, 'c?'));
+  return { proj, done: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+test('R1: a Read through a glob-named link to a credential store reaches the device, rated high, showing where it really goes', async () => {
+  const { proj, done } = linkRoot();
+  try {
+    // The hook the driver gives the CLI: a call that does not ask here never reaches the handler at all.
+    const needsAsk = needsAskFor(proj);
+    assert.equal(needsAsk('Read', { file_path: 'src/a.ts' }), false, 'control: an ordinary read inside the project is the only free call');
+    for (const input of [{ file_path: 'g[0]/config' }, { file_path: join(proj, 'g[0]', 'config') }, { file_path: 'c?/settings.local.json' }]) {
+      assert.equal(needsAsk('Read', input), true, JSON.stringify(input));
+      assert.equal(needsTap('Read', input, proj), true);
+      assert.equal(hardDenyFor(proj)('Read', input), undefined, 'a read is asked about, never refused');
+    }
+    // And the handler puts it in front of the human with the arrow.
+    const r = rig({ cwd: proj });
+    const p = r.handler(req('Read', { file_path: 'g[0]/config' }));
+    assert.equal(await peek(p), PENDING, 'it waits for a tap');
+    assert.deepEqual(r.approvals.current(), { id: id(1), label: 'Read', risk: 'high', summary: 'g[0]/config -> .git/config', ttlSec: 60 });
+    assert.equal(r.approvals.answer(id(1), false), 'accepted');
+    assert.deepEqual(await p, { allow: false, message: MSG.denied });
+  } finally {
+    done();
+  }
+});
+
+test('R1: a Write through a link to Claude Code\'s configuration is refused before the device is asked, by the hook and by the handler', async () => {
+  const { proj, done } = linkRoot();
+  try {
+    const input = { file_path: 'c?/settings.local.json', content: '{"hooks":{}}' };
+    assert.match(hardDenyFor(proj)('Write', input) ?? '', /configuration/, 'the SDK-side veto the driver runs inside the CLI\'s own hook');
+    const r = rig({ cwd: proj });
+    const d = await refused(r, req('Write', input), 'a write to the configuration through a link');
+    assert.equal(d.allow, false);
+    assert.match((d as { message: string }).message, /safety rules.*configuration/);
+    assert.equal(r.approvals.current(), undefined, 'nothing was put to the device');
+    // The control: the same write to an ordinary file is asked about, so the refusal above is the link and the rule.
+    const ok = rig({ cwd: proj });
+    void ok.handler(req('Write', { file_path: 'src/b.ts', content: 'x' }));
+    assert.equal(ok.approvals.current()!.risk, 'med');
+  } finally {
+    done();
+  }
+});
+
+test('R3: a pile of wildcards in a path reaches the device at high, at once, through the hook and the handler', async () => {
+  const stars = '*'.repeat(200);
+  const calls: [string, Record<string, unknown>][] = [
+    ['Read', { file_path: `${CWD}/${stars}abc` }],
+    ['Glob', { pattern: `${stars}abc` }],
+    ['Grep', { pattern: 'x', path: `${stars}abc` }],
+    ['Write', { file_path: `${CWD}/${stars}abc`, content: 'x' }],
+    ['Bash', { command: `ls ${stars}abc` }],
+  ];
+  const started = Date.now();
+  for (const [tool, input] of calls) {
+    assert.equal(needsAskFor(CWD)(tool, input), true, `${tool}: the hook must ask`);
+    const r = rig();
+    void r.handler(req(tool, input));
+    assert.equal(r.approvals.current()!.risk, 'high', tool);
+  }
+  // 14 of these froze the bridge for 12 seconds; this is a backstop against a regression to that, not a measurement.
+  assert.ok(Date.now() - started < 2_000, `took ${Date.now() - started} ms`);
 });
