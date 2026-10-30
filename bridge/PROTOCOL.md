@@ -12,9 +12,9 @@ a test holds this document to, on every run:
   the encoder writes; the members of every enumerated field and the length limits in its notes
   are compared with the code; every message type, phase, enum value and error code must be
   named here;
-- the conversation: the worked example at the end is **replayed against a live bridge** and
-  every frame it lists must be exactly what the bridge sends, in that order, including the
-  order of the `state` messages that surround an `ask`;
+- the conversation: the worked example at the end is **replayed against the stock
+  `--fake-claude` bridge** and every frame it lists must be exactly what the bridge sends, in
+  that order, including the order of the `state` messages that surround an `ask`;
 - the bytes: the files in `fixtures/` are the conformance suite for any other
   implementation (the firmware's test should read that directory).
 
@@ -69,8 +69,8 @@ State this plainly, because the transport is plaintext.
   answer that does not decode, an answer with an unknown id. The bridge fails closed.
 - **The calls that run without any ask.** The device is never shown, and never asked about,
   a read-only call to one of `Read`, `Glob`, `Grep`, `LS` or `NotebookRead` on a path inside
-  the bridge's working directory that is not a credential store (symbolic links followed, no
-  look-alike characters in the name). These are the calls the bridge rates `low`, and they are
+  the bridge's working directory that is not a credential store (not through a symbolic link, which
+  always asks; no look-alike characters in the name; no pile of wildcards). These are the calls the bridge rates `low`, and they are
   the only calls that run without a tap; the Claude Code build the bridge ships with offers
   only `Read` of the five, so a search or a listing there is a `Bash` call and is asked about.
   Everything else is asked about, a read outside the working directory included, and some calls
@@ -501,7 +501,8 @@ what a player will see.
 What `sum` and `risk` hold is the bridge's business and may change between bridge versions;
 a device shows them and MUST NOT parse them. Today: for a shell command, the command itself
 (cut at 96 characters, and a cut or multi-line command is at least `high`); for a file tool,
-the path (the content of a write is not shown); for a web fetch, host, path and query; for any
+the path (the content of a write is not shown; a path that goes through a symbolic link is shown as
+`given -> real` and is at least `high`); for a web fetch, host, path and query; for any
 tool the bridge does not know (an MCP tool), the tool's name, the fields that identify its
 target, and the size of its input, always `high`. Any character that is not printable ASCII
 is shown as `?` and rates the call at least `high`. A call whose arguments look like a
@@ -883,17 +884,23 @@ starting with `B>` are frames the bridge sends, lines starting with `#@` are thi
 happen that are not frames (audio, time passing, the connection dropping), and lines
 starting with `#` are commentary.
 
-This is not an illustration: `test/server.e2e.test.ts` **replays it against a live bridge**.
-It sends each `D>` line, performs each `#@` action, and compares what the bridge sends with
-the `B>` lines that follow, byte for byte and in order, so the order of the `state` messages
-around an `ask` is the order a real bridge produces. (The bridge here asks for 60 seconds, not
-the default 90, and a scripted Claude asks to run `npm test` and then `rm -rf build`.)
-`test/protocol.test.ts` also decodes every line and re-encodes it to prove it is canonical.
+This is not an illustration: `test/server.e2e.test.ts` **replays it against a live bridge**, and the
+bridge is the stock one, `node src/main.ts --fake-claude --fake-delay-ms 0 --ask-ttl-sec 60` with the
+token `example.token_0123456789~abcdef`, so anyone can type the `D>` lines at it and read the same
+frames back. The test sends each `D>` line, performs each `#@` action, and compares what the bridge
+sends with the `B>` lines that follow, byte for byte and in order, so the order of the `state` messages
+around an `ask` is the order a real bridge produces. Three things differ from run to run of a real
+bridge and are fixed from outside by the test: the clock (the waits are not real), the two ask ids (a real
+bridge makes up random ones) and the session name (`fake-1` is the first scripted session of a fresh
+process). The scripted Claude picks what to do from the words of the prompt: "run" or "test" makes it
+ask to run `npm test`, "edit" makes it ask to edit `src/app.ts`; the speech recognizer of fake mode always
+hears "please run the tests". `test/protocol.test.ts` also decodes every line and re-encodes it to prove
+it is canonical.
 
 ```transcript
 # 1. Connect. The device speaks first; its token is a placeholder here.
 D> {"t":"hello","v":1,"token":"example.token_0123456789~abcdef","dev":"tamaclaude-a1b2","fw":"0.1.0","rate":16000,"bits":16,"ch":1}
-B> {"t":"hello_ack","v":1,"ok":true,"sid":"c0ffee00-1234-4abc-8def-0123456789ab"}
+B> {"t":"hello_ack","v":1,"ok":true,"sid":"fake-1"}
 B> {"t":"state","seq":1,"ph":"idle","tl":"","pend":0}
 # 2. Keepalive at the application level (optional; see Keepalive).
 D> {"t":"ping","n":1}
@@ -904,11 +911,11 @@ B> {"t":"state","seq":2,"ph":"listening","tl":"","pend":0}
 #@ mic 25 frames of 640 bytes (20 ms each)
 D> {"t":"listen","m":"stop"}
 B> {"t":"state","seq":3,"ph":"transcribing","tl":"","pend":0}
-B> {"t":"stt","text":"run the unit tests"}
+B> {"t":"stt","text":"please run the tests"}
 B> {"t":"state","seq":4,"ph":"idle","tl":"","pend":0}
 # 4. Nothing runs yet: a transcript is only shown. The player reads it and taps SEND,
 #    so the device sends it as a say. Only now does a turn start.
-D> {"t":"say","text":"run the unit tests"}
+D> {"t":"say","text":"please run the tests"}
 B> {"t":"state","seq":5,"ph":"thinking","tl":"","pend":0}
 # 5. Claude starts a command, so the phase is `tool`, and then asks. The ask comes before the
 #    state that reports it, and only the tap can allow it.
@@ -921,15 +928,15 @@ B> {"t":"state","seq":8,"ph":"tool","tl":"Bash","pend":0}
 B> {"t":"state","seq":9,"ph":"thinking","tl":"","pend":0}
 # 6. The turn ends: one result, and the phase settles back to idle via done. `done` is
 #    followed by `idle` at once; the device times its own celebration.
-B> {"t":"result","ok":true,"text":"All 42 tests pass."}
+B> {"t":"result","ok":true,"text":"I ran npm test."}
 B> {"t":"state","seq":10,"ph":"done","tl":"","pend":0}
 B> {"t":"state","seq":11,"ph":"idle","tl":"","pend":0}
-# 7. A second turn asks about a risky command; then the Wi-Fi drops with the ask still open.
-D> {"t":"say","text":"delete the build folder"}
+# 7. A second turn asks to edit a file; then the Wi-Fi drops with the ask still open.
+D> {"t":"say","text":"edit the file"}
 B> {"t":"state","seq":12,"ph":"thinking","tl":"","pend":0}
-B> {"t":"state","seq":13,"ph":"tool","tl":"Bash","pend":0}
-B> {"t":"ask","id":"b7d24e90","tl":"Bash","risk":"high","sum":"rm -rf build","ttl":60}
-B> {"t":"state","seq":14,"ph":"asking","tl":"Bash","pend":1}
+B> {"t":"state","seq":13,"ph":"tool","tl":"Edit","pend":0}
+B> {"t":"ask","id":"b7d24e90","tl":"Edit","risk":"med","sum":"src/app.ts","ttl":60}
+B> {"t":"state","seq":14,"ph":"asking","tl":"Edit","pend":1}
 #@ wait 10 seconds
 #@ drop the connection
 #@ wait 9 seconds
@@ -937,14 +944,14 @@ B> {"t":"state","seq":14,"ph":"asking","tl":"Bash","pend":1}
 #    open), then the ask again with its REMAINING ttl.
 #@ reconnect
 D> {"t":"hello","v":1,"token":"example.token_0123456789~abcdef","dev":"tamaclaude-a1b2","fw":"0.1.0","rate":16000,"bits":16,"ch":1}
-B> {"t":"hello_ack","v":1,"ok":true,"sid":"c0ffee00-1234-4abc-8def-0123456789ab"}
-B> {"t":"state","seq":1,"ph":"asking","tl":"Bash","pend":1}
-B> {"t":"ask","id":"b7d24e90","tl":"Bash","risk":"high","sum":"rm -rf build","ttl":41}
+B> {"t":"hello_ack","v":1,"ok":true,"sid":"fake-1"}
+B> {"t":"state","seq":1,"ph":"asking","tl":"Edit","pend":1}
+B> {"t":"ask","id":"b7d24e90","tl":"Edit","risk":"med","sum":"src/app.ts","ttl":41}
 D> {"t":"ask_rsp","id":"b7d24e90","ok":false}
 B> {"t":"ask_end","id":"b7d24e90","why":"answered"}
-B> {"t":"state","seq":2,"ph":"tool","tl":"Bash","pend":0}
+B> {"t":"state","seq":2,"ph":"tool","tl":"Edit","pend":0}
 B> {"t":"state","seq":3,"ph":"thinking","tl":"","pend":0}
-B> {"t":"result","ok":true,"text":"I did not delete anything because you denied it."}
+B> {"t":"result","ok":true,"text":"Edit (src/app.ts) was refused, so it did not run. The user denied this action on their handheld device. Do not retry it; ask what they would like instead."}
 B> {"t":"state","seq":4,"ph":"done","tl":"","pend":0}
 B> {"t":"state","seq":5,"ph":"idle","tl":"","pend":0}
 # 9. The same id answered again is unknown now.

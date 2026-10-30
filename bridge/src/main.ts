@@ -41,7 +41,7 @@ import { readFileSync, statSync } from 'node:fs';
 import { homedir, networkInterfaces } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
-import { checkManagedLock, claudeDriverFactory, DEFAULT_STALL_MS } from './drivers/claude.ts';
+import { AUTO_MEMORY_SWITCH, checkManagedLock, claudeDriverFactory, DEFAULT_STALL_MS, NEVER_PASS } from './drivers/claude.ts';
 import type { ClaudeDriverConfig, ManagedLockStatus } from './drivers/claude.ts';
 import { fakeDriverFactory } from './drivers/fake.ts';
 import { inspectProjectMemory, MEMORY_MAX_BYTES } from './memory.ts';
@@ -50,6 +50,7 @@ import { startServer } from './server.ts';
 import type { RunningServer, ServerOptions } from './server.ts';
 import { clearSession } from './store.ts';
 import { ScriptedStt } from './stt.ts';
+import { sanitize } from './text.ts';
 import { AUTO_RUN_TOOLS, bridgeSecretsInside, describeTool, needsTap, setBridgeSecrets } from './tools.ts';
 import { LIMITS } from './types.ts';
 import type { DriverFactory, Logger } from './types.ts';
@@ -165,7 +166,10 @@ Claude
                          counted as silence.
   --pass-env <names>     environment variables, comma separated or repeated, that the
                          commands Claude runs may see. Everything else of this
-                         process's environment stays behind (BRIDGE_TOKEN never goes).
+                         process's environment stays behind. A name the bridge sets
+                         itself is refused here (BRIDGE_TOKEN, ANTHROPIC_API_KEY and
+                         the CLAUDE_CODE_DISABLE_* switches that keep background work,
+                         workflows and the CLI's own memory off).
   --setting-sources <l>  OPT-IN: Claude Code settings files to read, a comma list of user,
                          project, local, or none (the default, and the only safe setting
                          for a repository you do not trust). With none, the bridge reads
@@ -404,12 +408,26 @@ export function parseConfig(argv: string[], env: Record<string, string | undefin
 }
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
-/** Names the child never gets, with the reason the operator is told. */
-const NEVER_PASSED = new Map<string, string>([
+
+/**
+ * Why each name the driver sets for itself may not be given with --pass-env. WHICH names are refused is NOT decided
+ * here: it is `NEVER_PASS` in the driver, the very list the driver applies when it builds the child's environment.
+ * This file used to keep a second copy of the names (three of the driver's four, later three of five), so
+ * `--pass-env CLAUDE_CODE_DISABLE_WORKFLOWS` was accepted at start-up and then dropped by the driver with a log line
+ * nobody reads. Only the explanations live here, and test/main.test.ts fails for a name without one.
+ */
+export const NEVER_PASSED_WHY: ReadonlyMap<string, string> = new Map([
   ['BRIDGE_TOKEN', 'it is the credential that lets a process connect as the device; passing it would let the commands Claude runs approve their own asks'],
   ['ANTHROPIC_API_KEY', 'the key is always passed, and it is the one from this process'],
   ['CLAUDE_CODE_DISABLE_BACKGROUND_TASKS', 'the bridge turns background work off for a voice session and nothing may turn it back on'],
+  ['CLAUDE_CODE_DISABLE_WORKFLOWS', 'the Workflow tool starts background agents whatever the other switches say, so the bridge turns it off and nothing may turn it back on'],
+  [AUTO_MEMORY_SWITCH, "the bridge switches the CLI's own memory off (what an earlier session left in ~/.claude would be read with no tap) and nothing may turn it back on"],
 ]);
+
+/** Every name the child is never given, with the reason the operator is told: the driver's list, explained. */
+export const NEVER_PASSED: ReadonlyMap<string, string> = new Map(
+  [...NEVER_PASS].map((name): [string, string] => [name, NEVER_PASSED_WHY.get(name) ?? 'the bridge sets it itself and nothing may undo that']),
+);
 
 function parsePassEnv(raw: readonly string[]): string[] {
   const out: string[] = [];
@@ -519,11 +537,28 @@ function memoryLines(config: Config, info: BannerInfo): string[] {
   if (m.sources.length === 0) {
     out.push('  memory  none: no CLAUDE.md or .claude/CLAUDE.md in the working directory');
   } else {
-    out.push(`  memory  ${m.sources.join(', ')}, read by the bridge as plain text (no @imports followed)`);
+    out.push(`  memory  ${m.sources.join(', ')}, read by the bridge as plain text (no @imports and no links followed)`);
     if (m.truncated) out.push(`          CUT at ${MEMORY_MAX_BYTES / 1024} KB: the rest of it is not given to Claude`);
   }
-  for (const s of m.skipped) out.push(`          not used: ${s.file} ${s.why}`);
+  // Said beside the file list, not instead of it: how the directory was read (a working directory that is itself a link).
+  // Squeezed to one printable ASCII line again here: a real path can hold anything, and this is the operator's terminal.
+  for (const n of m.notes ?? []) out.push(`          ${sanitize(n, 240)}`);
+  for (const s of m.skipped) out.push(`          not used: ${sanitize(s.file, 60)} ${sanitize(s.why, 240)}`);
   return out;
+}
+
+/**
+ * What the bridge cannot stop, said on every start: git itself reads the repository's `.git/config` when Claude Code
+ * starts (a status, a log), and a clean filter defined there runs a program. The CLI turns off git's hooks and its file-system
+ * monitor for those commands; it does not turn off filters, and nothing here can: it happens before any tool call exists
+ * for the device to be asked about. The source of such a config is a repository that arrived WITH its `.git` directory
+ * (an archive, a copied folder) or a `.git/config` edited by a call somebody tapped; `git clone` does not copy configuration.
+ */
+function gitLines(): string[] {
+  return [
+    "  git     NOT covered: a filter in the repository's own .git/config can run a program when Claude starts (git reads it).",
+    '          Use --cwd only for a repository whose .git directory you trust; a clone you made yourself does not bring one.',
+  ];
 }
 
 /**
@@ -556,15 +591,17 @@ export function renderBanner(config: Config, urls: readonly string[], info: Bann
       `  devices ${config.allowLocalDevice ? 'on this machine AND elsewhere' : 'only on other machines (a device on this machine is refused)'}`,
     );
     lines.push(
-      `  no tap  ${CLI_FREE_TOOLS.join(', ')} inside the working directory (a search or a listing is a Bash call and asks); ` +
-        'every other call asks the device first',
+      `  no tap  ${CLI_FREE_TOOLS.join(', ')} inside the working directory, through no symbolic link and not a credential store ` +
+        '(a search or a listing is a Bash call and asks); every other call asks the device first',
     );
     lines.push(
       config.settingSources.length === 0
-        ? '  settings none are read: nothing in the repository or in ~/.claude can change how Claude runs'
+        ? '  settings none are read: no settings file, hook, helper, MCP server, skill, plugin or command of the repository or of ' +
+            "~/.claude is loaded, and the CLI's own auto-memory is off"
         : `  settings ${config.settingSources.join(', ')} (OPT-IN, see the warning below)`,
     );
     lines.push(...memoryLines(config, info));
+    lines.push(...gitLines());
     lines.push(
       config.turnStallSec === 0
         ? '  stall   a turn is never ended for silence (--turn-stall-sec 0)'

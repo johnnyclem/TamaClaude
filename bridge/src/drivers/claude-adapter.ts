@@ -60,9 +60,11 @@ export type AdapterEvent =
  * CODE, which arrives with the first retry. Printable ASCII, one line, under the wire limit.
  *
  * NO IDENTIFIERS WITH UNDERSCORES OR ASTERISKS in these sentences: the server runs result text
- * through src/text.ts, which reads markdown, and `ANTHROPIC_API_KEY` reached the device as
- * `ANTHROPICAPIKEY` (measured). test/claude-adapter.test.ts holds every sentence here to "the
- * sanitiser leaves it unchanged", so this cannot come back.
+ * through src/text.ts, which reads markdown, and `ANTHROPIC_API_KEY` once reached the device as
+ * `ANTHROPICAPIKEY` (measured; text.ts keeps an underscore inside a word now). The sentences keep to
+ * plain words anyway, because they are the one text nobody can correct afterwards: test/claude-adapter.test.ts
+ * holds every sentence here to "the sanitiser leaves it unchanged" and to "no character a markdown reader
+ * could eat".
  */
 export const GIVE_UP: ReadonlyMap<string, string> = new Map([
   ['authentication_failed', 'the API key was rejected. Check the key the bridge was started with.'],

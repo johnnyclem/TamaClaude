@@ -34,8 +34,11 @@
  * WHICH CALLS MAY RUN WITHOUT A TAP. The driver asks the device about every call that is
  * not hard-denied and not rated 'low' here (see `needsTap`). 'low' is therefore the
  * auto-run set, and it is deliberately tiny: the built-in READ-ONLY tools (AUTO_RUN_TOOLS)
- * aimed at a place INSIDE the session's working directory (symlinks followed) that is
- * not a secret store and does not contain one. Everything else, including every Bash
+ * aimed at a place INSIDE the session's working directory that is not a secret store and
+ * does not contain one, whose path goes through NO symbolic link (a link is followed to where
+ * it really lands, that place is judged too, and the path is still never free: see "Where a
+ * path REALLY lands") and has no glob character that is not simply a literal name. Everything
+ * else, including every Bash
  * command however harmless it looks, every write, every web tool and every MCP tool, is
  * 'med' or 'high' and needs a tap. test/tools.test.ts enumerates this set from the SDK's
  * own tool list so a new built-in cannot join it by accident.
@@ -44,7 +47,7 @@
  * (see "COVERAGE" below); the tests exercise both columns so the list cannot rot.
  */
 
-import { realpathSync } from 'node:fs';
+import { lstatSync, readlinkSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { posix } from 'node:path';
 import type { DescribeTool, Risk, ToolView } from './types.ts';
@@ -113,22 +116,181 @@ const CONFIG_REASON = "writes Claude Code's own configuration (.claude/, .claude
 
 const GLOB_CHARS = /[*?[]/;
 
-function globToRegex(comp: string): RegExp | undefined {
-  try {
-    const body = comp.replace(/[.+^${}()|\\]/g, '\\$&').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]');
-    return new RegExp(`^${body}$`, 'i');
-  } catch {
-    return undefined; // an unbalanced [ ... ] is not a pattern we can reason about
+// ---------------------------------------------------------------------------
+// Glob matching
+//
+// THE MATCHER IS NOT A REGULAR EXPRESSION, and that is the whole point of it. This file used to
+// turn each glob component into a RegExp (`*` became `[^/]*`), and a run of adjacent stars is a
+// nested quantifier: fourteen of them froze the bridge's only thread for 12 seconds, twenty for
+// half an hour, twenty-six for days, from a call that is rated 'low' and so never reaches a human.
+// Whatever builds a matcher from text a model chose must not be able to backtrack, so this one is
+// the classic two-pointer wildcard match: it remembers only the LAST star and, when a mismatch
+// comes, retries from just after it. That is at most (pattern tokens x name length) steps, whatever
+// the pattern looks like, and runs of stars are collapsed while compiling so `********` is one
+// token. Flagging a pattern as "too wild to be one anybody typed" (`tooWild`) is a separate,
+// rating decision; it is not what keeps the matcher fast.
+// ---------------------------------------------------------------------------
+
+/** A glob longer than this (stars collapsed) is not one anybody typed to find a file: it is asked about, never matched. */
+const MAX_GLOB = 1024;
+/** More wildcard characters than this in one word, or a run of five stars, is rated high instead of being believed. */
+const MAX_WILDCARDS = 24;
+const STAR_RUN_RE = /\*{5,}/;
+
+type GlobTok =
+  | { k: 'star' }
+  | { k: 'any' }
+  | { k: 'lit'; c: string }
+  | { k: 'set'; neg: boolean; ranges: readonly (readonly [string, string])[] };
+
+/** Counts the matcher's inner steps, so a test can assert on WORK done instead of on a clock. */
+export interface GlobMeter {
+  steps: number;
+}
+
+/** `[...]` starting at `p[i]`: the set and the index just past its `]`, or undefined when it is not closed (bash then reads `[` literally). */
+function parseSet(p: string, i: number): { tok: GlobTok; next: number } | undefined {
+  let j = i + 1;
+  const neg = p[j] === '!' || p[j] === '^';
+  if (neg) j++;
+  const from = j;
+  if (p[j] === ']') j++; // a `]` first in the set is a member, not the end
+  while (j < p.length && p[j] !== ']') j++;
+  if (j >= p.length) return undefined;
+  const body = p.slice(from, j);
+  const ranges: [string, string][] = [];
+  for (let k = 0; k < body.length; k++) {
+    if (body[k + 1] === '-' && k + 2 < body.length) {
+      ranges.push([body[k]!, body[k + 2]!]);
+      k += 2;
+    } else ranges.push([body[k]!, body[k]!]);
+  }
+  return { tok: { k: 'set', neg, ranges }, next: j + 1 };
+}
+
+/** One path component's pattern as tokens (lower-cased: file names are compared without case, as on macOS). undefined when it is over the cap. */
+function compileGlob(pattern: string): GlobTok[] | undefined {
+  if (pattern.length > MAX_GLOB) return undefined;
+  const p = pattern.toLowerCase();
+  const out: GlobTok[] = [];
+  for (let i = 0; i < p.length; i++) {
+    const c = p[i]!;
+    if (c === '*') {
+      if (out[out.length - 1]?.k !== 'star') out.push({ k: 'star' });
+    } else if (c === '?') out.push({ k: 'any' });
+    else if (c === '[') {
+      const set = parseSet(p, i);
+      if (set === undefined) out.push({ k: 'lit', c });
+      else {
+        out.push(set.tok);
+        i = set.next - 1;
+      }
+    } else out.push({ k: 'lit', c });
+  }
+  return out;
+}
+
+function matchTok(t: GlobTok, ch: string, meter: GlobMeter | undefined): boolean {
+  switch (t.k) {
+    case 'any': return true;
+    case 'lit': return t.c === ch;
+    case 'set': {
+      if (meter) meter.steps += t.ranges.length;
+      let hit = false;
+      for (const [lo, hi] of t.ranges) if (ch >= lo && ch <= hi) hit = true;
+      return hit !== t.neg;
+    }
+    default: return false;
   }
 }
 
+/** Does a compiled component match `name`? At most (tokens x name length) steps, whatever the tokens. */
+function runGlob(toks: readonly GlobTok[], name: string, meter?: GlobMeter): boolean {
+  const s = name.toLowerCase();
+  let ti = 0;
+  let si = 0;
+  let starT = -1;
+  let starS = 0;
+  while (si < s.length) {
+    if (meter) meter.steps++;
+    const t = toks[ti];
+    if (t !== undefined && t.k === 'star') {
+      starT = ti++;
+      starS = si;
+      continue;
+    }
+    if (t !== undefined && matchTok(t, s[si]!, meter)) {
+      ti++;
+      si++;
+      continue;
+    }
+    if (starT < 0) return false;
+    ti = starT + 1;
+    si = ++starS;
+  }
+  while (toks[ti]?.k === 'star') ti++;
+  return ti === toks.length;
+}
+
+/**
+ * Shell-style match of ONE path component (`*`, `?`, `[a-z]`, `[!x]`; case-insensitive; no `/` handling).
+ * Exported for the tests, which pin its work with a `GlobMeter`.
+ */
+export function globMatch(pattern: string, name: string, meter?: GlobMeter): boolean {
+  const toks = compileGlob(pattern);
+  return toks !== undefined && runGlob(toks, name, meter);
+}
+
+/** How many `*`, `?` and `[` a word has: what a person typing a glob never needs more than a handful of. */
+function wildcardCount(word: string): number {
+  let n = 0;
+  for (let i = 0; i < word.length; i++) {
+    const c = word.charCodeAt(i);
+    if (c === 42 || c === 63 || c === 91) n++;
+  }
+  return n;
+}
+
+/** The word with each run of stars made one: the form the matcher actually works on, and the one its cost is judged by. */
+const collapseStars = (word: string): string => word.replace(/\*{2,}/g, '*');
+
+/**
+ * A glob nobody typed: a pile of wildcards, a run of stars, or one too long to match. Rated high
+ * wherever it appears (it is the shape of an attack on the analyser, and of a search for secrets
+ * the lists cannot spell), and never handed to the matcher when it is over the length cap.
+ */
+function tooWild(word: string): boolean {
+  if (!GLOB_CHARS.test(word)) return false;
+  return wildcardCount(word) > MAX_WILDCARDS || STAR_RUN_RE.test(word) || collapseStars(word).length > MAX_GLOB;
+}
+
+/**
+ * The units a Bash word's glob matching costs against the work bound: the pattern's length times the
+ * (short) names it is matched with. Measured: one unit is about ten microseconds, and a glob word is
+ * matched against ~120 secret names and roots, so a pattern character costs close to a unit.
+ */
+const GLOB_UNITS_PER_CHAR = 0.9;
+const globUnits = (word: string): number => 4 + Math.ceil(collapseStars(word).length * GLOB_UNITS_PER_CHAR);
+
+/** The pattern components of `word` that can be matched at all (under the cap), compiled once. */
+function globComps(word: string): { comp: string; toks: GlobTok[] }[] {
+  const out: { comp: string; toks: GlobTok[] }[] = [];
+  if (!GLOB_CHARS.test(word) || tooWild(word)) return out;
+  for (const comp of word.split('/')) {
+    if (!GLOB_CHARS.test(comp)) continue;
+    const toks = compileGlob(comp);
+    if (toks !== undefined) out.push({ comp, toks });
+  }
+  return out;
+}
+
+const CONFIG_NAMES = ['.claude', '.claude.json', '.mcp.json'];
+
 /** Does a glob component such as `.cl*` or `.clau?e` expand to a config name? Bash never matches a leading dot with `*`. */
 function globHitsConfig(word: string): boolean {
-  if (!GLOB_CHARS.test(word)) return false;
-  for (const comp of word.split('/')) {
-    if (!comp.startsWith('.') || !GLOB_CHARS.test(comp)) continue;
-    const re = globToRegex(comp);
-    if (re && (re.test('.claude') || re.test('.claude.json') || re.test('.mcp.json'))) return true;
+  for (const { comp, toks } of globComps(word)) {
+    if (!comp.startsWith('.')) continue;
+    if (CONFIG_NAMES.some((n) => runGlob(toks, n))) return true;
   }
   return false;
 }
@@ -148,6 +310,12 @@ function globHitsConfig(word: string): boolean {
 export const SECRET_LISTS = {
   /** A directory with one of these names, at any depth, is a secret store. */
   dirs: ['.ssh', '.aws', '.gnupg', '.kube', '.docker', '.azure', '.password-store', '.oci', '.terraform.d', '.ibmcloud', '.bluemix', '.minikube'],
+  /**
+   * A directory a project keeps its credentials in (`secrets/db_password`, Docker and Kubernetes secrets), at any depth.
+   * Not in `dirs` on purpose: every `dirs` entry is also a ROOT under the home directory, and a root named like an
+   * ordinary folder would make `ls ~/*` a warning.
+   */
+  projectDirs: ['secrets', '.secrets'],
   /** `~/.config/<app>` directories that hold a login. */
   configApps: ['gcloud', 'gh', 'hub', 'doctl', 'rclone', 'op', 'heroku', 'huggingface'],
   /** Absolute places that are secret stores wherever the project lives. `/proc` is all of it: `environ` is every secret of a process, `cmdline` every argument. */
@@ -172,17 +340,53 @@ export const SECRET_LISTS = {
    */
   pairs: [['.git', 'config'], ['.claude', 'settings.local.json'], ['library', 'keychains']],
   /** `.<name>` dotfiles that carry a login. */
-  dotfiles: ['npmrc', 'netrc', 'pypirc', 'git-credentials', 'pgpass', 'my.cnf', 's3cfg', 'boto', 'htpasswd', 'vault-token', 'dockercfg', 'terraformrc', 'yarnrc.yml', 'yarnrc.yaml'],
+  dotfiles: [
+    'npmrc', 'netrc', 'pypirc', 'git-credentials', 'pgpass', 'my.cnf', 's3cfg', 'boto', 'htpasswd', 'vault-token', 'dockercfg', 'terraformrc',
+    'yarnrc.yml', 'yarnrc.yaml', 'gitconfig', 'kubeconfig',
+  ],
   /** `id_<type>` and `id_<type>_sk`: private keys. */
   keyTypes: ['rsa', 'dsa', 'ecdsa', 'ed25519'],
   /** `anything.<extension>`: key material and state that holds it. */
-  extensions: ['pem', 'key', 'p12', 'pfx', 'jks', 'keystore', 'kdbx', 'tfstate', 'tfvars'],
+  extensions: [
+    'pem', 'key', 'p12', 'pfx', 'jks', 'keystore', 'kdbx', 'tfstate', 'tfvars',
+    // Apple and PuTTY private keys, Java and PKCS#12 stores, a VPN profile (it embeds its key), an encrypted file, a Terraform variable file in JSON.
+    'p8', 'pkcs12', 'ppk', 'jceks', 'ovpn', 'gpg', 'tfvars.json',
+  ],
   /** `secret.<ext>` and `secrets.<ext>`. */
   secretsExtensions: ['json', 'yaml', 'yml', 'toml', 'env', 'txt'],
   /** A shell or REPL history: every command ever typed, including the ones with a password on them. (`*_history` is a pattern.) */
   historyFiles: ['.history', '.zhistory', '.lesshst', '.viminfo'],
   /** `token.<ext>`, `bridge.token`, `access_token.json`: a file named for the credential it holds. Source code (`token.ts`) is not on the list. */
   tokenExtensions: ['txt', 'json', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf', 'dat', 'key', 'secret'],
+  /**
+   * Whole file names (lower case) that hold a login and fit no other family. Cloud and CI tools write them with
+   * these exact names, which is how they are found by anybody who has read the tool's documentation.
+   */
+  exactNames: [
+    'kubeconfig', 'serviceaccountkey.json', 'service_account.json', 'rootkey.csv', 'accesstokens.json', 'auth.json', 'passwords.txt', 'password.txt',
+    'passwords.csv', 'passwords.json', 'wp-config.php',
+  ],
+  /**
+   * A file whose name STARTS with one of these and ends in a data extension (below), or is exactly the prefix, is a credential:
+   * `firebase-adminsdk-abc.json`, `client_secret_123.apps.googleusercontent.com.json`, `AuthKey_ABC123.p8`, `github_pat.txt`.
+   */
+  credentialPrefixes: [
+    'firebase-adminsdk', 'client_secret', 'client-secret', 'authkey_', 'private_key', 'private-key', 'privatekey',
+    'gcp-key', 'gcp_key', 'gcloud-key', 'github_pat', 'github-pat',
+  ],
+  /** The extensions of a data file (not of source code): what a credential prefix or a `password` name needs to be a credential. */
+  dataExtensions: ['json', 'csv', 'txt', 'p8', 'pem', 'key', 'yaml', 'yml', 'env', 'dat', 'conf', 'cfg', 'ini', 'toml'],
+  /**
+   * What a backup, a rotation or an editor leaves beside a file, after a `.`, `_` or `-`: `id_rsa.bak`, `.netrc.old`,
+   * `terraform.tfstate.backup`. A copy of a secret is the secret. (A trailing `~`, a number and a date are forms of their
+   * own, listed in `backupForms`.)
+   */
+  backupTails: ['bak', 'old', 'orig', 'save', 'saved', 'backup', 'bkp', 'swp', 'swo', 'tmp', 'temp', 'copy', 'prev', 'previous', 'new'],
+  /**
+   * EXAMPLES, not a pattern: a suffix of each KIND of backup, so a test can append every one to every secret name and
+   * demand that it is still caught. `backupTails` entries are covered by their own loop; these are the structural forms.
+   */
+  backupForms: ['~', '.1', '.12', '.2023-01-01', '.20230101', '-2023-01-01', '.bak', '.swp', '_old', '-backup', '.bak.1'],
   /**
    * Names a secret-hunting GLOB would match (`**\/.env*`, `*.pem`). Deliberately not every name above:
    * a sample for `*.yaml` or `*.txt` would ask about every search for configuration or notes.
@@ -191,6 +395,7 @@ export const SECRET_LISTS = {
     '.env', '.envrc', '.ssh', '.aws', '.gnupg', '.kube', '.docker', '.azure', '.npmrc', '.netrc', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519',
     'x.pem', 'x.key', 'x.p12', 'x.pfx', 'x.jks', 'x.keystore', 'x.kdbx', 'x.tfstate', 'x.tfvars', 'credentials', 'credentials.json',
     '.bash_history', '.zsh_history', 'token', '.token', 'bridge.token', '.tamaclaude-token', 'secrets.json',
+    'kubeconfig', 'x.ovpn', 'x.gpg', 'x.p8', 'x.ppk',
   ],
 } as const;
 
@@ -210,6 +415,8 @@ const ENV_TEMPLATE_RE = /^\.env\.(example|sample|template|dist)$/;
 
 export const SECRET_NAME_PATTERNS: readonly SecretNamePattern[] = [
   { re: /^\.env(rc)?(\..+)?$/, examples: ['.env', '.envrc', '.env.local', '.env.production', '.envrc.local'], last: false },
+  // `prod.env`, `app.env`: a file named for being an environment file holds one.
+  { re: /^[\w-]+\.env$/, examples: ['prod.env', 'app.env', 'my-app.env'], last: false },
   { re: new RegExp(`^\\.(?:${anyOf(SECRET_LISTS.dotfiles)})$`), examples: SECRET_LISTS.dotfiles.map((n) => `.${n}`), last: false },
   {
     re: new RegExp(`^id_(?:${anyOf(SECRET_LISTS.keyTypes)})(?:_sk)?$`),
@@ -221,6 +428,19 @@ export const SECRET_NAME_PATTERNS: readonly SecretNamePattern[] = [
   // credentials, .credentials.json, application_default_credentials.json
   { re: /(?:^|[._-])credentials(?:\.[\w.]+)?$/, examples: ['credentials', '.credentials.json', 'application_default_credentials.json', 'aws-credentials'], last: false },
   { re: /^service-account.*\.json$/, examples: ['service-account.json', 'service-account-prod.json'], last: false },
+  { re: new RegExp(`^(?:${anyOf(SECRET_LISTS.exactNames)})$`), examples: SECRET_LISTS.exactNames, last: false },
+  {
+    re: new RegExp(`^(?:${anyOf(SECRET_LISTS.credentialPrefixes)})(?:$|[\\w.-]*\\.(?:${anyOf(SECRET_LISTS.dataExtensions)})$)`),
+    examples: SECRET_LISTS.credentialPrefixes.flatMap((p) => [p, `${p}-abc123.json`, `${p}_x.apps.example.com.json`]),
+    last: false,
+  },
+  // A file named for the password it holds (`db_password`, `passwords.csv`), but not source code about passwords (`password.ts`)
+  // and not `/etc/passwd`, which holds none.
+  {
+    re: new RegExp(`(?:^|[._-])(?:passwords?|passphrase)(?:\\.(?:${anyOf(SECRET_LISTS.dataExtensions)}))?$`),
+    examples: ['db_password', 'password', 'my-passwords', 'passphrase', 'password.json', 'db.password.txt'],
+    last: true,
+  },
   { re: /^\.?token$/, examples: ['token', '.token'], last: false },
   {
     re: new RegExp(`^secrets?\\.(?:${anyOf(SECRET_LISTS.secretsExtensions)})$`),
@@ -240,18 +460,49 @@ export const SECRET_NAME_PATTERNS: readonly SecretNamePattern[] = [
   },
 ];
 
+// -- backup, rotated and editor copies -----------------------------------------------------------
+//
+// A secret's name used to be matched ANCHORED AT THE END, so `id_rsa.bak`, `.netrc.old`,
+// `terraform.tfstate.backup` and `.bash_history.1` were read without a tap: the copy is the secret.
+// The tail is taken off first (up to three times: `id_rsa.bak.1`) and the name that is left is judged by
+// the same patterns. The forms are the ones backups, logrotate, vim, emacs and people leave behind.
+
+const BACKUP_TAIL_RE = new RegExp(
+  `(?:[._-](?:${anyOf(SECRET_LISTS.backupTails)})|~|\\.\\d{1,10}|[._-]\\d{4}-?\\d{2}-?\\d{2}(?:[t_-]?\\d{2,6})?)$`,
+);
+
+/** The names a file called `name` may be a copy of (never `name` itself): `.id_rsa.swp` is a copy of `id_rsa`. */
+function backupBases(name: string): string[] {
+  const out: string[] = [];
+  let cur = name;
+  // Emacs: `#id_rsa#` is the auto-save of `id_rsa` and `.#id_rsa` its lock.
+  const emacs = /^#(.+)#$/.exec(cur) ?? /^\.#(.+)$/.exec(cur);
+  if (emacs) {
+    cur = emacs[1]!;
+    out.push(cur);
+  }
+  for (let i = 0; i < 3; i++) {
+    const m = BACKUP_TAIL_RE.exec(cur);
+    if (m === null || m.index === 0) break;
+    cur = cur.slice(0, m.index);
+    out.push(cur);
+  }
+  // vim's swap file is `.name.swp`: the leading dot belongs to the swap file, not to the name.
+  if (out.length > 0 && cur.startsWith('.') && cur.length > 1) out.push(cur.slice(1));
+  return out;
+}
+
 /** The list names, for the code that reads them. */
 const SECRET_DIRS: ReadonlySet<string> = new Set(SECRET_LISTS.dirs);
+const SECRET_PROJECT_DIRS: ReadonlySet<string> = new Set(SECRET_LISTS.projectDirs);
 const SECRET_CONFIG_APPS: ReadonlySet<string> = new Set(SECRET_LISTS.configApps);
 const SECRET_SAMPLES: readonly string[] = SECRET_LISTS.globSamples;
 
 /** `**\/.env*` or `*.pem` names secret files. A pattern needs three literal characters to count, so `*` and `*.ts` do not. */
 function globHitsSecret(word: string): boolean {
-  if (!GLOB_CHARS.test(word)) return false;
-  for (const comp of word.split('/')) {
-    if (!GLOB_CHARS.test(comp) || comp.replace(/[*?[\]]/g, '').length < 3) continue;
-    const re = globToRegex(comp);
-    if (re && SECRET_SAMPLES.some((n) => re.test(n))) return true;
+  for (const { comp, toks } of globComps(word)) {
+    if (comp.replace(/[*?[\]]/g, '').length < 3) continue;
+    if (SECRET_SAMPLES.some((n) => runGlob(toks, n))) return true;
   }
   return false;
 }
@@ -269,24 +520,26 @@ function configComps(comps: string[]): boolean {
 
 /** The longest a single file name can be on any file system we run on. */
 const MAX_NAME = 255;
-/** A glob this long is not one anybody typed to find a file: it is asked about rather than matched. */
-const MAX_GLOB = 1024;
 
 /** Secret stores: reading one hands the model credentials, writing one changes who the machine trusts. */
 function sensitiveComps(comps: string[]): boolean {
   for (let i = 0; i < comps.length; i++) {
     const c = comps[i]!.toLowerCase();
     const next = (comps[i + 1] ?? '').toLowerCase();
-    if (SECRET_DIRS.has(c)) return true;
+    if (SECRET_DIRS.has(c) || SECRET_PROJECT_DIRS.has(c)) return true;
     if (c === '.config' && SECRET_CONFIG_APPS.has(next)) return true;
     for (const [a, b] of SECRET_LISTS.pairs) if (c === a && next === b) return true;
-    if (c === '.claude.json') return true; // OAuth account, MCP server environments
     // No file system has a name this long, so nothing real hides here; and a few of these patterns
     // backtrack, which a megabyte of `.credentials.credentials...` must not be able to exploit.
     if (c.length > MAX_NAME) continue;
-    if (ENV_TEMPLATE_RE.test(c)) continue;
     const isFile = i === comps.length - 1;
-    for (const p of SECRET_NAME_PATTERNS) if ((isFile || !p.last) && p.re.test(c)) return true;
+    // The name itself, and every name it may be a backup or an editor copy of.
+    const names = [c, ...backupBases(c)];
+    if (names.includes('.claude.json')) return true; // OAuth account, MCP server environments
+    for (const name of names) {
+      if (ENV_TEMPLATE_RE.test(name)) continue;
+      for (const p of SECRET_NAME_PATTERNS) if ((isFile || !p.last) && p.re.test(name)) return true;
+    }
   }
   return false;
 }
@@ -360,19 +613,22 @@ function reachesSecret(abs: string, home: string): boolean {
  * A glob word such as `/pro?/self/environ` or `/etc/sh*`, matched component by component
  * against the secret stores, in both directions (it may name something inside one, or a
  * directory that contains one). Bash's `*` never matches a leading dot, so it does not here.
+ * A word nobody typed (`tooWild`) is a hit without being matched: that is the rating, and it
+ * keeps the matching itself bounded by the length cap.
  */
 function globHitsSecretRoot(word: string, home: string): boolean {
   if (!GLOB_CHARS.test(word)) return false;
-  if (word.length > MAX_GLOB) return true;
+  if (tooWild(word)) return true;
   const comps = word.split('/').filter((c) => c !== '' && c !== '.');
-  const res = comps.map((c) => (GLOB_CHARS.test(c) ? globToRegex(c) : undefined));
+  // Compiled once per component, then tried against every root.
+  const progs = comps.map((c) => (GLOB_CHARS.test(c) ? compileGlob(c) : undefined));
   for (const root of secretRoots(home)) {
     const rc = root.split('/').filter((c) => c !== '');
     const n = Math.min(comps.length, rc.length);
     let ok = n > 0;
     for (let i = 0; i < n && ok; i++) {
-      const re = res[i];
-      if (GLOB_CHARS.test(comps[i]!)) ok = re !== undefined && re.test(rc[i]!) && (!rc[i]!.startsWith('.') || comps[i]!.startsWith('.'));
+      const prog = progs[i];
+      if (GLOB_CHARS.test(comps[i]!)) ok = prog !== undefined && runGlob(prog, rc[i]!) && (!rc[i]!.startsWith('.') || comps[i]!.startsWith('.'));
       else ok = comps[i]!.toLowerCase() === rc[i]!.toLowerCase();
     }
     if (ok) return true;
@@ -428,7 +684,7 @@ function inspectPath(raw: string, resolveFrom: string | undefined, baseCwd: stri
     comps = norm.split('/').filter((c) => c !== '' && c !== '.');
   }
   const all = norm.split('/').filter((c) => c !== '' && c !== '.');
-  const literal = sensitiveComps(all) || sensitiveAbs(norm, home) || globHitsSecretRoot(abs ?? norm, home);
+  const lit = sensitiveComps(all) || sensitiveAbs(norm, home) || globHitsSecretRoot(abs ?? norm, home);
   return {
     abs,
     norm,
@@ -436,14 +692,220 @@ function inspectPath(raw: string, resolveFrom: string | undefined, baseCwd: stri
     comps,
     config: configComps(all) || globHitsConfig(raw),
     hidden: comps.some((c) => c.startsWith('.') && c !== '..'),
-    sensitive: literal || globHitsSecret(raw),
-    sensitiveLiteral: literal,
+    sensitive: lit || globHitsSecret(raw),
+    sensitiveLiteral: lit,
   };
 }
 
 function displayPath(info: PathInfo, baseCwd: string | undefined): string {
   if (info.abs !== undefined && baseCwd !== undefined && info.inside) return posix.relative(baseCwd, info.abs) || '.';
   return info.abs ?? info.norm;
+}
+
+// ---------------------------------------------------------------------------
+// Where a path REALLY lands
+//
+// A symlink is a path that names a different place than it spells, and a rule that judges the
+// spelling is judging the wrong thing. Three bypasses of that kind shipped, all the same shape:
+//  - a link inside the project to `.git`, `.claude`, `~/.config/gh`: the spelling is in the project;
+//  - the same link NAMED with a glob character (`g[0]`): the resolution used to cut the path at
+//    the first wildcard component, and for a Read, whose path is a literal, that meant it stopped
+//    before it had followed anything;
+//  - a Write through a link into $HOME, shown with a project-looking path.
+// So every path is walked component by component (lstat, readlink), the way the kernel does it
+// (both readings of a `..` are walked: the kernel's, which goes to the parent of a link's TARGET,
+// and a normaliser's), and what it lands on is judged by the same rules as what it says. A path that
+// goes through a link is never rated 'low': whatever the link's target, the panel would otherwise show
+// the human a place other than the one that is read or written, so it says both.
+//
+// What is NOT done: a wildcard component is matched against the secret lists, never EXPANDED against
+// the file system, so a pattern that merely could match a link (`g?/config` with a link `g0`) is not
+// followed; only names that are spelled out are. (The README says so; test/tools.test.ts pins it.)
+// ---------------------------------------------------------------------------
+
+/** What `lstat` says about one place. */
+type Kind = { t: 'missing' } | { t: 'dir' } | { t: 'file' } | { t: 'error' } | { t: 'link'; target: string };
+const K_MISSING: Kind = { t: 'missing' };
+const K_DIR: Kind = { t: 'dir' };
+const K_FILE: Kind = { t: 'file' };
+const K_ERROR: Kind = { t: 'error' };
+
+const isMissing = (e: unknown): boolean => {
+  const code = (e as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+};
+
+function lstatKind(path: string): Kind {
+  try {
+    const st = lstatSync(path, { throwIfNoEntry: false });
+    if (st === undefined) return K_MISSING;
+    if (st.isSymbolicLink()) return { t: 'link', target: readlinkSync(path) };
+    return st.isDirectory() ? K_DIR : K_FILE;
+  } catch (e) {
+    return isMissing(e) ? K_MISSING : K_ERROR;
+  }
+}
+
+/** The kernel follows at most this many links in one path (Linux MAXSYMLINKS); past it the answer is "a loop". */
+const MAX_HOPS = 40;
+/** A path of more components than this is not walked: it is reported as unresolvable, which is rated high. */
+const MAX_WALK_COMPS = 256;
+/** Components handled in one walk, links' own targets included: a link can add as many as a path may hold, forty times over. */
+const MAX_WALK_STEPS = 1024;
+
+interface Walk {
+  /** The place the path lands: absolute, with no link in it. */
+  real: string;
+  /** At least one link was followed on the way (links in the working directory's own prefix do not count). */
+  linked: boolean;
+  /** A loop, a path too deep to walk, an error that is not plain absence, or the work bound ran out. */
+  broken: boolean;
+}
+
+interface Resolver {
+  /** Walk `comps` (names, `.` and `..`) starting from `base`, a real absolute directory. Never throws. */
+  walk(base: string, comps: readonly string[]): Walk;
+}
+
+/**
+ * `charge` is told one unit per file system call that was not answered from this resolver's own
+ * cache (the Bash analyser passes its work counter; the tools that have no counter pass nothing and
+ * are bounded by MAX_WALK_COMPS, MAX_WALK_STEPS and MAX_HOPS). The cache lives as long as the resolver,
+ * which is one analysis: nothing is remembered between calls, because the file system changes between them.
+ */
+function makeResolver(charge?: (units: number) => boolean): Resolver {
+  const kinds = new Map<string, Kind>();
+  const kindOf = (path: string): Kind | undefined => {
+    const hit = kinds.get(path);
+    if (hit !== undefined) return hit;
+    if (charge !== undefined && !charge(1)) return undefined;
+    const k = lstatKind(path);
+    kinds.set(path, k);
+    return k;
+  };
+  return {
+    walk(base, comps) {
+      const cur = base.split('/').filter((c) => c !== '');
+      if (comps.length > MAX_WALK_COMPS) return { real: posix.join(base, ...comps.filter((c) => c !== '..')), linked: false, broken: true };
+      const pending: string[] = [];
+      for (let i = comps.length - 1; i >= 0; i--) pending.push(comps[i]!);
+      let hops = 0;
+      let steps = 0;
+      let linked = false;
+      let broken = false;
+      // Once a component is missing, nothing beneath it exists: the rest is appended without asking the file system.
+      let gone = false;
+      while (pending.length > 0) {
+        const c = pending.pop()!;
+        if (c === '' || c === '.') continue;
+        if (++steps > MAX_WALK_STEPS) {
+          broken = true;
+          gone = true;
+        }
+        if (c === '..') {
+          cur.pop(); // `cur` has no link in it, so its parent is the lexical parent
+          continue;
+        }
+        if (!gone) {
+          const k = kindOf('/' + [...cur, c].join('/'));
+          if (k === undefined || k.t === 'error') {
+            broken = true;
+            gone = true;
+          } else if (k.t === 'missing') gone = true;
+          else if (k.t === 'link') {
+            linked = true;
+            if (++hops > MAX_HOPS) {
+              broken = true;
+              gone = true;
+            } else {
+              if (k.target.startsWith('/')) cur.length = 0;
+              const tc = k.target.split('/');
+              for (let i = tc.length - 1; i >= 0; i--) pending.push(tc[i]!);
+              continue;
+            }
+          }
+        }
+        cur.push(c);
+      }
+      return { real: '/' + cur.join('/'), linked, broken };
+    },
+  };
+}
+
+/** A place a path really lands, judged. */
+interface Landing {
+  real: string;
+  linked: boolean;
+  broken: boolean;
+  /** `real` inspected against the real working directory. */
+  info: PathInfo;
+}
+
+interface Lander {
+  /**
+   * Every place `abs` can land. `abs` is the lexical (normalised) path; `rawAbs` the same with its `..`
+   * left in, because the kernel resolves `link/..` through the link and a normaliser does not, and both
+   * readings are judged. A PATTERN is walked as the literal string it is, which is how a link NAMED `g[0]`
+   * is found; its wildcard components are never expanded against the file system (see the README).
+   * The walk goes on through names that do not exist, so there is no need to cut a pattern at its first wildcard.
+   */
+  of(abs: string, o?: { rawAbs?: string | undefined }): Landing[];
+  /** The working directory's own display of a real path: relative when it lies inside. */
+  show(l: Landing): string;
+}
+
+function makeLander(rv: Resolver, cwd: string | undefined, home: string): Lander {
+  // Looked up on first use, not when the lander is made: the Bash analyser builds it before its work counter exists.
+  let realCwd: string | undefined;
+  let looked = false;
+  const real = (): string | undefined => {
+    if (!looked && cwd !== undefined) {
+      looked = true;
+      const w = rv.walk('/', cwd.split('/'));
+      realCwd = w.broken ? cwd : w.real;
+    }
+    return realCwd;
+  };
+  const prefix = cwd === undefined ? undefined : cwd === '/' ? '/' : cwd + '/';
+  const land = (v: string): Landing => {
+    // The part of the path inside the working directory starts from its real self: a link in the cwd's own
+    // prefix (/tmp on macOS) is how the session was started, not something the path goes through.
+    const rc = real();
+    const w =
+      cwd !== undefined && rc !== undefined && prefix !== undefined && (v === cwd || v.startsWith(prefix))
+        ? rv.walk(rc, v.slice(cwd.length).split('/'))
+        : rv.walk('/', v.split('/'));
+    // Judged like any path, glob rules included: what a pattern lands on still has the pattern's wildcards in its tail.
+    return { real: w.real, linked: w.linked, broken: w.broken, info: inspectPath(w.real, undefined, rc, home) };
+  };
+  return {
+    of(abs, o = {}) {
+      const variants = new Set<string>([abs]);
+      if (o.rawAbs !== undefined) variants.add(o.rawAbs);
+      const out: Landing[] = [];
+      const seen = new Set<string>();
+      for (const v of variants) {
+        const l = land(v);
+        const key = `${l.real}\0${l.linked}\0${l.broken}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(l);
+      }
+      return out;
+    },
+    show(l) {
+      const rc = real();
+      return l.info.inside && rc !== undefined ? posix.relative(rc, l.real) || '.' : l.real;
+    },
+  };
+}
+
+/** The path with its `..` left in, when it has any: what the kernel is handed, as opposed to what a normaliser makes of it. */
+function rawAbsOf(raw: string, from: string | undefined, home: string): string | undefined {
+  const e = expandHome(raw, home);
+  if (!e.includes('..')) return undefined;
+  if (e.startsWith('/')) return e;
+  return from === undefined ? undefined : `${from}/${e}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -907,7 +1369,10 @@ function parseScript(src: string, depth: number, ctx: ParseCtx): Seg[] {
 //     "$(echo ~)", echo ~ | xargs rm -rf, rsync --delete, mv ~ /tmp/x)
 //   - only the TOP level of a system directory is protected: rm -rf /usr/lib is not denied
 //     (prefix matching would also refuse rm -rf /home/me/project)
-//   - symlinks, bind mounts, and relative paths after a cd that is not a literal
+//   - bind mounts, and relative paths after a cd that is not a literal. Symlinks ARE followed for path
+//     words, but against the file system as it is when the line is analysed: a link the same line makes
+//     (`ln -s ~/.ssh k && cat k/id_rsa`) does not exist yet. (Here the target is named, so it is 'high'
+//     anyway; a target computed at run time is 'high' as a computed path.)
 //   - `find` behind a wrapper this file does not list (`parallel find / -delete ::: x`): its rule
 //     runs at the command position only, because applying it to every word spelled `find` made the
 //     analysis exponential. (rm, chmod, dd, git and the rest still apply wherever they appear.)
@@ -970,6 +1435,8 @@ interface State {
   ctx: ParseCtx;
   /** Units of analysis work spent so far; see BASH_WORK_LIMIT. */
   work: number;
+  /** Follows symlinks for the path words, paying for each file system call out of `work`. */
+  lander: Lander;
 }
 
 const noteDeny = (st: State, why: string): void => {
@@ -985,12 +1452,19 @@ const noteDeny = (st: State, why: string): void => {
  * Both are fixed at the root, and this bound is what keeps the NEXT shape of that bug a refusal
  * instead of a freeze.
  *
- * One unit is roughly ten microseconds: one segment parsed, one segment analysed, one rule applied,
- * one path inspected (four when it is a glob, which is matched against every secret store), or
- * WORDS_PER_UNIT plain words looked at. Past BASH_WORK_LIMIT the analysis stops and the command is
- * refused: nobody reviews a command of that size on a 25 character panel, and a refusal is final
- * only for that command (the model is told to split it up). 5 000 units is about twice what a
- * 300 line script spends (measured: 2 300) and bounds the worst stall to under a tenth of a second.
+ * One unit is at most ten microseconds: one segment parsed, one segment analysed, one rule applied,
+ * one path inspected (a glob pays for its LENGTH as well, see `globUnits`, because it is matched against
+ * every secret store), one file system call made to follow a link, or WORDS_PER_UNIT plain words looked at.
+ * Past BASH_WORK_LIMIT the analysis stops and the command is refused: nobody reviews a command of that size
+ * on a 25 character panel, and a refusal is final only for that command (the model is told to split it up).
+ * 5 000 units is about twice what a 300 line script spends (measured: 2 300). MEASURED worst cases: a
+ * command that spends the whole budget on glob words takes under 20 ms.
+ *
+ * What the bound does NOT cover is the scan of the text itself: it is linear in the size of the command, so
+ * the largest command accepted (MAX_COMMAND_CHARS, 1 MiB) costs between a third of a second and a second per
+ * `describeTool` call on the machine this was measured on, and the driver calls it more than once per tool
+ * call. That is a bounded pause, not a freeze, and it is the reason the cap exists; a command anywhere near it
+ * is not one a person can review in 96 characters.
  */
 export const BASH_WORK_LIMIT = 5000;
 const WORDS_PER_UNIT = 8;
@@ -1435,7 +1909,18 @@ function writeTarget(raw: string, st: State): void {
     noteDeny(st, CONFIG_REASON);
     return;
   }
-  if (!info.inside || info.hidden || info.sensitive) st.high = true;
+  let risky = !info.inside || info.hidden || info.sensitive;
+  // Output written through a link lands where the link points, which is not what the line says.
+  if (info.abs !== undefined && st.baseCwd !== undefined) {
+    for (const l of st.lander.of(info.abs, { rawAbs: rawAbsOf(target, st.cwd, st.home) })) {
+      if (l.info.config) {
+        noteDeny(st, CONFIG_REASON);
+        return;
+      }
+      if (l.linked || l.broken || !l.info.inside || l.info.hidden || l.info.sensitive) risky = true;
+    }
+  }
+  if (risky) st.high = true;
 }
 
 /**
@@ -1575,17 +2060,30 @@ function analyzeSeg(seg: Seg, depth: number, st: State): void {
   // Secret stores named anywhere in the command (cat ~/.ssh/id_rsa, source .env, tr -d x < /proc/1/environ).
   // Input redirects name files too; the command word itself is not a path to a secret.
   const named = words.filter((_w, k) => k !== found.idx);
+  // Only the command's own words can be written by it; an input redirect (`< file`) is a read, whatever the command.
+  const wordCount = named.length;
   for (const r of seg.redirects) if (r.op === '<' || r.op === '<>') named.push(r.target);
   const searches = SEARCHERS.has(cmd);
-  for (const w of named) {
+  for (const [ni, w] of named.entries()) {
     const v = w.replace(/^[-\w]+=/, '');
     if (/\s/.test(v) || v.length > 512 || v.startsWith('-')) continue;
     for (const alt of braceExpand(v)) {
-      // Inspecting a path is the dearest thing done per word, and a glob is matched against every secret store.
-      if (!spend(st, GLOB_CHARS.test(alt) ? 4 : 1)) return;
+      // Inspecting a path is the dearest thing done per word, and a glob is matched against every secret store:
+      // it pays for its length (and the lstat calls below pay for themselves, through the resolver).
+      if (!spend(st, GLOB_CHARS.test(alt) ? globUnits(alt) : 1)) return;
       const info = inspectPath(alt, st.cwd, st.baseCwd, st.home);
       // grep -r pattern ~ walks into ~/.ssh: a search is judged by what is beneath its directory too.
       if (info.sensitiveLiteral || (searches && info.abs !== undefined && reachesSecret(info.abs, st.home))) st.high = true;
+      // Where the word really points: `cat notes` is `cat ~/.ssh/id_rsa` when `notes` is a link to it, and
+      // `cp x link/hooks.json` writes the configuration when `link` points at `.claude`.
+      // (/dev/stdout and its siblings are links into /proc by design, and are what they say they are.)
+      if (info.abs !== undefined && st.baseCwd !== undefined && !SAFE_DEV_RE.test(alt)) {
+        for (const l of st.lander.of(info.abs, { rawAbs: rawAbsOf(alt, st.cwd, st.home) })) {
+          if (l.broken || l.info.sensitiveLiteral || (searches && reachesSecret(l.real, st.home))) st.high = true;
+          if (ni < wordCount && !readOnly && l.info.config) noteDeny(st, CONFIG_REASON);
+        }
+      }
+      if (overBudget(st)) return;
     }
   }
 
@@ -1637,8 +2135,13 @@ function mentionsZshCode(command: string): boolean {
 }
 
 function analyzeCommand(command: string, baseCwd: string | undefined): State {
-  const st: State = {
-    home: safeHome(),
+  const home = safeHome();
+  // The resolver is paid for out of the same bound as everything else, so a line of paths cannot make it a stall.
+  // (`st` is assigned just below; the resolver only runs once the analysis does.)
+  let st!: State;
+  const lander = makeLander(makeResolver((units) => spend(st, units)), baseCwd, home);
+  st = {
+    home,
     baseCwd,
     cwd: baseCwd,
     vars: new Map(),
@@ -1647,6 +2150,7 @@ function analyzeCommand(command: string, baseCwd: string | undefined): State {
     tooDeep: false,
     ctx: { nextGroup: 0, tooDeep: false },
     work: 0,
+    lander,
   };
   // Parsing is linear, but a megabyte of text still costs a second the bridge does not have; no
   // model writes a command this long on purpose, and a person cannot review it on the panel.
@@ -1720,52 +2224,40 @@ export const AUTO_RUN_TOOLS: readonly string[] = ['Read', 'Glob', 'Grep', 'LS', 
 const READERS = new Set(AUTO_RUN_TOOLS);
 const WRITERS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
 
-const isMissing = (e: unknown): boolean => {
-  const code = (e as NodeJS.ErrnoException | undefined)?.code;
-  return code === 'ENOENT' || code === 'ENOTDIR';
-};
+/**
+ * `rel` below `start` unless it already names a place of its own. NOT normalised: a `..` after a link means something
+ * other than a `..` after a directory, and `rawAbsOf` has to see it.
+ */
+const joinFrom = (start: string, rel: string): string => (rel.startsWith('/') || rel.startsWith('~') ? rel : `${start.replace(/\/+$/, '')}/${rel}`);
 
-/** The part of a glob up to its first wildcard component: the directory that really exists. */
-function literalPrefix(abs: string): string {
-  const comps = abs.split('/');
-  const k = comps.findIndex((c) => GLOB_CHARS.test(c));
-  return k < 0 ? abs : comps.slice(0, k).join('/') || '/';
+/** `s` cut to `n` characters by dropping its MIDDLE: the start says where it is, the end says what it is. */
+function midCut(s: string, n: number): string {
+  if (s.length <= n) return s;
+  if (n <= 3) return s.slice(s.length - Math.max(n, 0));
+  const tail = Math.ceil((n - 3) * 0.6);
+  return s.slice(0, n - 3 - tail) + '...' + s.slice(s.length - tail);
 }
 
 /**
- * Where a path REALLY lands once symlinks are followed, judged against the real working
- * directory. A link inside the project that points at ~/.ssh is not inside the project, and
- * neither is a file about to be created beneath a link to /etc: a path that does not exist
- * yet is resolved through its nearest directory that does.
- * `undefined` means "cannot tell" (the cwd itself does not exist), so the lexical answer
- * stands; 'unknown' means it could not be resolved for a reason that is not absence (a loop,
- * a name too long, a NUL byte), which is treated as outside.
+ * `given -> landing`: what the call said and where it really goes, in one summary that fits. Each side
+ * keeps what it needs and the longer one gives way, because a link's two ends are what the human is
+ * deciding about and cutting off the tail of either would show a place that is not the one it names.
  */
-function realInfo(abs: string, cwd: string, home: string): PathInfo | 'unknown' | undefined {
-  let realCwd: string;
-  try {
-    realCwd = realpathSync(cwd);
-  } catch {
-    return undefined;
-  }
-  const tail: string[] = [];
-  let probe = literalPrefix(abs);
-  for (;;) {
-    try {
-      return inspectPath(posix.join(realpathSync(probe), ...tail), undefined, realCwd, home);
-    } catch (e) {
-      const up = posix.dirname(probe);
-      if (!isMissing(e) || up === probe) return isMissing(e) ? undefined : 'unknown';
-      tail.unshift(posix.basename(probe));
-      probe = up;
-    }
-  }
+function bothPaths(given: string, landing: string): string {
+  const a = toAscii(plain(given));
+  const b = toAscii(plain(landing));
+  const sep = ' -> ';
+  const room = LIMITS.summaryMax - sep.length;
+  if (a.length + b.length <= room) return a + sep + b;
+  const half = Math.floor(room / 2);
+  let la = half;
+  let lb = room - half;
+  if (a.length <= half) lb = room - a.length;
+  else if (b.length <= room - half) la = room - b.length;
+  return midCut(a, la) + sep + midCut(b, lb);
 }
 
-/** `rel` resolved from `start` unless it already names a place of its own. */
-const joinFrom = (start: string, rel: string): string => (rel.startsWith('/') || rel.startsWith('~') ? rel : posix.join(start, rel));
-
-function viewReader(name: string, input: Record<string, unknown>, cwd: string | undefined, home: string): ToolView {
+function viewReader(name: string, input: Record<string, unknown>, cwd: string | undefined, home: string, lander: Lander): ToolView {
   const target = str(input.file_path) ?? str(input.notebook_path) ?? str(input.path);
   const pattern = str(input.pattern);
   const glob = str(input.glob);
@@ -1778,26 +2270,35 @@ function viewReader(name: string, input: Record<string, unknown>, cwd: string | 
   // The places this call touches. A search starts at its path argument, or at the cwd.
   const searches = name === 'Glob' || name === 'Grep';
   const start = searches ? (target ?? cwd) : target;
-  const places: { raw: string; nameLike: boolean }[] = [];
-  if (start !== undefined) places.push({ raw: start, nameLike: true });
+  // A path is a LITERAL name (a Read does not expand anything), a Glob pattern or Grep filter may be a glob; every place is
+  // judged both ways: as the literal string (a link NAMED `g[0]` is found that way, and so is what the lists say about the
+  // name), and as the pattern it could be (the glob rules in `inspectPath`).
+  const places: { raw: string; nameLike: boolean; isStart: boolean }[] = [];
+  if (start !== undefined) places.push({ raw: start, nameLike: true, isStart: true });
   const filter = name === 'Glob' ? pattern : name === 'Grep' ? glob : undefined;
-  if (start !== undefined && filter !== undefined) places.push({ raw: joinFrom(start, filter), nameLike: name === 'Glob' });
+  if (start !== undefined && filter !== undefined) places.push({ raw: joinFrom(start, filter), nameLike: name === 'Glob', isStart: false });
   // A read with nothing to read, or a search with nothing to search for, is malformed: not an auto-run.
   if (start === undefined || (searches && pattern === undefined)) risk = raiseTo(risk, 'med');
 
-  for (const { raw, nameLike } of places) {
+  let shown: Landing | undefined;
+  for (const { raw, nameLike, isStart } of places) {
     const info = inspectPath(raw, cwd, cwd, home);
     // Reading a secret store is not harmless: what is read is sent to the model.
     if (info.sensitive) risk = raiseTo(risk, 'high');
     // A look-alike character makes the path on the panel a different path from the one read.
     if (nameLike && spoofable(raw)) risk = raiseTo(risk, 'high');
     // grep -r over a directory that CONTAINS ~/.ssh reads it, though nothing names it.
-    if (name === 'Grep' && raw === start && info.abs !== undefined && reachesSecret(info.abs, home)) risk = raiseTo(risk, 'high');
+    if (name === 'Grep' && isStart && info.abs !== undefined && reachesSecret(info.abs, home)) risk = raiseTo(risk, 'high');
     if (!info.inside) risk = raiseTo(risk, 'med');
-    else if (cwd !== undefined && info.abs !== undefined) {
-      const real = realInfo(info.abs, cwd, home);
-      if (real === 'unknown' || (real !== undefined && !real.inside)) risk = raiseTo(risk, 'med');
-      if (real !== undefined && real !== 'unknown' && real.sensitive) risk = raiseTo(risk, 'high');
+    if (cwd === undefined || info.abs === undefined) continue;
+    // Where it REALLY goes. A path through a link is never an auto-run, whatever the link points at: the
+    // panel would show a place other than the one that is read. And what it lands on is judged as itself.
+    for (const l of lander.of(info.abs, { rawAbs: rawAbsOf(raw, cwd, home) })) {
+      if (l.linked || l.broken) risk = raiseTo(risk, 'high');
+      if (l.info.sensitive) risk = raiseTo(risk, 'high');
+      else if (!l.info.inside) risk = raiseTo(risk, 'med');
+      if (name === 'Grep' && isStart && reachesSecret(l.real, home)) risk = raiseTo(risk, 'high');
+      if (l.linked && shown === undefined) shown = l;
     }
   }
 
@@ -1805,23 +2306,29 @@ function viewReader(name: string, input: Record<string, unknown>, cwd: string | 
   if (searches) summary = target !== undefined && pattern !== undefined ? `${pattern} in ${target}` : (pattern ?? target ?? name);
   else if (target !== undefined) summary = pathSummary(displayPath(inspectPath(target, cwd, cwd, home), cwd));
   else summary = name;
-  return finish(name, { risk, summary: plain(summary) });
+  summary = shown === undefined ? plain(summary) : bothPaths(summary, lander.show(shown));
+  return finish(name, { risk, summary });
 }
 
-function viewWriter(name: string, input: Record<string, unknown>, cwd: string | undefined, home: string): ToolView {
+function viewWriter(name: string, input: Record<string, unknown>, cwd: string | undefined, home: string, lander: Lander): ToolView {
   const target = name === 'NotebookEdit' ? (str(input.notebook_path) ?? str(input.file_path)) : (str(input.file_path) ?? str(input.notebook_path));
   // A write whose target we cannot read is one we cannot judge.
   if (target === undefined) return finish(name, { risk: 'high', summary: name });
   const info = inspectPath(target, cwd, cwd, home);
-  const summary = pathSummary(displayPath(info, cwd));
-  if (info.config) return finish(name, { risk: 'high', summary, deny: CONFIG_REASON });
+  let summary = pathSummary(displayPath(info, cwd));
   let risk: Risk = !info.inside || info.hidden || info.sensitive || spoofable(target) ? 'high' : 'med';
-  // Writing through a link inside the project writes wherever it points.
+  let config = info.config;
+  // Writing through a link inside the project writes wherever it points, and the panel says where that is.
   if (cwd !== undefined && info.abs !== undefined) {
-    const real = realInfo(info.abs, cwd, home);
-    if (real !== undefined && real !== 'unknown' && real.config) return finish(name, { risk: 'high', summary, deny: CONFIG_REASON });
-    if (real === 'unknown' || (real !== undefined && (!real.inside || real.sensitive || real.hidden))) risk = 'high';
+    let shown: Landing | undefined;
+    for (const l of lander.of(info.abs, { rawAbs: rawAbsOf(target, cwd, home) })) {
+      if (l.info.config) config = true;
+      if (l.linked || l.broken || !l.info.inside || l.info.sensitive || l.info.hidden) risk = 'high';
+      if (l.linked && shown === undefined) shown = l;
+    }
+    if (shown !== undefined) summary = bothPaths(summary, lander.show(shown));
   }
+  if (config) return finish(name, { risk: 'high', summary, deny: CONFIG_REASON });
   return finish(name, { risk, summary });
 }
 
@@ -1932,13 +2439,16 @@ function identifySummary(name: string, input: Record<string, unknown>, keys: Set
 const WRITER_NAME_RE = /write|edit|create|save|put|append|replace|move|rename|copy|delete|remove|patch|update|touch|mkdir|insert|upload|overwrite|modify|set/i;
 
 /** Rated 'high' without exception: nothing here knows what the tool does, only what it was aimed at. */
-function viewUnknown(name: string, input: Record<string, unknown>, cwd: string | undefined, home: string): ToolView {
+function viewUnknown(name: string, input: Record<string, unknown>, cwd: string | undefined, home: string, lander: Lander): ToolView {
   const summary = identifySummary(name, input, IDENT_KEYS, true);
   // A file-writing tool we have never heard of (an MCP filesystem server) that is pointed at
-  // Claude Code's configuration is the same attack through a different door.
+  // Claude Code's configuration is the same attack through a different door, and so is one pointed at a LINK to it.
   if (WRITER_NAME_RE.test(labelFor(name))) {
     for (const v of Object.values(input)) {
-      if (typeof v === 'string' && v.length <= 1024 && !/\s/.test(v.trim()) && inspectPath(v.trim(), cwd, cwd, home).config) {
+      if (typeof v !== 'string' || v.length > 1024 || /\s/.test(v.trim())) continue;
+      const info = inspectPath(v.trim(), cwd, cwd, home);
+      if (info.config) return finish(name, { risk: 'high', summary, deny: CONFIG_REASON });
+      if (cwd !== undefined && info.abs !== undefined && lander.of(info.abs, { rawAbs: rawAbsOf(v.trim(), cwd, home) }).some((l) => l.info.config)) {
         return finish(name, { risk: 'high', summary, deny: CONFIG_REASON });
       }
     }
@@ -2059,12 +2569,14 @@ function describe(name: string, input: Record<string, unknown>, cwd: string | un
   const home = safeHome();
   if (name === 'Bash') return viewBash(name, input, cwd);
   if (name === 'Agent' || name === 'Task') return viewAgent(name, input);
-  if (READERS.has(name)) return viewReader(name, input, cwd, home);
-  if (WRITERS.has(name)) return viewWriter(name, input, cwd, home);
+  // One resolver per call: what it learns about the file system lives exactly as long as the analysis does.
+  const lander = makeLander(makeResolver(), cwd, home);
+  if (READERS.has(name)) return viewReader(name, input, cwd, home, lander);
+  if (WRITERS.has(name)) return viewWriter(name, input, cwd, home, lander);
   if (name === 'WebFetch') return viewWebFetch(name, input);
   if (name === 'WebSearch') return viewWebSearch(name, input);
   if (SESSION_TOOLS.has(name)) return viewSession(name, input);
-  return viewUnknown(name, input, cwd, home);
+  return viewUnknown(name, input, cwd, home, lander);
 }
 
 /** `os.homedir()` throws when the account has no home; the answer must not become "deny everything". */

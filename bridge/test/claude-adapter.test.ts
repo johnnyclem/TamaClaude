@@ -938,9 +938,15 @@ test('every give-up sentence reaches the device exactly as written: the text san
   }
 });
 
-test('the sanitiser check can fail: the old sentence with its variable name does not survive it', () => {
-  const old = 'Claude API error 401: the API key was rejected. Check ANTHROPIC_API_KEY.';
-  assert.notEqual(summarizeForDevice(old, LIMITS.resultMax), old);
+test('the sanitiser check can fail: a sentence with markup in it does not survive it', () => {
+  // Emphasis and code ticks are markup under any reading of text.ts, so this stays a real companion whatever it
+  // decides about an underscore inside a word (it once deleted them, which is what the sentences above were
+  // written to avoid, and keeps them now).
+  const marked = 'Claude API error 401: the API key was **rejected**. Check `the key`.';
+  assert.notEqual(summarizeForDevice(marked, LIMITS.resultMax), marked);
+  // And the plain wording passes through, so the difference above is the markup's doing.
+  const plain = 'Claude API error 401: the API key was rejected. Check the key.';
+  assert.equal(summarizeForDevice(plain, LIMITS.resultMax), plain);
 });
 
 test('an error CODE that is also an Object.prototype name is not a give-up (the table is looked up as data)', () => {

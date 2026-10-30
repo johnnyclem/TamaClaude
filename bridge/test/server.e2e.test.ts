@@ -123,6 +123,8 @@ class FakeClock implements Clock {
   #live = new Map<number, { at: number; ms: number; fn: () => void }>();
   #sets = new Signal();
   #everSet: number[] = [];
+  /** Every callback ever handed to setTimeout, cleared or not: a test can run one the real clock had already queued (V10). */
+  readonly everSet: { ms: number; fn: () => void }[] = [];
 
   now(): number {
     return this.t;
@@ -131,6 +133,7 @@ class FakeClock implements Clock {
     const id = ++this.#seq;
     this.#live.set(id, { at: this.t + ms, ms, fn });
     this.#everSet.push(ms);
+    this.everSet.push({ ms, fn });
     this.#sets.fire();
     return id;
   }
@@ -1982,6 +1985,44 @@ test('an upgrade that carries an Origin header is refused: a web page is not a d
   if ('open' in ok) ok.open.terminate();
 });
 
+/** PROTOCOL.md's list of the HTTP statuses a device may see before the WebSocket exists, as [cause, status] (backticks removed). */
+function documentedStatuses(): Array<[string, number]> {
+  const flat = readFileSync(new URL('../PROTOCOL.md', import.meta.url), 'utf8').replace(/\s+/g, ' ');
+  const list = /status instead of `101`: (.*?) Any status other than `101`/.exec(flat)?.[1];
+  assert.ok(list, 'PROTOCOL.md no longer lists the statuses a device may see before the WebSocket exists');
+  return [...list.matchAll(/`(\d{3})` \(([^)]*)\)/g)].map((m): [string, number] => [m[2]!.replace(/`/g, ''), Number(m[1])]);
+}
+/** The status the document gives for the cause that matches `cause`; exactly one entry must match. */
+function documentedStatus(cause: RegExp): number {
+  const hits = documentedStatuses().filter(([c]) => cause.test(c));
+  assert.equal(hits.length, 1, `PROTOCOL.md should name exactly one status for ${cause}`);
+  return hits[0]![1];
+}
+
+test('V8: the HTTP statuses README and PROTOCOL.md promise -- 403, 404, 400, 408, 426 here, 503 in the shutdown test -- are the ones the server sends', async (t) => {
+  const flat = (file: string): string => readFileSync(new URL(file, import.meta.url), 'utf8').replace(/\s+/g, ' ');
+  const readme = flat('../README.md');
+  const local = /\*\*A device on this machine is refused in real mode\*\* \(HTTP (\d{3}) before any WebSocket\)/.exec(readme)?.[1];
+  const browser = /an upgrade with an `Origin` header gets a (\d{3})/.exec(readme)?.[1];
+  assert.ok(local && browser, 'the README states both statuses');
+  const refusing = await startRig(t, { server: { allowLocalDevice: false } });
+  assert.deepEqual(await tryUpgrade(refusing.url), { status: Number(local) }, 'a device on this machine');
+  const rig = await startRig(t, { server: { limits: { headersTimeoutMs: 100 } } });
+  assert.deepEqual(await tryUpgrade(rig.url, { headers: { Origin: 'https://evil.example' } }), { status: Number(browser) }, 'a browser');
+  assert.equal(local, browser, 'one status for both, as the document says');
+
+  // PROTOCOL.md: the whole list, and each entry against the behaviour that earns it. The set is typed out so that adding or
+  // renaming a status in the document without a behaviour to match it fails here.
+  assert.deepEqual(documentedStatuses().map(([, n]) => n).sort(), [400, 403, 404, 408, 426, 503]);
+  assert.equal(documentedStatus(/browser.*own machine/), Number(local), 'the document gives the same 403 for both causes');
+  const status = (raw: string): number => Number(/^HTTP\/1\.1 (\d{3}) /.exec(raw)?.[1]);
+  assert.deepEqual(await tryUpgrade(`${rig.url}other`), { status: documentedStatus(/path other than/) }, 'another path');
+  assert.equal(status(await rawExchange(rig.server.port, (s) => s.write('garbage\r\n\r\n'))), documentedStatus(/not HTTP at all/));
+  assert.equal(status(await rawExchange(rig.server.port, (s) => s.write('GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'))), documentedStatus(/plain request that is not an upgrade/));
+  assert.equal(status(await rawExchange(rig.server.port, (s) => s.write('GET / HTTP/1.1\r\nHost: x\r\n'))), documentedStatus(/not complete in time/));
+  assert.match(flat('../PROTOCOL.md'), new RegExp(`\\*\\*${DEFAULTS.headersTimeoutMs / 1000}\\s+seconds\\*\\* of the TCP connection opening, or the bridge answers \`${documentedStatus(/not complete in time/)}\``));
+});
+
 test('permessage-deflate is not negotiated, even when the client offers it', async (t) => {
   const rig = await startRig(t);
   const r = await tryUpgrade(rig.url, { perMessageDeflate: true });
@@ -3193,6 +3234,60 @@ test('C11: close() with a listen window open leaves no timer armed, and nothing 
   assert.equal(c.transcript.some(errOf('empty')), false, 'and no late error was sent to a device that was told the bridge is going away');
 });
 
+test('V10: close() takes the listen window down ITSELF, before any socket has finished closing', async (t) => {
+  // The test above passes for the wrong reason as well: closing the device's socket drops the window too (the device leaving),
+  // so a close() that forgot the window was still clean by the time it resolved. The window's own cleanup is what is pinned here:
+  // look at the clock right after close() is CALLED, which is before the socket's close event can have run.
+  const rig = await startRig(t, { server: { listenIdleMs: IDLE } });
+  const c = await rig.connect();
+  c.listen('start');
+  await c.waitForPhase('listening');
+  assert.equal(rig.clock.delays().includes(IDLE), true, 'control: the window has its timer');
+  const closing = rig.server.close();
+  assert.equal(rig.clock.delays().includes(IDLE), false, 'the timer was cleared by close() itself, synchronously');
+  assert.equal(rig.clock.armed, 0);
+  await closing;
+  rig.clock.advance(IDLE * 2);
+  assert.equal(c.transcript.some(errOf('empty')), false, 'and nothing fires into a closed server');
+});
+
+test('V10: a listen timer that fires after its window is gone does nothing -- it cannot end the NEXT window', async (t) => {
+  const stt = new ScriptedStt('after the restart');
+  const rig = await startRig(t, { server: { stt, listenIdleMs: IDLE } });
+  const c = await rig.connect();
+  c.listen('start');
+  await c.waitForPhase('listening');
+  const first = rig.clock.everSet.filter((e) => e.ms === IDLE).at(-1);
+  assert.ok(first, 'control: the first window armed a timer');
+
+  rig.clock.advance(5_000);
+  c.listen('start'); // a restart: the first window and its timer are gone, a second window opens
+  await c.sync();
+  c.sendPcm(2);
+  await c.sync();
+  rig.clock.advance(IDLE - 5_000); // exactly IDLE after the first window opened, only IDLE - 5 s after the second
+  await c.sync();
+  assert.equal(c.transcript.some(errOf('empty')), false, 'control: the second window is not idle yet');
+
+  // The callback the first window had registered runs anyway (a real clock may already have queued it when it was cleared).
+  // Judged by the first window's own last audio (IDLE ago) it would close the window, and the window that is open now is the
+  // second one: only the guard "is this still the current window?" stands between the stale callback and the new utterance.
+  first.fn();
+  await c.sync();
+  assert.equal(c.transcript.some(errOf('empty')), false, 'the stale callback ended nothing');
+  assert.equal(rig.logs.some((l) => /listen window had no audio/.test(l)), false, 'and logged nothing');
+  c.listen('stop');
+  assert.equal((await c.waitFor((m) => m.t === 'stt')).t, 'stt', 'the second window was still open, with its audio');
+  assert.equal(stt.received.length, 1, 'and it was transcribed');
+
+  // Companion: the guard did not disable the real timer. A window left alone still times out at its own deadline.
+  await c.waitForPhase('idle');
+  c.listen('start');
+  await c.waitForPhase('listening');
+  rig.clock.advance(IDLE);
+  assert.equal((await c.waitFor(errOf('empty'))).msg, 'listen window timed out');
+});
+
 // ===========================================================================
 // Smaller guards that used to survive deletion (M11), and the transport rows of PROTOCOL.md (C3-C7)
 // ===========================================================================
@@ -3283,6 +3378,7 @@ test('N4: an upgrade that reaches a server that is shutting down is answered 503
   sock.write(`Connection: Upgrade\r\nSec-WebSocket-Key: ${UPGRADE_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n`);
   await eventually(() => Promise.resolve(/\r\n\r\n/.test(answer)), 'the server to answer the upgrade');
   assert.match(answer, /^HTTP\/1\.1 503 Service Unavailable\r\n/, 'refused while shutting down; 101 would mean it became a WebSocket');
+  assert.equal(documentedStatus(/shutting down/), 503, 'and PROTOCOL.md gives the same status for it');
   assert.match(answer, /The bridge is shutting down\./);
   release();
   await closing;
@@ -3450,35 +3546,51 @@ function parseTranscript(block: string): ReplayStep[] {
   return steps;
 }
 
-test('the worked example in PROTOCOL.md is replayed against a live bridge: every frame is the one the document lists, in order', async (t) => {
+/** A fresh process's first scripted session is named `fake-1`; earlier tests in this file made others, so the name is pinned. */
+const EXAMPLE_SID = 'fake-1';
+
+test('the worked example in PROTOCOL.md is replayed against the STOCK `--fake-claude` bridge that main.ts composes: every frame is the one the document lists, in order', async (t) => {
   const doc = readFileSync(new URL('../PROTOCOL.md', import.meta.url), 'utf8');
   const block = /```transcript\n([\s\S]*?)```/.exec(doc)?.[1];
   assert.ok(block, 'PROTOCOL.md has no transcript block');
   const steps = parseTranscript(block);
   assert.ok(steps.length >= 15, 'the example is too short to be a conversation');
 
-  // The cast: a Claude that asks about `npm test` and then about `rm -rf build`, a recognizer that hears
-  // "run the unit tests", and the ids and token the document uses.
+  // The command line and the token are READ FROM THE DOCUMENT, so a sentence that says `--ask-ttl-sec 60` while the example's asks
+  // show another number, or a token that is not the one in the `hello` lines, is a disagreement this test sees.
+  const flat = doc.replace(/\s+/g, ' ');
+  const command = /the stock one, `node src\/main\.ts ((?:--[a-z-]+(?: \d+)?(?: |(?=`)))+)` with the token `([^`]+)`/.exec(flat);
+  assert.ok(command, 'the document no longer says which command the example is');
+  const flags = command[1]!.trim().split(' ');
+  assert.deepEqual(flags.filter((f) => f.startsWith('--')), ['--fake-claude', '--fake-delay-ms', '--ask-ttl-sec'], 'the stock bridge, with only the flags the example needs');
+  const token = command[2]!;
+  assert.ok(steps.some((st) => 'frame' in st.do && st.do.frame.includes(`"token":"${token}"`)), 'and the hello lines carry that token');
+
+  // The cast is NOT a script of this test's own (an earlier version replayed a driver and a recognizer written for the occasion,
+  // so the document described a bridge nobody could start). It is `node src/main.ts --fake-claude --fake-delay-ms 0 --ask-ttl-sec 60`
+  // as run() builds it: the scripted Claude, the canned recognizer, the loopback rules. Only the things that are different on every
+  // run are fixed from outside, and each is named in the document: the clock, the two ask ids, and the session name.
   const ids = ['a3f09c1e', 'b7d24e90'];
-  const sc = scripted(
-    async (d, prompt) => {
-      const [tool, command, ok, no] =
-        prompt === 'run the unit tests'
-          ? ['tu1', 'npm test', 'All 42 tests pass.', 'I did not run the tests because you denied it.']
-          : ['tu2', 'rm -rf build', 'Deleted the build folder.', 'I did not delete anything because you denied it.'];
-      d.emit({ k: 'tool_start', id: tool!, name: 'Bash' });
-      const decision = await d.permission('Bash', { command: command! });
-      d.emit({ k: 'tool_end', id: tool!, ok: decision.allow });
-      d.emit({ k: 'result', ok: true, text: decision.allow ? ok! : no!, subtype: 'success' });
-    },
-    { id: 'c0ffee00-1234-4abc-8def-0123456789ab' },
-  );
   const rig = await startRig(t, {
-    server: {
-      token: 'example.token_0123456789~abcdef',
-      driverFactory: sc.factory,
-      stt: new ScriptedStt('run the unit tests'),
-      newId: () => ids.shift() ?? 'ffffffff',
+    start: async ({ clock, log }) => {
+      const r = await run(
+        [...flags, '--port', '0', '--cwd', process.cwd()],
+        { BRIDGE_TOKEN: token },
+        { out: () => {}, err: () => {} },
+        {
+          startServer: (opts) =>
+            startServer({
+              ...opts,
+              clock,
+              newId: () => ids.shift() ?? 'ffffffff',
+              log: (l) => (opts.log?.(l), log(l)),
+              driverFactory: (o) => opts.driverFactory({ ...o, resume: EXAMPLE_SID }),
+            }),
+        },
+      );
+      assert.equal(r.exitCode, 0, 'run() came up');
+      assert.ok(r.server);
+      return r.server;
     },
   });
 
@@ -3506,6 +3618,7 @@ test('the worked example in PROTOCOL.md is replayed against a live bridge: every
     assert.deepEqual(client.rawFrames.slice(consumed), step.expect, `after: ${step.line}`);
     consumed = client.rawFrames.length;
   }
+  assert.equal(ids.length, 0, 'the document uses both ask ids, and no more');
 });
 
 // ===========================================================================
