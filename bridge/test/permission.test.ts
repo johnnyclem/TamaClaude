@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 import { ApprovalManager } from '../src/approvals.ts';
 import type { ApprovalEvent, ApprovalOutcome } from '../src/approvals.ts';
 import { createPermissionHandler } from '../src/permission.ts';
-import { ANALYSIS_FAILED, makeDescribeTool } from '../src/tools.ts';
+import { ANALYSIS_FAILED, UNSERVED_TOOL_NAMES, makeDescribeTool, setBridgeSecrets, unservedReason } from '../src/tools.ts';
 import type { Clock, DescribeTool, PermissionDecision, PermissionRequest, TimerHandle } from '../src/types.ts';
 
 const CWD = '/work/proj';
@@ -87,6 +87,17 @@ const req = (tool: string, input: Record<string, unknown>, signal: AbortSignal =
 });
 const PENDING = Symbol('pending');
 const peek = <T>(p: Promise<T>): Promise<T | typeof PENDING> => Promise.race([p, Promise.resolve(PENDING)]);
+
+/**
+ * A refusal must be IMMEDIATE: if the handler instead put the call in front of the device, `await handler()` would
+ * wait for a tap that never comes and the whole run would hang (finding M6). So a test about a refusal asks this,
+ * which turns "it asked" into a failed assertion.
+ */
+async function refused(r: Rig, request: PermissionRequest, what: string): Promise<PermissionDecision> {
+  const d = await peek(r.handler(request));
+  assert.notEqual(d, PENDING, `${what}: it was put to the device instead of being refused`);
+  return d as PermissionDecision;
+}
 
 const MSG = {
   denied: 'The user denied this action on their handheld device. Do not retry it; ask what they would like instead.',
@@ -399,22 +410,73 @@ test('H2: an analyser that crashes is a refusal the model is told about, never a
 // Tools the device cannot serve (finding L18), and what the ask shows (finding M2)
 // ---------------------------------------------------------------------------
 
-test('L18: AskUserQuestion and the scheduling tools are refused with a message that tells the model what to do instead', async () => {
-  for (const name of ['AskUserQuestion', 'ScheduleWakeup', 'CronCreate', 'CronDelete', 'CronList', 'Monitor']) {
+test('L18/K4/K5: every tool the device cannot serve is refused with the reason that tells the model what to do instead (the list is derived, not retyped)', async () => {
+  assert.ok(UNSERVED_TOOL_NAMES.length >= 16 && UNSERVED_TOOL_NAMES.includes('Skill') && UNSERVED_TOOL_NAMES.includes('Workflow'), 'the loop has something to loop over');
+  for (const name of UNSERVED_TOOL_NAMES) {
     const r = rig();
-    const d = await r.handler(req(name, { questions: [{ question: 'Which one?', options: ['a', 'b'] }] }));
+    const d = await refused(r, req(name, { questions: [{ question: 'Which one?', options: ['a', 'b'] }], script: 'export const meta = {}', skill: 'status' }), name);
     assert.equal(d.allow, false, name);
-    assert.equal(r.approvals.pendingCount(), 0, `${name}: allowing it would tell the model "the user did not answer"`);
+    assert.equal(r.approvals.pendingCount(), 0, `${name}: allowing it would tell the model something false, or run work nobody can see`);
     assert.ok(!('interrupt' in d), 'the turn goes on: the model is meant to adapt');
+    // The refusal IS the reason, whole: the "do not work around it with a different tool" wrapper would contradict "do the steps yourself".
+    assert.equal((d as { message: string }).message, unservedReason(name), name);
+    assert.ok(!/work around/i.test((d as { message: string }).message), name);
+    assert.equal(r.events.length, 0, 'the device saw nothing');
+    assert.equal(r.logs.length, 1);
+    assert.match(r.logs[0]!, new RegExp(`^permission: refused by rule tool=${name} risk=high reason=`));
+    assert.ok(!r.logs[0]!.includes('Which one'), 'and the log never carries the input');
   }
   const r = rig();
-  const d = await r.handler(req('AskUserQuestion', {}));
+  const d = await refused(r, req('AskUserQuestion', {}), 'AskUserQuestion');
   assert.match((d as { message: string }).message, /multiple-choice/);
   assert.match((d as { message: string }).message, /ask one short question in your final message/, 'the whole reason reaches the model');
-  // Companion: a neighbouring tool is asked about.
-  const t = rig();
-  void t.handler(req('TodoWrite', { todos: [] }));
-  assert.equal(t.approvals.pendingCount(), 1);
+  // Companion: a neighbouring tool, and a prefixed MCP tool of the same name, are asked about.
+  for (const name of ['TodoWrite', 'mcp__srv__Skill', 'mcp__srv__Workflow']) {
+    const t = rig();
+    void t.handler(req(name, { todos: [] }));
+    assert.equal(t.approvals.pendingCount(), 1, name);
+  }
+});
+
+test('K4/K5: the name list is enforced HERE, whatever the describer says (an injected describer cannot turn Skill into an ask)', async () => {
+  const lenient: DescribeTool = (name) => ({ label: name, risk: 'low', summary: name });
+  for (const name of UNSERVED_TOOL_NAMES) {
+    const r = rig({ describe: lenient });
+    const d = await refused(r, req(name, {}), name);
+    assert.equal(d.allow, false, name);
+    assert.equal(r.approvals.pendingCount(), 0, `${name}: the describer said low and the handler asked anyway`);
+    assert.equal((d as { message: string }).message, unservedReason(name));
+  }
+  // Control: the same lenient describer DOES let an ordinary tool through to the device, so the loop above can fail.
+  const ctl = rig({ describe: lenient });
+  void ctl.handler(req('TodoWrite', {}));
+  assert.equal(ctl.approvals.pendingCount(), 1);
+  // And the older spellings the SDK still resolves.
+  for (const alias of ['KillShell', 'KillBash', 'ListPeers']) {
+    const r = rig({ describe: lenient });
+    assert.equal((await refused(r, req(alias, {}), alias)).allow, false, alias);
+    assert.equal(r.approvals.pendingCount(), 0, alias);
+  }
+});
+
+test('S5/M13: a read of the bridge\'s own credentials is asked about at high, even inside the project and with an innocent name', async () => {
+  const token = '/work/proj/notes/innocuous.txt';
+  const before = rig();
+  void before.handler(req('Read', { file_path: token }));
+  assert.equal(before.approvals.current()!.risk, 'low', 'control: unregistered, it is an ordinary file in the project');
+  setBridgeSecrets([token, '/work/proj/.bridge-state']);
+  try {
+    for (const [tool, input] of [
+      ['Read', { file_path: token }], ['Read', { file_path: 'notes/innocuous.txt' }], ['Grep', { pattern: 'x', path: token }], ['Glob', { pattern: 'notes/*.txt' }],
+      ['Bash', { command: 'cat notes/innocuous.txt' }], ['Bash', { command: 'grep -r x .' }], ['Read', { file_path: '.bridge-state/session.json' }],
+    ] as [string, Record<string, unknown>][]) {
+      const r = rig();
+      void r.handler(req(tool, input));
+      assert.equal(r.approvals.current()!.risk, 'high', `${tool} ${JSON.stringify(input)}`);
+    }
+  } finally {
+    setBridgeSecrets([]);
+  }
 });
 
 test('M2/M3: the ask for an MCP tool shows its target and its size, rated high; a secret read is high', async () => {

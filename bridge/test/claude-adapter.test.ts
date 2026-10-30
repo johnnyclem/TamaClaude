@@ -15,8 +15,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { SDKMessage, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
-import { ClaudeAdapter } from '../src/drivers/claude-adapter.ts';
+import { ClaudeAdapter, GIVE_UP } from '../src/drivers/claude-adapter.ts';
 import type { AdapterEvent } from '../src/drivers/claude-adapter.ts';
+import { summarizeForDevice } from '../src/text.ts';
+import { LIMITS } from '../src/types.ts';
 import type { DriverEvent } from '../src/types.ts';
 
 const SID = 'sess-1';
@@ -740,7 +742,7 @@ test('an api_retry becomes a signal, and only errors retrying cannot fix carry a
     sdk({ type: 'system', subtype: 'api_retry', attempt, max_retries: 10, retry_delay_ms: 600, error_status: status, error });
   const a = new ClaudeAdapter();
   assert.deepEqual(a.map(retry('authentication_failed', 401)), [
-    { k: 'api_retry', error: 'authentication_failed', status: 401, attempt: 1, max: 10, giveUp: 'Claude API error 401: the API key was rejected. Check ANTHROPIC_API_KEY.' },
+    { k: 'api_retry', error: 'authentication_failed', status: 401, attempt: 1, max: 10, giveUp: 'Claude API error 401: the API key was rejected. Check the key the bridge was started with.' },
   ]);
   assert.deepEqual(a.map(retry('overloaded', 529, 3)), [
     { k: 'api_retry', error: 'overloaded', status: 529, attempt: 3, max: 10, giveUp: undefined },
@@ -864,4 +866,111 @@ test('over generated message sequences tools stay balanced and ids are never reu
   // The generator must actually have exercised the rule it claims to check.
   assert.ok(starts > 1000, `only ${starts} tool starts generated`);
   assert.ok(results > 100, `only ${results} results generated`);
+});
+
+// ---------------------------------------------------------------------------
+// Running tools, for the driver's silence watchdog (D15)
+// ---------------------------------------------------------------------------
+
+test('a tool is RUNNING only once its input has finished streaming and until its result: that is when quiet is legitimate', () => {
+  const a = new ClaudeAdapter();
+  assert.equal(a.runningToolCount, 0);
+  feed(a, toolBlockStart(0, 't1'));
+  assert.equal(a.openToolCount, 1);
+  assert.equal(a.runningToolCount, 0, 'still streaming its input: a model that went silent here is the stall the watchdog exists for');
+  feed(a, blockStop(0));
+  assert.equal(a.runningToolCount, 1, 'the block finished, the tool is running');
+  feed(a, toolResults({ id: 't1' }));
+  assert.equal(a.runningToolCount, 0);
+  assert.equal(a.openToolCount, 0);
+});
+
+test('the complete assistant block alone also means running, and a cut-off stream strands nothing as running', () => {
+  const a = new ClaudeAdapter();
+  // Without partial messages the complete block is the only announcement.
+  feed(a, assistantTool('t1'));
+  assert.equal(a.runningToolCount, 1);
+  // A second tool, streaming when the message is abandoned.
+  feed(a, toolBlockStart(1, 't2'));
+  assert.equal(a.runningToolCount, 1, 't2 is still streaming');
+  a.abandon();
+  assert.equal(a.runningToolCount, 0);
+  assert.equal(a.openToolCount, 0);
+});
+
+test('a subagent\'s running tool counts, and the two contexts do not hide each other\'s streaming blocks', () => {
+  const a = new ClaudeAdapter();
+  feed(a, toolBlockStart(0, 'main-1'), toolBlockStart(0, 'sub-1', 'Bash', 'agent-1'));
+  assert.equal(a.runningToolCount, 0);
+  feed(a, blockStop(0, 'agent-1'));
+  assert.equal(a.runningToolCount, 1, 'the subagent\'s block finished; the main thread\'s did not');
+  feed(a, blockStop(0));
+  assert.equal(a.runningToolCount, 2);
+});
+
+test('running never exceeds open and never goes negative, over the generated sequences\' own shapes', () => {
+  const a = new ClaudeAdapter();
+  const steps: SDKMessage[] = [
+    toolBlockStart(0, 'a'), toolBlockStart(1, 'b'), blockStop(0), toolResults({ id: 'a' }), blockStop(1),
+    toolResults({ id: 'zzz' }), toolBlockStart(2, 'c'), messageStop(), toolResults({ id: 'b' }),
+  ];
+  for (const m of steps) {
+    a.map(m);
+    assert.ok(a.runningToolCount >= 0 && a.runningToolCount <= a.openToolCount, `${a.runningToolCount} running of ${a.openToolCount} open`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The one sentence a person gets for a rejected key (K6)
+// ---------------------------------------------------------------------------
+
+test('every give-up sentence reaches the device exactly as written: the text sanitiser leaves it alone', () => {
+  // `Check ANTHROPIC_API_KEY.` was mangled on the wire into `ANTHROPICAPIKEY`: text.ts reads
+  // underscores as markdown. The sentences are driver-authored, so the rule is checked on all of them.
+  assert.ok(GIVE_UP.size >= 8);
+  for (const [code, phrase] of GIVE_UP) {
+    const a = new ClaudeAdapter();
+    const ev = a.map(sdk({ type: 'system', subtype: 'api_retry', attempt: 1, max_retries: 10, error_status: 401, error: code }))[0] as { giveUp: string };
+    assert.equal(ev.giveUp, `Claude API error 401: ${phrase}`, code);
+    assert.equal(summarizeForDevice(ev.giveUp, LIMITS.resultMax), ev.giveUp, `${code}: the wire text differs from the written text`);
+    assert.match(ev.giveUp, /^[\x20-\x7e]+$/, code);
+    assert.doesNotMatch(phrase, /[_*`#~\\]/, `${code}: a character the markdown reader would eat`);
+  }
+});
+
+test('the sanitiser check can fail: the old sentence with its variable name does not survive it', () => {
+  const old = 'Claude API error 401: the API key was rejected. Check ANTHROPIC_API_KEY.';
+  assert.notEqual(summarizeForDevice(old, LIMITS.resultMax), old);
+});
+
+test('an error CODE that is also an Object.prototype name is not a give-up (the table is looked up as data)', () => {
+  // The code comes from the CLI. A plain-object table would answer `constructor` with a function,
+  // and the "sentence" would be that function's source.
+  for (const code of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf', 'isPrototypeOf']) {
+    const a = new ClaudeAdapter();
+    const ev = a.map(sdk({ type: 'system', subtype: 'api_retry', attempt: 1, max_retries: 10, error_status: 400, error: code }))[0] as { giveUp: unknown; error: string };
+    assert.equal(ev.error, code);
+    assert.equal(ev.giveUp, undefined, code);
+  }
+  // Companion: a real code still has its sentence, so the loop above is not vacuous.
+  assert.ok(GIVE_UP.has('authentication_failed'));
+});
+
+// ---------------------------------------------------------------------------
+// Exactly one terminal, with a watchdog in front of the adapter (D15)
+// ---------------------------------------------------------------------------
+
+test('a result stamped for a prompt that was given up on is foreign once a newer prompt is awaited', () => {
+  // What the driver relies on after a stall: it begins the next prompt on a NEW adapter, but a
+  // reused adapter must hold the same line, or a late result would end the wrong turn.
+  const a = new ClaudeAdapter();
+  a.begin(OTHER);
+  feed(a, stamped(messageStart(), OTHER)); // the stalled turn started
+  a.begin(MINE); // the user spoke again
+  const late = feed(a, stamped(resultOk('late answer to the old prompt'), OTHER));
+  assert.deepEqual(late, [{ k: 'foreign_result' }], 'not terminal, not a result');
+  const real = feed(a, stamped(messageStart(), MINE), stamped(resultOk('answer'), MINE));
+  assert.deepEqual(real.filter((e) => e.k === 'result'), [{ k: 'result', ok: true, text: 'answer', subtype: 'success' }]);
+  // And a duplicate of the real one afterwards produces nothing terminal either.
+  assert.deepEqual(feed(a, stamped(resultOk('answer again'), MINE)).filter((e) => e.k === 'result'), []);
 });

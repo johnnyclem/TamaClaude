@@ -19,7 +19,9 @@ import {
   decodeAudioFrame, decodeBridgeMsg, decodeDeviceMsg, encodeAudioFrame, encodeBridgeMsg, encodeDeviceMsg,
   isPrintableAscii,
 } from '../src/protocol.ts';
+import { DEFAULT_STALL_MS } from '../src/drivers/claude.ts';
 import { DEFAULTS, MAX_BAD_FRAMES, MAX_PAYLOAD } from '../src/server.ts';
+import { AUTO_RUN_TOOLS } from '../src/tools.ts';
 import {
   ASK_END_REASONS, BRIDGE_MSG_TYPES, CLOSE, DEVICE_MSG_TYPES, ERR_CODES, FRAME_KIND_MIC, FRAME_KIND_TTS, HELLO_WHYS,
   LIMITS, LISTEN_MODES, PHASES, PROTOCOL_VERSION, RISKS,
@@ -61,6 +63,17 @@ function withLimit<T>(key: keyof typeof LIMITS, value: number, fn: () => T): T {
  * when the machine is busy running other suites.
  */
 const BUDGET_MS = 1500;
+
+/** The shortest of `runs` wall-clock times of `fn`, in ms: load only adds to a run, so the minimum is the measure. */
+function fastest(fn: () => void, runs = 3): number {
+  let best = Infinity;
+  for (let i = 0; i < runs; i++) {
+    const t0 = performance.now();
+    fn();
+    best = Math.min(best, performance.now() - t0);
+  }
+  return best;
+}
 const INT_MAX = 2147483647;
 const bytes = (s: string): number => Buffer.byteLength(s, 'utf8');
 
@@ -135,9 +148,9 @@ describe('isPrintableAscii', () => {
   });
 
   it('takes a long string in one pass', () => {
-    const t0 = performance.now();
-    assert.equal(isPrintableAscii('a'.repeat(5_000_000)), true);
-    assert.ok(performance.now() - t0 < BUDGET_MS);
+    const big = 'a'.repeat(5_000_000);
+    assert.equal(isPrintableAscii(big), true);
+    assert.ok(fastest(() => void isPrintableAscii(big)) < BUDGET_MS);
   });
 });
 
@@ -294,9 +307,9 @@ describe('encoders: refuse what the contract forbids (RangeError)', () => {
   });
 
   it('the length check does not scan: a huge string is refused at once', () => {
-    const t0 = performance.now();
-    assert.throws(() => encodeDeviceMsg({ t: 'say', text: '\u00e9'.repeat(20_000_000) }), RangeError);
-    assert.ok(performance.now() - t0 < BUDGET_MS);
+    const big = '\u00e9'.repeat(20_000_000);
+    assert.throws(() => encodeDeviceMsg({ t: 'say', text: big }), RangeError);
+    assert.ok(fastest(() => assert.throws(() => encodeDeviceMsg({ t: 'say', text: big }), RangeError)) < BUDGET_MS);
   });
 
   it('tokens: only the unreserved characters, A-Z a-z 0-9 . _ ~ -', () => {
@@ -546,23 +559,28 @@ describe('decoders: refuse', () => {
   });
 
   it('nested values, however deep, without recursing', () => {
-    const t0 = performance.now();
-    refused(decodeDeviceMsg('{"t":"say","text":{}}'), /nested value/);
-    refused(decodeDeviceMsg('{"t":"say","text":[]}'), /nested value/);
-    refused(decodeDeviceMsg(`{"t":"say","text":${'['.repeat(500)}}`), /nested value/);
-    refused(decodeDeviceMsg(`{"a":${'{"a":'.repeat(150)}`), /nested value/);
-    // Beyond the frame limit the size guard answers first; the point is that neither path overflows the stack.
-    refused(decodeDeviceMsg('['.repeat(1_000_000)), /frame too big/);
-    refused(decodeDeviceMsg(`{"t":"say","text":${'['.repeat(1_000_000)}`), /frame too big/);
-    assert.ok(performance.now() - t0 < BUDGET_MS);
+    const all = (): void => {
+      refused(decodeDeviceMsg('{"t":"say","text":{}}'), /nested value/);
+      refused(decodeDeviceMsg('{"t":"say","text":[]}'), /nested value/);
+      refused(decodeDeviceMsg(`{"t":"say","text":${'['.repeat(500)}}`), /nested value/);
+      refused(decodeDeviceMsg(`{"a":${'{"a":'.repeat(150)}`), /nested value/);
+      // Beyond the frame limit the size guard answers first; the point is that neither path overflows the stack.
+      refused(decodeDeviceMsg('['.repeat(1_000_000)), /frame too big/);
+      refused(decodeDeviceMsg(`{"t":"say","text":${'['.repeat(1_000_000)}`), /frame too big/);
+    };
+    all();
+    assert.ok(fastest(all) < BUDGET_MS);
   });
 
   it('a huge input is refused without being read', () => {
-    const t0 = performance.now();
-    refused(decodeDeviceMsg('x'.repeat(20_000_000)), /frame too big/);
-    refused(decodeBridgeMsg(' '.repeat(20_000_000) + '{"t":"pong","n":1}'), /frame too big/);
-    refused(decodeDeviceMsg('{"t":"say","text":"' + 'a'.repeat(20_000_000) + '"}'), /frame too big/);
-    assert.ok(performance.now() - t0 < BUDGET_MS);
+    const inputs = ['x'.repeat(20_000_000), ' '.repeat(20_000_000) + '{"t":"pong","n":1}', '{"t":"say","text":"' + 'a'.repeat(20_000_000) + '"}'];
+    const all = (): void => {
+      refused(decodeDeviceMsg(inputs[0]!), /frame too big/);
+      refused(decodeBridgeMsg(inputs[1]!), /frame too big/);
+      refused(decodeDeviceMsg(inputs[2]!), /frame too big/);
+    };
+    all();
+    assert.ok(fastest(all) < BUDGET_MS);
   });
 
   it('duplicate keys, even when the values agree, and even for t', () => {
@@ -1071,24 +1089,111 @@ describe('PROTOCOL.md agrees with the code', () => {
     }
   });
 
-  it('every message has a field table whose keys are the keys the encoder writes, in order', () => {
-    const all = [...DEVICE_SAMPLES, ...BRIDGE_SAMPLES].map((s) => s.msg as unknown as Record<string, unknown>);
-    const sections: Array<[string, string]> = [['Device to bridge', 'device'], ['Bridge to device', 'bridge']];
-    for (const [title] of sections) {
+  it('every message has a field table whose rows are the keys the encoder writes, IN ORDER, with the enum members and the length limits the code has', () => {
+    const samples: Array<{ dir: Dir; msg: Record<string, unknown> }> = [
+      ...DEVICE_SAMPLES.map((s) => ({ dir: 'device' as const, msg: s.msg as unknown as Record<string, unknown> })),
+      ...BRIDGE_SAMPLES.map((s) => ({ dir: 'bridge' as const, msg: s.msg as unknown as Record<string, unknown> })),
+    ];
+    // The members each enumerated field may hold, from the code, never retyped.
+    const enums: Record<string, readonly string[]> = {
+      'listen.m': LISTEN_MODES, 'hello_ack.why': HELLO_WHYS, 'state.ph': PHASES, 'ask.risk': RISKS,
+      'ask_end.why': ASK_END_REASONS, 'err.code': ERR_CODES,
+    };
+    // The "N to M characters" limits of every string field, from LIMITS.
+    const lengths: Record<string, readonly [number, number]> = {
+      'hello.token': [LIMITS.tokenMin, LIMITS.tokenMax], 'hello.dev': [0, LIMITS.devMax], 'hello.fw': [0, LIMITS.fwMax],
+      'say.text': [0, LIMITS.sayMax], 'hello_ack.sid': [0, 64], 'state.tl': [0, LIMITS.labelMax], 'stt.text': [0, LIMITS.sttMax],
+      'ask.tl': [0, LIMITS.labelMax], 'ask.sum': [0, LIMITS.summaryMax], 'result.text': [0, LIMITS.resultMax], 'err.msg': [0, LIMITS.errMax],
+    };
+    const idFields = ['ask_rsp.id', 'ask.id', 'ask_end.id'];
+    let checkedEnums = 0;
+    let checkedLengths = 0;
+    let checkedTypes = 0;
+
+    for (const title of ['Device to bridge', 'Bridge to device']) {
       const body = section(title);
       for (const heading of body.split('\n### ').slice(1)) {
         const name = heading.split('\n')[0]!.replace(/`/g, '').trim();
         const type = name.split(/[ (]/)[0]!;
-        const forms = all.filter((m) => m['t'] === type);
+        const forms = samples.filter((m) => m.msg['t'] === type);
         assert.ok(forms.length > 0, `doc documents "${type}", which has no sample`);
-        const keys = tableAfter(heading, '\n|').map((r) => r[0]!).filter((k) => k !== 't');
-        const documented = new Set(keys);
-        for (const form of forms) {
-          for (const key of Object.keys(form).filter((k) => k !== 't')) assert.ok(documented.has(key), `${type}.${key} is not in the doc`);
+
+        // ORDER: the keys of the bytes the encoder writes, forms merged in the order they first name a key.
+        const expected: string[] = [];
+        for (const f of forms) {
+          for (const key of Object.keys(JSON.parse(enc(f.dir, f.msg)) as Record<string, unknown>)) if (key !== 't' && !expected.includes(key)) expected.push(key);
         }
-        for (const key of keys) assert.ok(forms.some((f) => key in f), `the doc lists ${type}.${key}, which the code does not have`);
+        const rows = tableAfter(heading, '\n|');
+        assert.deepEqual(rows.map((r) => r[0]).filter((k) => k !== 't'), expected, `${type}: the field table's rows are not the encoder's keys in the encoder's order`);
+        assert.equal(rows[0]?.[0], 't', `${type}: t is the first row`);
+        assert.equal(rows[0]?.[2], type, `${type}: the t row names the type`);
+        checkedTypes += 1;
+
+        for (const r of rows) {
+          const field = `${type}.${r[0]}`;
+          const allowed = r[2] ?? '';
+          const note = r[3] ?? '';
+          // ENUMS: the members of the "allowed" cell are exactly the code's.
+          if (field in enums) {
+            assert.deepEqual(allowed.split(',').map((x) => x.trim()), enums[field], `${field}: the allowed values`);
+            checkedEnums += 1;
+          } else if (r[1] === 'boolean') {
+            assert.equal(allowed, 'true, false', `${field}: a boolean allows exactly true and false`);
+          } else if (/^[a-z_]+(, [a-z_]+)+$/.test(allowed)) {
+            assert.fail(`${field} lists several allowed values (${allowed}) that this test has no source for`);
+          }
+          // LENGTHS: "N to M characters" in the notes, and "exactly 8 characters" for ids.
+          const m = /(\d+) to (\d+) characters/.exec(note);
+          if (field in lengths) {
+            assert.ok(m, `${field}: the notes state no "N to M characters"`);
+            assert.deepEqual([Number(m[1]), Number(m[2])], lengths[field], `${field}: the length limits`);
+            checkedLengths += 1;
+          } else if (idFields.includes(field)) {
+            assert.match(note, new RegExp(`exactly ${LIMITS.idLen} characters`), `${field}: id length`);
+            checkedLengths += 1;
+          } else if (m !== null) {
+            assert.fail(`${field} states a length limit (${m[0]}) that this test has no source for`);
+          }
+        }
       }
     }
+    assert.equal(checkedTypes, DEVICE_MSG_TYPES.length + BRIDGE_MSG_TYPES.length, 'every message type has a table');
+    assert.equal(checkedEnums, Object.keys(enums).length, 'every enumerated field was found in the document');
+    assert.equal(checkedLengths, Object.keys(lengths).length + idFields.length, 'every length limit was found in the document');
+  });
+
+  it('the calls that run without an ask are exactly AUTO_RUN_TOOLS, and the document says what that means for `low`', () => {
+    const security = section('Security model');
+    const bullet = /\*\*The calls that run without any ask\.\*\*([\s\S]*?)\n- \*\*/.exec(security)?.[1];
+    assert.ok(bullet, 'the Security model has no bullet about the calls that run without an ask');
+    const named = [...(/one of ([^.]*?) on a path/.exec(bullet)?.[1] ?? '').matchAll(/`([A-Za-z]+)`/g)].map((m) => m[1]!);
+    assert.deepEqual([...named].sort(), [...AUTO_RUN_TOOLS].sort(), 'PROTOCOL.md and src/tools.ts disagree about which calls run without an ask');
+    assert.match(bullet, /the only calls that run without a tap/);
+    assert.match(bullet, /Everything else is asked about, a read outside the working directory included/);
+    // The headline rule is qualified: it must not say "only a tap approves" without the exception being right there.
+    assert.match(security, /\*\*Only a tap can approve a call that is asked about, and almost every call is\.\*\*/);
+    assert.doesNotMatch(security, /\*\*Only a tap can approve\.\*\*/, 'the unqualified claim is gone');
+    // `low` on the wire.
+    const ask = section('Bridge to device');
+    assert.match(ask, /`risk: low` is valid and a device MUST accept it, but a real bridge sends it rarely or never/);
+    assert.match(ask, /`low` is the rating of the calls that run without any ask/);
+  });
+
+  it('the figures in the prose are the code\'s: hello deadline, grace period, listen idle limit, stall limit, headers deadline, wrong-token delay', () => {
+    const flat = (title: string): string => section(title).replace(/\s+/g, ' ');
+    const secs = (ms: number): number => ms / 1000;
+    assert.match(flat('Connection lifecycle'), new RegExp(`within \\*\\*${secs(DEFAULTS.helloTimeoutMs)} seconds\\*\\*`));
+    assert.match(DOC, new RegExp(`within ${secs(DEFAULTS.helloTimeoutMs)} s of opening the socket`));
+    assert.match(flat('Reconnect and takeover'), new RegExp(`the default is ${secs(DEFAULTS.graceMs)} seconds`));
+    assert.match(flat('Device to bridge'), new RegExp(`no audio for ${secs(DEFAULTS.listenIdleMs)} seconds\\*\\* \\(counted from \`start\`, or from the last MIC frame\\) is closed by the bridge: it sends \`err\` \`empty\``));
+    assert.match(flat('Errors'), new RegExp(`received no audio for ${secs(DEFAULTS.listenIdleMs)} s`));
+    assert.match(flat('Input rules'), new RegExp(`no MIC frame for ${secs(DEFAULTS.listenIdleMs)} s`));
+    assert.match(flat('Input rules'), new RegExp(`restarts the ${secs(DEFAULTS.listenIdleMs)} s idle limit`));
+    assert.equal(DEFAULT_STALL_MS, 5 * 60_000, 'the prose below says five minutes');
+    assert.match(flat('Bridge to device'), /no sign of life for five minutes/);
+    assert.match(flat('Transport'), new RegExp(`complete within \\*\\*${secs(DEFAULTS.headersTimeoutMs)} seconds\\*\\*`));
+    assert.match(flat('Connection lifecycle'), /half a second/);
+    assert.equal(DEFAULTS.authFailDelayMs, 500);
   });
 
   it('the worked transcript is real: each line decodes in its direction and re-encodes to the same bytes', () => {
@@ -1132,7 +1237,7 @@ describe('PROTOCOL.md agrees with the code', () => {
     assert.match(section('Transport'), new RegExp(`up to ${MAX_PAYLOAD} bytes`));
     assert.equal(MAX_PAYLOAD > LIMITS.deviceFrameMax, true, 'the socket admits more than the protocol, so a long frame is a bad_msg');
     assert.equal(MAX_BAD_FRAMES, 5);
-    assert.match(DOC, /fifth frame\s+in a\s+row/);
+    assert.match(DOC, /fifth bad frame\s+in a\s+row/);
   });
 
   it('the timings table is DEFAULTS: every setting documented, every value the same', () => {

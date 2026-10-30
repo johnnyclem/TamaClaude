@@ -20,7 +20,20 @@
  * deleted by one line without any unit noticing: the API key, the hard-deny hook, which
  * settings files are read, the bind address, the recognizer, whether a device on this
  * machine is accepted. The wiring is therefore two pure functions, `buildClaudeConfig` and
- * `buildServerOptions`, which `run` calls and test/main.test.ts reads line by line.
+ * `buildServerOptions`, which `run` calls and test/main.test.ts reads line by line, AND two
+ * seams in `run` itself (`RunDeps.makeClaudeDriver`, `RunDeps.startServer`) through which a
+ * test sees exactly what `run` handed over. Reading the pure functions proves they are right;
+ * only the seams prove `run` calls them and passes their output on unchanged, which is where
+ * a one-line regression (the driver given only the key, the veto stripped, the grace period
+ * forced) used to survive the whole suite. test/server.e2e.test.ts builds its real-driver rig
+ * through `run` for the same reason.
+ *
+ * THE DEFAULT IS TO READ NO REPOSITORY CONFIGURATION (`--setting-sources none`). A
+ * repository's `.claude/settings*.json` can run commands when Claude starts, change the
+ * environment and send the conversation (and the API key) to another server before any tool
+ * call exists for the device to be asked about. So the bridge reads the project's CLAUDE.md
+ * ITSELF and hands the model plain text (src/memory.ts); `project` and `local` remain as an
+ * explicit opt-in that prints a loud warning.
  */
 
 import { randomBytes } from 'node:crypto';
@@ -28,14 +41,16 @@ import { readFileSync, statSync } from 'node:fs';
 import { homedir, networkInterfaces } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
-import { claudeDriverFactory } from './drivers/claude.ts';
-import type { ClaudeDriverConfig } from './drivers/claude.ts';
+import { checkManagedLock, claudeDriverFactory, DEFAULT_STALL_MS } from './drivers/claude.ts';
+import type { ClaudeDriverConfig, ManagedLockStatus } from './drivers/claude.ts';
 import { fakeDriverFactory } from './drivers/fake.ts';
+import { inspectProjectMemory, MEMORY_MAX_BYTES } from './memory.ts';
+import type { ProjectMemory, ProjectMemoryReport } from './memory.ts';
 import { startServer } from './server.ts';
 import type { RunningServer, ServerOptions } from './server.ts';
 import { clearSession } from './store.ts';
 import { ScriptedStt } from './stt.ts';
-import { AUTO_RUN_TOOLS, describeTool, needsTap } from './tools.ts';
+import { AUTO_RUN_TOOLS, bridgeSecretsInside, describeTool, needsTap, setBridgeSecrets } from './tools.ts';
 import { LIMITS } from './types.ts';
 import type { DriverFactory, Logger } from './types.ts';
 
@@ -64,6 +79,8 @@ export interface Config {
   /** The token was made up here, so the banner must show it (it is the only chance). */
   tokenGenerated: boolean;
   tokenSource: TokenSource;
+  /** The absolute path of --token-file, when that is where the token came from. */
+  tokenFile: string | undefined;
   /** Accept a device on this machine. Always true in fake mode; in real mode only with --allow-local-device. */
   allowLocalDevice: boolean;
   /** Extra environment variable NAMES the Claude child may see (--pass-env). */
@@ -77,6 +94,12 @@ export interface Config {
   newSession: boolean;
   askTtlSec: number;
   graceSec: number;
+  /** Seconds of silence from Claude, with no tool running and no ask open, after which a turn is ended. 0: never. */
+  turnStallSec: number;
+  /**
+   * Which Claude Code settings files are read. DEFAULT: none. `project` and `local` are an opt-in for a
+   * repository the operator trusts like its build scripts; see the file header and the banner.
+   */
   settingSources: SettingSource[];
   /** Things the person should know before trusting the setup. Printed in the banner. */
   warnings: string[];
@@ -88,6 +111,22 @@ export interface ParseDeps {
   randomToken?: () => string;
   /** Reads a --token-file: its text and its permission bits. Default: the real file system. */
   readTokenFile?: (path: string) => { text: string; mode: number };
+}
+
+/** The seams of `run` (see the file header): a test sees, and can replace, what `run` hands over. */
+export interface RunDeps extends ParseDeps {
+  /** Builds the real driver factory from the configuration `run` composed. Default: `claudeDriverFactory`. */
+  makeClaudeDriver?: (cfg: ClaudeDriverConfig) => DriverFactory;
+  /** Starts the server from the options `run` composed. Default: `startServer`. */
+  startServer?: (opts: ServerOptions) => Promise<RunningServer>;
+  /** Reads the project's memory file. Default: `inspectProjectMemory`. */
+  loadMemory?: (cwd: string) => ProjectMemoryReport;
+  /** Asks whether the policy-tier lock is in force. Default: `checkManagedLock`. */
+  checkManagedLock?: (cwd: string) => Promise<ManagedLockStatus | undefined>;
+  /** Registers the bridge's own credential files with the tool rules. Default: tools.ts. */
+  secrets?: { set: (paths: readonly string[]) => void; inside: (cwd: string) => string[] };
+  /** Makes SIGUSR1 unable to open the Node inspector. Default: `neutraliseInspector`. */
+  guardInspector?: (io: Io) => void;
 }
 
 function readTokenFileFromDisk(path: string): { text: string; mode: number } {
@@ -117,13 +156,24 @@ Claude
   --fake-claude          scripted stand-in for Claude: no API key, no network
   --fake-delay-ms <n>    pause between the fake's steps (default 400)
   --model <id>           the Claude model (default: the Claude Code default)
-  --max-turns <n>        most model turns one prompt may take (default: unlimited)
+  --max-turns <n>        most model turns one prompt may take (default: unlimited; Claude
+                         can read files inside the project without asking, so a loop of
+                         those costs API calls until this or --turn-stall-sec stops it)
+  --turn-stall-sec <n>   end a turn when Claude has shown no sign of life for this many
+                         seconds while no tool is running and no ask is open (default 300,
+                         0 = never). A tool that is running, or an ask on the panel, is not
+                         counted as silence.
   --pass-env <names>     environment variables, comma separated or repeated, that the
                          commands Claude runs may see. Everything else of this
                          process's environment stays behind (BRIDGE_TOKEN never goes).
-  --setting-sources <l>  Claude Code settings to read: project,local,user or none
-                         (default project,local). Permission rules and hooks in them
-                         are ignored; their env and CLAUDE.md still apply.
+  --setting-sources <l>  OPT-IN: Claude Code settings files to read, a comma list of user,
+                         project, local, or none (the default, and the only safe setting
+                         for a repository you do not trust). With none, the bridge reads
+                         the project's CLAUDE.md itself and gives Claude plain text. With
+                         project or local, the repository's own settings can run commands
+                         when Claude starts, change its environment and redirect its
+                         traffic before you are asked about anything; the bridge blocks
+                         the ways it knows of, which is best effort.
   --state-dir <dir>      where the session id is kept (default
                          $XDG_STATE_HOME/tamaclaude-bridge or
                          ~/.local/state/tamaclaude-bridge)
@@ -152,7 +202,7 @@ export function isLoopbackHost(host: string): boolean {
 }
 
 function parseSettingSources(raw: string | undefined): SettingSource[] {
-  if (raw === undefined) return ['project', 'local'];
+  if (raw === undefined) return [];
   const parts = raw.split(',').map((s) => s.trim()).filter((s) => s !== '');
   if (parts.length === 1 && parts[0] === 'none') return [];
   const out: SettingSource[] = [];
@@ -190,6 +240,7 @@ export function parseConfig(argv: string[], env: Record<string, string | undefin
         'new-session': { type: 'boolean' },
         'ask-ttl-sec': { type: 'string' },
         'grace-sec': { type: 'string' },
+        'turn-stall-sec': { type: 'string' },
         'setting-sources': { type: 'string' },
         help: { type: 'boolean', short: 'h' },
       },
@@ -213,6 +264,7 @@ export function parseConfig(argv: string[], env: Record<string, string | undefin
     token: '',
     tokenGenerated: false,
     tokenSource: 'generated',
+    tokenFile: undefined,
     allowLocalDevice: fakeClaude || flag('allow-local-device'),
     passEnv: [],
     model: undefined,
@@ -224,7 +276,8 @@ export function parseConfig(argv: string[], env: Record<string, string | undefin
     newSession: flag('new-session'),
     askTtlSec: 90,
     graceSec: 15,
-    settingSources: ['project', 'local'],
+    turnStallSec: DEFAULT_STALL_MS / 1000,
+    settingSources: [],
     warnings: [],
   };
   if (base.help) return base;
@@ -237,9 +290,10 @@ export function parseConfig(argv: string[], env: Record<string, string | undefin
   }
   base.askTtlSec = parseIntFlag('--ask-ttl-sec', str('ask-ttl-sec'), 90, 1, 3600);
   base.graceSec = parseIntFlag('--grace-sec', str('grace-sec'), 15, 0, 3600);
+  base.turnStallSec = parseIntFlag('--turn-stall-sec', str('turn-stall-sec'), DEFAULT_STALL_MS / 1000, 0, 3600);
   base.settingSources = parseSettingSources(str('setting-sources'));
 
-  const claudeOnly = ['pass-env', 'model', 'max-turns'].filter((k) => values[k] !== undefined);
+  const claudeOnly = ['pass-env', 'model', 'max-turns', 'turn-stall-sec'].filter((k) => values[k] !== undefined);
   if (fakeClaude && claudeOnly.length > 0) {
     throw new ConfigError(`--${claudeOnly[0]} only applies to the real Claude, not together with --fake-claude.`);
   }
@@ -266,6 +320,7 @@ export function parseConfig(argv: string[], env: Record<string, string | undefin
     given = file.text.trim();
     if (given === '') throw new ConfigError(`--token-file ${path} is empty.`);
     base.tokenSource = 'file';
+    base.tokenFile = path;
     // A secret in a file other users can read is no better than one on the command line.
     if ((file.mode & 0o077) !== 0) {
       base.warnings.push(`The token file ${path} can be read by other users (mode ${(file.mode & 0o777).toString(8)}). Make it yours alone: chmod 600.`);
@@ -329,7 +384,8 @@ export function parseConfig(argv: string[], env: Record<string, string | undefin
   if (base.settingSources.includes('user')) {
     base.warnings.push(
       'User settings (~/.claude) are enabled. Their permission rules and hooks are ignored here, but the rest of them (environment ' +
-        'variables, CLAUDE.md) applies to everything Claude runs.',
+        'variables, CLAUDE.md) applies to everything Claude runs, and the bridge\'s blocks on settings that run commands or ' +
+        'redirect traffic are best effort.',
     );
   }
   if (!fakeClaude && base.allowLocalDevice) {
@@ -410,11 +466,72 @@ function packageVersion(): string {
 }
 
 /**
+ * The read-only tools that run without a tap AND that the Claude Code build bundled with the pinned
+ * SDK actually offers. The bridge's own rule (`AUTO_RUN_TOOLS`) is wider: it also rates `Glob`,
+ * `Grep`, `LS` and `NotebookRead` free so that a CLI which has them behaves the same. This build has
+ * none of those (a search or a listing is a `Bash` call and asks), which is what the banner and the
+ * README say. test/real-cli.integration.test.ts measures the tools the CLI offers; a build that adds
+ * one must change this list and those two texts together.
+ */
+export const CLI_FREE_TOOLS: readonly string[] = ['Read'];
+
+/** Does the bridge give the model the project's CLAUDE.md as text? Only when the CLI will not load it itself. */
+export function bridgeSuppliesMemory(config: Pick<Config, 'settingSources'>): boolean {
+  return !config.settingSources.includes('project');
+}
+
+/** True when the CLI will read the repository's own settings files: the opt-in that runs repository-chosen code. */
+export function readsRepositorySettings(config: Pick<Config, 'settingSources'>): boolean {
+  return config.settingSources.includes('project') || config.settingSources.includes('local');
+}
+
+/**
+ * The warning printed when the repository's own settings are switched on. Deliberately a block, not a
+ * line among the other warnings: it is the one switch that gives a repository the power to run code,
+ * change the environment and redirect traffic before any call exists for the device to be asked about.
+ */
+export function settingsWarning(config: Pick<Config, 'settingSources'>): string[] {
+  if (!readsRepositorySettings(config)) return [];
+  const bar = '  ' + '='.repeat(76);
+  return [
+    bar,
+    `  WARNING  THE REPOSITORY'S OWN SETTINGS ARE ON (--setting-sources ${config.settingSources.join(',')})`,
+    '           Those files can run commands when Claude starts, change the environment of everything',
+    '           it runs, send your API key and the conversation to another server, and switch features',
+    '           back on, all BEFORE the device is asked about anything. The bridge blocks the ways it',
+    '           knows of; that is best effort, and a new Claude Code release can add a way it does not.',
+    '           Use this only for a repository you trust as you trust its build scripts.',
+    '           --setting-sources none (the default) is the only safe setting for one you do not.',
+    bar,
+  ];
+}
+
+export interface BannerInfo {
+  /** What the bridge read as the project's memory; absent when it did not look (or this is a banner test). */
+  memory?: ProjectMemoryReport;
+}
+
+function memoryLines(config: Config, info: BannerInfo): string[] {
+  if (!bridgeSuppliesMemory(config)) return ['  memory  loaded by Claude Code itself (the project settings are on)'];
+  const m = info.memory;
+  if (m === undefined) return [];
+  const out: string[] = [];
+  if (m.sources.length === 0) {
+    out.push('  memory  none: no CLAUDE.md or .claude/CLAUDE.md in the working directory');
+  } else {
+    out.push(`  memory  ${m.sources.join(', ')}, read by the bridge as plain text (no @imports followed)`);
+    if (m.truncated) out.push(`          CUT at ${MEMORY_MAX_BYTES / 1024} KB: the rest of it is not given to Claude`);
+  }
+  for (const s of m.skipped) out.push(`          not used: ${s.file} ${s.why}`);
+  return out;
+}
+
+/**
  * The only place the token is ever printed, and only when WE made it up: a token the person
  * supplied is already in their shell history or their service file, and a second copy in a
  * log or a journal is a leak with no benefit.
  */
-export function renderBanner(config: Config, urls: readonly string[]): string[] {
+export function renderBanner(config: Config, urls: readonly string[], info: BannerInfo = {}): string[] {
   const lines = [`TamaClaude bridge ${packageVersion()}`];
   lines.push(
     config.fakeClaude
@@ -439,13 +556,21 @@ export function renderBanner(config: Config, urls: readonly string[]): string[] 
       `  devices ${config.allowLocalDevice ? 'on this machine AND elsewhere' : 'only on other machines (a device on this machine is refused)'}`,
     );
     lines.push(
-      `  no tap  ${AUTO_RUN_TOOLS.join(', ')} inside the working directory; every other call asks the device first`,
+      `  no tap  ${CLI_FREE_TOOLS.join(', ')} inside the working directory (a search or a listing is a Bash call and asks); ` +
+        'every other call asks the device first',
     );
     lines.push(
       config.settingSources.length === 0
-        ? '  settings none are read (no CLAUDE.md either)'
-        : `  settings ${config.settingSources.join(', ')}: CLAUDE.md and env apply; their permission rules and hooks are ignored`,
+        ? '  settings none are read: nothing in the repository or in ~/.claude can change how Claude runs'
+        : `  settings ${config.settingSources.join(', ')} (OPT-IN, see the warning below)`,
     );
+    lines.push(...memoryLines(config, info));
+    lines.push(
+      config.turnStallSec === 0
+        ? '  stall   a turn is never ended for silence (--turn-stall-sec 0)'
+        : `  stall   a turn with no sign of life from Claude for ${config.turnStallSec} s is ended (--turn-stall-sec)`,
+    );
+    lines.push(...settingsWarning(config));
   }
   for (const w of config.warnings) lines.push(`  WARNING ${w}`);
   lines.push(
@@ -478,8 +603,15 @@ export function needsAskFor(cwd: string): (tool: string, input: Record<string, u
   return (tool, input) => needsTap(tool, input, cwd);
 }
 
-/** Everything the real Claude driver is configured with, from the parsed flags and the environment. */
-export function buildClaudeConfig(config: Config, env: Record<string, string | undefined>): ClaudeDriverConfig {
+/**
+ * Everything the real Claude driver is configured with, from the parsed flags and the environment.
+ *
+ * `memory` is what the bridge read of the project's CLAUDE.md; when it is not given it is read here, so
+ * calling this with two arguments is complete. It is passed to the driver only when the CLI will not
+ * load that file itself (the `project` source does, and would then expand its @imports and show it twice).
+ */
+export function buildClaudeConfig(config: Config, env: Record<string, string | undefined>, memory?: ProjectMemory): ClaudeDriverConfig {
+  const mem = bridgeSuppliesMemory(config) ? (memory ?? inspectProjectMemory(config.cwd)) : undefined;
   return {
     // Trimmed: a key pasted with a trailing newline is a key the API refuses, with a message about
     // authentication that points everywhere but the whitespace.
@@ -488,6 +620,8 @@ export function buildClaudeConfig(config: Config, env: Record<string, string | u
     hardDeny: hardDenyFor(config.cwd),
     needsAsk: needsAskFor(config.cwd),
     passEnv: config.passEnv,
+    stallMs: config.turnStallSec * 1000,
+    ...(mem !== undefined && mem.text !== '' ? { projectMemory: mem.text } : {}),
     ...(config.model !== undefined ? { model: config.model } : {}),
     ...(config.maxTurns !== undefined ? { maxTurns: config.maxTurns } : {}),
   };
@@ -533,11 +667,48 @@ export interface RunResult {
   exitCode: number;
 }
 
+/** Words for the operator when the policy-tier lock is not (or cannot be shown to be) in force. */
+export function lockWarning(status: ManagedLockStatus | undefined): string | undefined {
+  if (status === undefined) {
+    return (
+      'Could not verify whether the policy-tier lock (which makes Claude Code ignore the permission rules and hooks of the settings ' +
+      'files above) is in force on this machine. Assume it is not: the bridge\'s own ask hook is then the only guard on tool calls.'
+    );
+  }
+  if (status.effective) return undefined;
+  const by = status.displacedBy.length > 0 ? ` (${status.displacedBy.join(', ')})` : '';
+  return (
+    `An administrator's policy tier${by} is active on this machine, so the lock that makes Claude Code ignore the permission rules ` +
+    `and hooks of the settings files above is NOT in force (${status.missing.join(', ')} not applied). The repository's hooks can ` +
+    "run commands; only the bridge's own ask hook still guards tool calls."
+  );
+}
+
+const inspectorGuarded = new WeakSet<object>();
+
+/**
+ * Makes `kill -USR1 <pid>` unable to open Node's inspector on this process.
+ *
+ * Node starts an unauthenticated inspector on 127.0.0.1:9229 when it gets SIGUSR1, unless a JavaScript
+ * handler is installed for it (measured: with one, the signal runs the handler and nothing listens). Any
+ * process running as the operator's user, including every command Claude runs once approved, can send that
+ * signal, and the inspector would let it read BRIDGE_TOKEN and ANTHROPIC_API_KEY or answer the bridge's own
+ * asks. `npm start` also passes `--disable-sigusr1`; this is the same refusal in code, so it holds when
+ * the bridge is started another way. It removes THAT road only: anything running as the operator's user
+ * can still read the process's memory through /proc or ptrace where the system allows it, and the README
+ * says so. Idempotent.
+ */
+export function neutraliseInspector(io: Io = stdIo, proc: Pick<NodeJS.Process, 'on'> = process): void {
+  if (inspectorGuarded.has(proc)) return;
+  inspectorGuarded.add(proc);
+  proc.on('SIGUSR1', () => io.err('SIGUSR1 ignored: this bridge does not open the Node inspector on a signal.\n'));
+}
+
 export async function run(
   argv: string[],
   env: Record<string, string | undefined>,
   io: Io = stdIo,
-  deps: ParseDeps = {},
+  deps: RunDeps = {},
 ): Promise<RunResult> {
   let config: Config;
   try {
@@ -555,10 +726,33 @@ export async function run(
   }
 
   let driverFactory: DriverFactory;
+  let memory: ProjectMemoryReport | undefined;
   if (config.fakeClaude) {
     driverFactory = fakeDriverFactory({ delayMs: config.fakeDelayMs });
   } else {
-    driverFactory = claudeDriverFactory(buildClaudeConfig(config, env));
+    (deps.guardInspector ?? neutraliseInspector)(io);
+
+    // The bridge's own credential files are secret stores for the tool rules, so a read of them asks at
+    // high risk even inside the working directory; and the person is told when one sits in the project.
+    const secrets = deps.secrets ?? { set: setBridgeSecrets, inside: bridgeSecretsInside };
+    secrets.set([...(config.tokenFile !== undefined ? [config.tokenFile] : []), config.stateDir]);
+    const inside = secrets.inside(config.cwd);
+    if (inside.length > 0) {
+      config.warnings.push(
+        `The bridge's own ${inside.length === 1 ? 'file' : 'files'} (${inside.join(', ')}) ${inside.length === 1 ? 'is' : 'are'} inside the working ` +
+          `directory. Claude can read ${inside.length === 1 ? 'it' : 'them'} only after a tap, but keep the token file and the state directory outside the project.`,
+      );
+    }
+
+    // Looked at once, here, so the banner and the driver describe the same bytes.
+    if (bridgeSuppliesMemory(config)) memory = (deps.loadMemory ?? inspectProjectMemory)(config.cwd);
+
+    if (config.settingSources.length > 0) {
+      const note = lockWarning(await (deps.checkManagedLock ?? checkManagedLock)(config.cwd));
+      if (note !== undefined) config.warnings.push(note);
+    }
+
+    driverFactory = (deps.makeClaudeDriver ?? claudeDriverFactory)(buildClaudeConfig(config, env, memory));
   }
 
   // The fake's session ids are made up. Written to the real state file they would be
@@ -568,7 +762,7 @@ export async function run(
 
   let server: RunningServer;
   try {
-    server = await startServer(
+    server = await (deps.startServer ?? startServer)(
       buildServerOptions(config, driverFactory, {
         ...(stateDir !== undefined ? { stateDir } : {}),
         log: (line) => io.err(`${new Date().toISOString()} ${line}\n`),
@@ -585,7 +779,7 @@ export async function run(
   }
 
   const urls = listUrls(config.host, server.port);
-  io.out(`${renderBanner(config, urls).join('\n')}\n`);
+  io.out(`${renderBanner(config, urls, memory !== undefined ? { memory } : {}).join('\n')}\n`);
   return { server, config, exitCode: 0 };
 }
 

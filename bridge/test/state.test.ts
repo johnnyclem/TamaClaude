@@ -57,6 +57,17 @@ const REACHABLE: readonly Phase[] = PHASES.filter((p) => p !== 'speaking');
 /** Generous on purpose: what is guarded is a stall, which takes seconds, not milliseconds. */
 const BUDGET_MS = 1500;
 
+/** The shortest of `runs` wall-clock times of `fn`, in ms: load only adds to a run, so the minimum is the measure. */
+function fastest(fn: () => void, runs = 3): number {
+  let best = Infinity;
+  for (let i = 0; i < runs; i++) {
+    const t0 = performance.now();
+    fn();
+    best = Math.min(best, performance.now() - t0);
+  }
+  return best;
+}
+
 function rng(seed: number): () => number {
   let a = seed >>> 0;
   return () => {
@@ -359,11 +370,13 @@ describe('hostile tool and ask labels', () => {
   });
 
   it('is linear in the size of the name', () => {
-    const t0 = performance.now();
-    reduce(fold(promptSent), toolStart('a', 'x'.repeat(1_000_000)));
-    reduce(fold(promptSent), asks(1, '\u{1F600}'.repeat(300_000)));
-    const ms = performance.now() - t0;
-    assert.ok(ms < BUDGET_MS, `took ${Math.round(ms)} ms`);
+    // The best of three runs: noise (a loaded machine) only ever makes a run slower, so the fastest is the
+    // honest measure, and a quadratic reducer would not finish a single run of a million characters.
+    const ms = fastest(() => {
+      reduce(fold(promptSent), toolStart('a', 'x'.repeat(1_000_000)));
+      reduce(fold(promptSent), asks(1, '\u{1F600}'.repeat(300_000)));
+    });
+    assert.ok(ms < BUDGET_MS, `the fastest of three runs took ${Math.round(ms)} ms`);
   });
 
   it('is accepted by the wire encoder (the caller), and decodes back to the same message', () => {

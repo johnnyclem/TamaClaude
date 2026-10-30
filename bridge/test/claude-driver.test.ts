@@ -26,10 +26,33 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { HookInput, Options, PermissionResult, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
-import { buildChildEnv, CHILD_ENV_NAMES, claudeDriverFactory, pinnedSettings, UNSERVED_TOOLS } from '../src/drivers/claude.ts';
-import type { ClaudeDriverConfig } from '../src/drivers/claude.ts';
-import { describeTool } from '../src/tools.ts';
-import { VOICE_RULES } from '../src/voice-prompt.ts';
+import {
+  buildChildEnv,
+  checkManagedLock,
+  CHILD_ENV_NAMES,
+  CHILD_ENV_PREFIXES,
+  claudeDriverFactory,
+  DEFAULT_STALL_MS,
+  PIN_COMMAND_KEYS,
+  PIN_COMMAND_OBJECT_KEYS,
+  PIN_CREDENTIAL_NAMES,
+  PIN_ENDPOINT_NAMES,
+  PIN_FEATURE_NAMES,
+  PIN_HIJACK_NAMES,
+  PIN_KEEP_OR_SKIP,
+  PIN_NEUTRAL,
+  PIN_PROVIDER_SELECTORS,
+  PIN_PROXY_NAMES,
+  pinnedSettings,
+  REDACTED,
+  redactSecrets,
+  STALLED_TEXT,
+} from '../src/drivers/claude.ts';
+import type { ClaudeDriverConfig, ManagedLockStatus } from '../src/drivers/claude.ts';
+import { describeTool, UNSERVED_TOOL_NAMES } from '../src/tools.ts';
+import { summarizeForDevice } from '../src/text.ts';
+import { LIMITS } from '../src/types.ts';
+import { composeSystemAppend, MEMORY_BEGIN, MEMORY_END, MEMORY_HEADING, VOICE_RULES } from '../src/voice-prompt.ts';
 import type { DriverEvent, PermissionHandler, PermissionRequest, SessionDriver } from '../src/types.ts';
 import {
   FakeClock,
@@ -48,6 +71,8 @@ import {
   SID,
 } from './support/fake-sdk.ts';
 import type { FakeQuery } from './support/fake-sdk.ts';
+import { settingsKeys, settingsTypeErrors } from './support/sdk-settings-type.ts';
+import { REAL_CLI_VERIFIED_SDK } from './support/sdk-version.ts';
 
 const KEY = 'sk-ant-test-0123456789abcdef';
 const CWD = '/work/proj';
@@ -89,6 +114,10 @@ interface HarnessOpts {
   /** Make query() throw for the first N calls. */
   queryThrows?: { times: number; error: unknown };
   env?: NodeJS.ProcessEnv;
+  /** What the lock check answers; defaults to "in force" so no test reaches for the machine's real policy tier. */
+  lock?: ManagedLockStatus | undefined | 'throws';
+  /** Records each time the lock is asked about. */
+  lockAsked?: string[];
 }
 
 interface Harness {
@@ -117,6 +146,11 @@ function harness(over: HarnessOpts = {}): Harness {
     interruptGraceMs: over.interruptGraceMs ?? 5000,
     env: over.env ?? PARENT_ENV,
     settingsDir: SCRATCH,
+    checkManagedLock: (cwd) => {
+      over.lockAsked?.push(cwd);
+      if (over.lock === 'throws') return Promise.reject(new Error('resolver moved'));
+      return Promise.resolve('lock' in over ? over.lock : { effective: true, missing: [], displacedBy: [] });
+    },
   })({
     cwd: CWD,
     resume: over.resume,
@@ -197,9 +231,11 @@ test('the query is started with the options that keep every call behind the hand
   const o = h.options();
   assert.equal(o.includePartialMessages, true);
   assert.equal(o.permissionMode, 'default');
-  assert.deepEqual(o.settingSources, ['project', 'local']);
+  assert.deepEqual(o.settingSources, [], 'the default loads no repository or user configuration at all');
   assert.equal(o.cwd, CWD);
-  assert.deepEqual(o.systemPrompt, { type: 'preset', preset: 'claude_code', append: VOICE_RULES });
+  // `snapshot: false`: a recorded prompt would keep an edited CLAUDE.md out of a resumed session (measured).
+  assert.deepEqual(o.systemPrompt, { type: 'preset', preset: 'claude_code', append: VOICE_RULES, snapshot: false });
+  assert.deepEqual(o.skills, [], 'no skills: their inline shell commands run without a question');
   assert.equal(typeof o.canUseTool, 'function');
   assert.ok(o.abortController instanceof AbortController);
   assert.equal(o.env?.ANTHROPIC_API_KEY, KEY);
@@ -224,14 +260,14 @@ test('a repository cannot grant itself permissions: the policy tier locks rules 
   assert.equal(o.strictMcpConfig, true);
   // Typed or dictated words are never a CLI command or a file mention.
   assert.equal(o.verbatimPrompts, true);
-  assert.deepEqual(o.disallowedTools, [...UNSERVED_TOOLS]);
-  assert.ok(o.disallowedTools!.includes('AskUserQuestion') && o.disallowedTools!.includes('ScheduleWakeup'));
+  assert.deepEqual(o.disallowedTools, [...UNSERVED_TOOL_NAMES]);
+  assert.ok(o.disallowedTools!.length > 0);
 });
 
 test('every tool the driver removes from the model is also refused by the bridge\'s own rules', () => {
-  // Two lists, one fact (the repo's recurring trap): the driver stops OFFERING these, the
-  // describer REFUSES a call to them. If a name drifts out of one list this fails.
-  for (const name of UNSERVED_TOOLS) {
+  // One list (src/tools.ts), two consumers (the driver stops OFFERING these, the describer
+  // REFUSES a call to them), so a name cannot drift out of one and stay in the other.
+  for (const name of UNSERVED_TOOL_NAMES) {
     const view = describeTool(name, {}, CWD);
     assert.ok(view.deny !== undefined, `${name} is removed from the model but describeTool would ask the device about it`);
   }
@@ -240,12 +276,13 @@ test('every tool the driver removes from the model is also refused by the bridge
 });
 
 test('the pinned settings file holds the endpoint, the proxies and an empty key helper, and is private', async () => {
-  const h = harness({ env: { PATH: '/bin', HOME: '/h', HTTPS_PROXY: 'http://user:proxy-pass@proxy.example:3128', ANTHROPIC_BASE_URL: 'https://gateway.example' } , cfg: { passEnv: ['ANTHROPIC_BASE_URL'] } });
+  const h = harness({ env: { PATH: '/bin', HOME: '/h', HTTPS_PROXY: 'http://user:proxy-pass@proxy.example:3128', ANTHROPIC_BASE_URL: 'https://gateway.example' } , cfg: { passEnv: ['ANTHROPIC_BASE_URL'], settingSources: ['project', 'local'] } });
   await begin(h);
   const path = h.options().settings;
   assert.equal(typeof path, 'string', 'a path, not an inline object: inline settings show up in `ps`');
   const text = readFileSync(path as string, 'utf8');
   const pinned = JSON.parse(text) as { env: Record<string, string>; apiKeyHelper: string };
+  assert.deepEqual(pinned, JSON.parse(JSON.stringify(pinnedSettings(h.options().env as Record<string, string>))), 'the file is exactly what the pin function says');
   assert.equal(pinned.env.ANTHROPIC_BASE_URL, 'https://gateway.example');
   assert.equal(pinned.env.HTTPS_PROXY, 'http://user:proxy-pass@proxy.example:3128');
   assert.equal(pinned.env.HTTP_PROXY, '', 'a proxy the operator did not set is pinned to none, not left to the repository');
@@ -255,6 +292,23 @@ test('the pinned settings file holds the endpoint, the proxies and an empty key 
   const { settings, managedSettings, ...rest } = h.options();
   void settings;
   assert.ok(!JSON.stringify([managedSettings, rest.systemPrompt, rest.disallowedTools]).includes('proxy-pass'));
+});
+
+test('the pinned file is written only when a settings source is loaded: with none there is nothing for it to outrank', async () => {
+  const none = harness();
+  await begin(none);
+  assert.ok(!('settings' in none.options()), 'no `settings` option by default');
+  await none.driver.close();
+  // Nothing was written: the scratch directory holds no pinned file for this driver.
+  // Companion: every source, alone, gets one, so the absence above is about the empty list and not a broken writer.
+  for (const source of ['project', 'local', 'user'] as const) {
+    const h = harness({ cfg: { settingSources: [source] } });
+    await begin(h);
+    const path = h.options().settings;
+    assert.equal(typeof path, 'string', source);
+    assert.ok(existsSync(path as string), source);
+    assert.deepEqual(JSON.parse(readFileSync(path as string, 'utf8')), JSON.parse(JSON.stringify(pinnedSettings(h.options().env as Record<string, string>))));
+  }
 });
 
 test('without an operator endpoint the pin is the public API, and the pin function is what decides', () => {
@@ -267,7 +321,7 @@ test('without an operator endpoint the pin is the public API, and the pin functi
 });
 
 test('close removes the pinned settings file the driver wrote', async () => {
-  const h = harness();
+  const h = harness({ cfg: { settingSources: ['project'] } });
   await begin(h);
   const path = h.options().settings as string;
   assert.ok(existsSync(path));
@@ -843,7 +897,7 @@ test('stderr from the CLI is logged, scrubbed and bounded', async () => {
   h.options().stderr!(`warn: using ${KEY}\n${'x'.repeat(1000)}`);
   assert.equal(h.logs.length, 1);
   assert.ok(!h.logs[0]!.includes(KEY));
-  assert.match(h.logs[0]!, /^claude stderr: warn: using \*\*\*/);
+  assert.match(h.logs[0]!, /^claude stderr: warn: using \[redacted\]/);
   assert.ok(h.logs[0]!.length <= 200);
 });
 
@@ -1186,7 +1240,7 @@ test('query() throwing is one fatal, and the next prompt tries again', async () 
   assert.equal(h.queries.length, 0);
   const t = terminals(h.events);
   assert.equal(t.length, 1);
-  assert.match((t[0] as { msg: string }).msg, /^Claude did not start: spawn failed for \*\*\*$/);
+  assert.match((t[0] as { msg: string }).msg, /^Claude did not start: spawn failed for \[redacted\]$/);
   const q = await begin(h, 'second');
   q.push(resultOk('ok'));
   await settle();
@@ -1612,10 +1666,650 @@ test('with no injected query the real SDK is imported on first use, and a missin
 });
 
 // ---------------------------------------------------------------------------
+// The pins: derived from their lists and from the SDK's own Settings type
+// ---------------------------------------------------------------------------
+
+/** Every env name the pin function is responsible for, from the lists themselves. */
+const PINNED_ENV_GROUPS: Record<string, readonly string[]> = {
+  proxies: PIN_PROXY_NAMES,
+  'provider selectors': PIN_PROVIDER_SELECTORS,
+  endpoints: PIN_ENDPOINT_NAMES,
+  credentials: PIN_CREDENTIAL_NAMES,
+  'feature switches': PIN_FEATURE_NAMES,
+  'program-lookup hijackers': PIN_HIJACK_NAMES,
+};
+
+test('every pinned environment name is in the file: the operator\'s value when the child has one, else nothing the repository chose', () => {
+  for (const [group, names] of Object.entries(PINNED_ENV_GROUPS)) {
+    assert.ok(names.length > 0, group);
+    for (const name of names) {
+      // The operator's own value always wins, so a gateway or a corporate proxy keeps working.
+      assert.equal(pinnedSettings({ [name]: 'operator-value' }).env[name], 'operator-value', `${group}: ${name}`);
+      const bare = pinnedSettings({}).env;
+      if (PIN_KEEP_OR_SKIP.has(name)) {
+        assert.ok(!(name in bare), `${name}: an empty value would be worse than none (an empty PATH entry is the current directory)`);
+      } else {
+        assert.equal(bare[name], PIN_NEUTRAL.get(name) ?? '', `${group}: ${name} is blanked when the operator gave none`);
+      }
+    }
+  }
+  // The one neutral value exists because blank is not "unset" for git over ssh (measured).
+  assert.equal(PIN_NEUTRAL.get('GIT_SSH_COMMAND'), 'ssh');
+  // No name is in two groups, or one group's rule would silently override another's.
+  const all = Object.values(PINNED_ENV_GROUPS).flat();
+  assert.equal(new Set(all).size, all.length, 'a name appears in two pin groups');
+});
+
+test('the pinned environment forces the two background switches and the public API, whatever the operator passed', () => {
+  const env = pinnedSettings({ CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '0', CLAUDE_CODE_DISABLE_WORKFLOWS: 'false' }).env;
+  assert.equal(env.CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, '1');
+  assert.equal(env.CLAUDE_CODE_DISABLE_WORKFLOWS, '1');
+  assert.equal(pinnedSettings({}).env.ANTHROPIC_BASE_URL, 'https://api.anthropic.com');
+});
+
+test('the API key is never written to the pinned file (a repository can replace it in an opt-in mode; that is documented, not hidden)', async () => {
+  const h = harness({ env: { PATH: '/bin', HTTPS_PROXY: 'http://u:proxy-pass@proxy.example:3128' }, cfg: { settingSources: ['project'] } });
+  await begin(h);
+  const text = readFileSync(h.options().settings as string, 'utf8');
+  assert.ok(!text.includes(KEY), 'the key would sit on disk until close(), and survive a kill');
+  assert.ok(!('ANTHROPIC_API_KEY' in (JSON.parse(text) as { env: Record<string, string> }).env));
+  // Companion: the file really does carry the other secret-bearing value, so the check can fail.
+  assert.ok(text.includes('proxy-pass'));
+});
+
+test('every command-bearing key is blanked: strings as empty strings, objects as empty-command objects', () => {
+  const pinned = pinnedSettings({});
+  for (const key of PIN_COMMAND_KEYS) assert.equal(pinned[key], '', key);
+  for (const key of PIN_COMMAND_OBJECT_KEYS) assert.deepEqual(pinned[key], { type: 'command', command: '' }, key);
+  // The boolean pins: the hook and workflow switches that back the policy tier up.
+  assert.equal(pinned.disableAllHooks, true, 'a repository hook must not run when the policy tier is not in force');
+  assert.equal(pinned.disableWorkflows, true);
+  assert.equal(pinned.disableSkillShellExecution, true);
+});
+
+test('the pinned file is a valid Settings literal: the CLI discards a whole file over one mistyped key', () => {
+  // Measured against the real CLI: `statusLine: ''` (and null, and {}) made it drop EVERY pin in the
+  // file without a word. The SDK's own Settings type is the contract the CLI validates against.
+  assert.deepEqual(settingsTypeErrors(pinnedSettings({})), []);
+  assert.deepEqual(
+    settingsTypeErrors(pinnedSettings({ PATH: '/usr/bin', HTTPS_PROXY: 'http://p', ANTHROPIC_BASE_URL: 'http://127.0.0.1:1' })),
+    [],
+  );
+  // Companion: the check can fail, on exactly the mistake that bit.
+  const bad = settingsTypeErrors({ ...pinnedSettings({}), statusLine: '' });
+  assert.ok(bad.length > 0 && bad.some((m) => /statusLine|not assignable/.test(m)), String(bad));
+  assert.ok(settingsTypeErrors({ apiKeyHelper: 5 }).length > 0);
+});
+
+/** Keys the SDK's Settings type names like a command runner, or gives a command-shaped value. */
+function commandCandidates(keys: { name: string; runsCommand: boolean }[]): string[] {
+  return keys.filter((k) => /(Helper|Refresh|Export)$/.test(k.name) || k.runsCommand).map((k) => k.name);
+}
+/** Candidates that are neither pinned nor reviewed: the ones a human has to look at. */
+function unreviewed(candidates: string[], pinned: string[], reviewed: Record<string, string>): string[] {
+  return candidates.filter((n) => !pinned.includes(n) && !(n in reviewed));
+}
+/**
+ * Keys that look like command runners and are deliberately NOT pinned, each with the reason. A new
+ * SDK key that looks like one fails the test below until somebody adds it here or to the pins.
+ */
+const REVIEWED_NOT_PINNED: Record<string, string> = {
+  policyHelper: 'honoured only from admin-controlled policy sources (the SDK documents it); a flag-layer value is ignored',
+  hooks: 'command hooks: ignored by the policy tier (allowManagedHooksOnly) and by the pinned disableAllHooks',
+  strictKnownMarketplaces: 'a plugin-marketplace allowlist; `command` appears in a marketplace SOURCE shape, nothing here is run from the file',
+  allowedMarketplaces: 'a plugin-marketplace allowlist, as above',
+  blockedMarketplaces: 'a plugin-marketplace denylist, as above',
+  sandbox: 'configures the optional sandbox, which this bridge does not rely on: every command asks regardless',
+  forceRemoteSettingsRefresh: 'a boolean (managed settings only) that makes the CLI refetch remote policy at start-up; it names no command',
+};
+
+test('every key the SDK names Helper, Refresh or Export, or gives a command-shaped value, is pinned or has a reviewed reason', () => {
+  const keys = settingsKeys();
+  const candidates = commandCandidates(keys);
+  // The candidate list must contain what the incident was about, or the scan found nothing real.
+  for (const known of ['apiKeyHelper', 'awsAuthRefresh', 'awsCredentialExport', 'gcpAuthRefresh', 'proxyAuthHelper', 'otelHeadersHelper', 'statusLine', 'fileSuggestion']) {
+    assert.ok(candidates.includes(known), `the scan should have found ${known}; the SDK's Settings type changed shape`);
+  }
+  const pinned = Object.keys(pinnedSettings({}));
+  assert.deepEqual(unreviewed(candidates, pinned, REVIEWED_NOT_PINNED), [], 'a command-running settings key is neither pinned nor reviewed');
+  // A reviewed reason for a key that is pinned, or that no longer exists, is a stale note.
+  const names = new Set(keys.map((k) => k.name));
+  for (const n of Object.keys(REVIEWED_NOT_PINNED)) {
+    assert.ok(names.has(n), `${n} is reviewed but the SDK no longer has it`);
+    assert.ok(!pinned.includes(n), `${n} is both pinned and reviewed-not-pinned`);
+  }
+  // Every pinned command key exists in the SDK's type (a rename would leave a pin pinning nothing).
+  for (const n of [...PIN_COMMAND_KEYS, ...PIN_COMMAND_OBJECT_KEYS, 'disableAllHooks', 'disableWorkflows', 'disableSkillShellExecution']) {
+    assert.ok(names.has(n), `${n} is pinned but is not a key of the SDK's Settings type any more`);
+  }
+});
+
+test('the settings scan can fail: a new *Helper key the pins do not know is reported', () => {
+  const real = settingsKeys();
+  const withNew = [...real, { name: 'newCredentialHelper', type: 'string', doc: '', runsCommand: false }];
+  assert.deepEqual(unreviewed(commandCandidates(withNew), Object.keys(pinnedSettings({})), REVIEWED_NOT_PINNED), ['newCredentialHelper']);
+  const shaped = [...real, { name: 'postStartHook', type: '{ command: string }', doc: '', runsCommand: true }];
+  assert.deepEqual(unreviewed(commandCandidates(shaped), Object.keys(pinnedSettings({})), REVIEWED_NOT_PINNED), ['postStartHook']);
+  // And a pin that is dropped from the function is reported too.
+  const { apiKeyHelper, ...without } = pinnedSettings({});
+  void apiKeyHelper;
+  assert.deepEqual(unreviewed(commandCandidates(real), Object.keys(without), REVIEWED_NOT_PINNED), ['apiKeyHelper']);
+});
+
+// ---------------------------------------------------------------------------
+// Opt-in settings sources
+// ---------------------------------------------------------------------------
+
+test('loading the repository\'s settings is announced in the log, once, and the default never says it', async () => {
+  const quiet = harness();
+  await begin(quiet);
+  assert.ok(!quiet.logs.some((l) => /WARNING/.test(l)), 'the default loads nothing, so there is nothing to warn about');
+
+  const loud = harness({ cfg: { settingSources: ['project', 'local'] } });
+  const q = await begin(loud);
+  const warnings = loud.logs.filter((l) => /^WARNING: settings sources project,local/.test(l));
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0]!, /run commands/);
+  // A second query (the CLI went away between turns) does not repeat it.
+  q.push(resultOk('done'));
+  await settle();
+  q.end();
+  await settle();
+  await begin(loud, 'again');
+  assert.equal(loud.logs.filter((l) => /^WARNING: settings sources/.test(l)).length, 1);
+
+  // `user` alone is the operator's own configuration, not the repository's: no repository warning.
+  const own = harness({ cfg: { settingSources: ['user'] } });
+  await begin(own);
+  assert.ok(!own.logs.some((l) => /^WARNING/.test(l)));
+});
+
+test('the driver says in its log whether the policy-tier lock is in force, only when a repository\'s files are loaded', async () => {
+  // Default: nothing is loaded, so there is nothing to lock and nobody is asked.
+  const asked: string[] = [];
+  const quiet = harness({ lockAsked: asked });
+  await begin(quiet);
+  await settle();
+  assert.deepEqual(asked, []);
+
+  const down: ManagedLockStatus = { effective: false, missing: ['allowManagedPermissionRulesOnly', 'allowManagedHooksOnly'], displacedBy: ['file'] };
+  const displaced = harness({ cfg: { settingSources: ['project'] }, lock: down, lockAsked: asked });
+  await begin(displaced);
+  await settle();
+  assert.deepEqual(asked, [CWD], 'asked once, about the working directory');
+  const line = displaced.logs.find((l) => /policy-tier lock is NOT in force/.test(l));
+  assert.ok(line !== undefined, displaced.logs.join('\n'));
+  assert.match(line, /admin tier: file/);
+  assert.match(line, /disableAllHooks/);
+  assert.match(line, /^[\x20-\x7e]+$/);
+
+  // In force: no warning. Unknown: a distinct line, never silence and never "fine".
+  const fine = harness({ cfg: { settingSources: ['local'] } });
+  await begin(fine);
+  await settle();
+  assert.ok(!fine.logs.some((l) => /lock/.test(l)));
+  for (const lock of [undefined, 'throws'] as const) {
+    const unknown = harness({ cfg: { settingSources: ['project'] }, lock });
+    await begin(unknown);
+    await settle();
+    assert.ok(unknown.logs.some((l) => /could not verify that the policy-tier lock is in force/.test(l)), String(lock));
+  }
+  // Asked once per driver, not once per query.
+  const once = harness({ cfg: { settingSources: ['project'] }, lock: down, lockAsked: (asked.length = 0, asked) });
+  const q = await begin(once);
+  q.push(resultOk('done'));
+  await settle();
+  q.end();
+  await settle();
+  await begin(once, 'again');
+  await settle();
+  assert.equal(asked.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// The project's memory file reaches the model as text
+// ---------------------------------------------------------------------------
+
+test('the project memory is appended to the system prompt under a heading, after the voice rules, and nowhere else', async () => {
+  const memory = '=== CLAUDE.md ===\nUse tabs. Run the formatter before committing.';
+  const h = harness({ cfg: { projectMemory: memory } });
+  await begin(h);
+  const o = h.options();
+  const sp = o.systemPrompt as { type: string; preset: string; append: string; snapshot: boolean };
+  assert.equal(sp.append, composeSystemAppend(memory));
+  assert.ok(sp.append.startsWith(VOICE_RULES), 'the voice rules come first and are untouched');
+  assert.ok(sp.append.includes(MEMORY_HEADING) && sp.append.includes(MEMORY_BEGIN) && sp.append.includes(MEMORY_END));
+  assert.ok(sp.append.indexOf(MEMORY_HEADING) < sp.append.indexOf('Use tabs'), 'the heading says what the text is before the text');
+  assert.match(MEMORY_HEADING, /memory file/);
+  assert.match(MEMORY_HEADING, /cannot approve/, 'the model is told this text cannot grant a permission');
+  // Only the system prompt: not the environment, not the pinned file, not an option anybody serialises elsewhere.
+  assert.ok(!JSON.stringify(o.env).includes('Use tabs'));
+  assert.ok(!('settings' in o), 'and with no settings source there is no pinned file for it to be in either');
+  assert.equal(sp.snapshot, false, 'a recorded prompt would keep an edited CLAUDE.md out of a resumed session');
+});
+
+test('no memory, an empty memory and a whitespace-only memory add no section at all', async () => {
+  for (const projectMemory of [undefined, '', '  \n\t ']) {
+    const h = harness({ cfg: projectMemory === undefined ? {} : { projectMemory } });
+    await begin(h);
+    assert.equal((h.options().systemPrompt as { append: string }).append, VOICE_RULES, JSON.stringify(projectMemory));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The driver's own environment allowlist (M10)
+// ---------------------------------------------------------------------------
+
+test('the allowlist\'s prefixes match the START of a name: a name that merely contains one is not passed', () => {
+  assert.ok(CHILD_ENV_PREFIXES.length > 0);
+  for (const prefix of CHILD_ENV_PREFIXES) {
+    const passes = (name: string): boolean => name in buildChildEnv({ [name]: 'v' }, KEY).env;
+    assert.ok(passes(`${prefix}SOMETHING`), `${prefix}SOMETHING starts with the prefix and is passed`);
+    for (const name of [`SECRET_${prefix}ALL`, `MY_${prefix}CONFIG`, `DB_${prefix}PASSWORD`, `X${prefix}TOKEN`, `${prefix.toLowerCase()}something`]) {
+      assert.ok(!passes(name), `${name} contains ${prefix} but does not start with it`);
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A request from a query that was given up on (M9)
+// ---------------------------------------------------------------------------
+
+test('a permission request from a DISCARDED query is refused while a newer turn is in flight, and never shown to the device', async () => {
+  // The case the identity check exists for: close() is not involved, a turn IS in flight, but the
+  // request belongs to the query the driver already gave up on (an interrupt it never acknowledged).
+  const h = harness({ interruptGraceMs: 1000 });
+  const q1 = await begin(h, 'first');
+  q1.onInterrupt = () => new Promise(() => {}); // the CLI never answers
+  void h.driver.interrupt();
+  await settle();
+  h.clock.advance(1000);
+  await settle();
+  assert.equal(terminals(h.events).length, 1, 'the first turn ended (fatal: did not stop)');
+  const q2 = await begin(h, 'second');
+  assert.notEqual(q1, q2);
+
+  const stale = await h.ask('Bash', { command: 'touch x' }, { run: 0 });
+  assert.equal(stale.behavior, 'deny');
+  assert.equal(h.requests.length, 0, 'a question from the old query must not be put to the device during the new turn');
+  assert.match((stale as { message: string }).message, /no longer active/);
+
+  // Companion: the same request from the CURRENT query does reach the device, so the refusal above
+  // is about which query asked and not about the turn.
+  const fresh = await h.ask('Bash', { command: 'touch x' }, { run: 1 });
+  assert.equal(fresh.behavior, 'allow');
+  assert.equal(h.requests.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// The silence watchdog (D15)
+// ---------------------------------------------------------------------------
+
+const terminalOf = (events: DriverEvent[]): DriverEvent | undefined => terminals(events)[0];
+
+test('a turn with no event for the stall period is interrupted and ends as stalled, exactly once', async () => {
+  const h = harness();
+  const q = await begin(h, 'hello');
+  q.push(init());
+  await settle();
+  h.clock.advance(DEFAULT_STALL_MS - 1);
+  await settle();
+  assert.equal(terminals(h.events).length, 0, 'not yet: one millisecond short');
+  h.clock.advance(1);
+  await settle();
+  assert.deepEqual(terminalOf(h.events), { k: 'result', ok: false, text: STALLED_TEXT, subtype: 'stalled' });
+  assertOneTerminalEach(h.events, 1);
+  assert.equal(q.interrupts, 1, 'the CLI was told to drop the request');
+  assert.equal(q.closes, 1, 'and the silent query was given up on');
+  assert.equal(h.clock.armed, 0, 'no timer left behind');
+  assert.ok(h.logs.some((l) => /no sign of life/.test(l)));
+  assert.match(STALLED_TEXT, /^[\x20-\x7e]+$/);
+});
+
+test('every event restarts the quiet period, and it is counted from the LAST one', async () => {
+  const h = harness();
+  const q = await begin(h, 'hello');
+  h.clock.advance(200_000);
+  q.push(init());
+  await settle();
+  h.clock.advance(200_000);
+  q.push(assistantText('working'));
+  await settle();
+  h.clock.advance(200_000);
+  await settle();
+  assert.equal(terminals(h.events).length, 0, '600 s in, but never 300 s without a word');
+  h.clock.advance(100_000);
+  await settle();
+  assert.equal(terminalOf(h.events)?.k, 'result');
+  assert.equal((terminalOf(h.events) as { subtype: string }).subtype, 'stalled');
+});
+
+test('a message from a turn nobody asked for still counts as a sign of life', async () => {
+  const h = harness();
+  const q = await begin(h, 'hello');
+  h.clock.advance(250_000);
+  q.push(assistantText('a background turn is talking'), { stamp: false });
+  await settle();
+  h.clock.advance(250_000);
+  await settle();
+  assert.equal(terminals(h.events).length, 0, 'the CLI is busy, not silent');
+});
+
+test('a tool that is RUNNING pauses the watchdog; its result is activity and restarts the count', async () => {
+  const h = harness();
+  const q = await begin(h, 'build it');
+  q.push(init());
+  q.push(toolStart('t1', 'Bash'));
+  q.push(blockStop());
+  await settle();
+  h.clock.advance(DEFAULT_STALL_MS * 10);
+  await settle();
+  assert.equal(terminals(h.events).length, 0, 'a long build is quiet and fine');
+  q.push(toolResult('t1'));
+  await settle();
+  h.clock.advance(DEFAULT_STALL_MS - 1);
+  await settle();
+  assert.equal(terminals(h.events).length, 0, 'counted from the result, not from before the tool');
+  h.clock.advance(1);
+  await settle();
+  assert.equal((terminalOf(h.events) as { subtype: string }).subtype, 'stalled');
+});
+
+test('a tool still STREAMING its input is not running: a model that goes silent mid-call is the stall', async () => {
+  const h = harness();
+  const q = await begin(h, 'build it');
+  q.push(init());
+  q.push(toolStart('t1', 'Bash')); // no content_block_stop: the input never finished
+  await settle();
+  h.clock.advance(DEFAULT_STALL_MS);
+  await settle();
+  assert.equal((terminalOf(h.events) as { subtype: string }).subtype, 'stalled');
+  assert.deepEqual(dangling(h.events), [], 'and the tool it announced is closed, not left open');
+});
+
+test('an open permission request pauses the watchdog; answering it is activity', async () => {
+  let release!: () => void;
+  const answer = new Promise<{ allow: true }>((resolve) => {
+    release = () => resolve({ allow: true });
+  });
+  const h = harness({ onPermission: () => answer });
+  const q = await begin(h, 'delete it');
+  q.push(init());
+  await settle();
+  const ask = h.ask('Bash', { command: 'rm x' });
+  await settle();
+  // Ten and a HALF periods: the watchdog's own timer is mid-period when the person answers, so
+  // counting from the answer and counting from the last message give different moments.
+  h.clock.advance(DEFAULT_STALL_MS * 10.5);
+  await settle();
+  assert.equal(terminals(h.events).length, 0, 'a person is deciding; that is not the model being silent');
+  release();
+  await ask;
+  await settle();
+  h.clock.advance(DEFAULT_STALL_MS - 1);
+  await settle();
+  assert.equal(terminals(h.events).length, 0, 'the quiet is counted from the answer');
+  h.clock.advance(1);
+  await settle();
+  assert.equal((terminalOf(h.events) as { subtype: string }).subtype, 'stalled');
+});
+
+test('no timer is armed unless a turn is running: before, between and after turns', async () => {
+  const h = harness();
+  assert.equal(h.clock.armed, 0, 'a new driver');
+  const q = await begin(h, 'one');
+  assert.ok(h.clock.armed > 0, 'a turn arms the watchdog (so this test can see it disarm)');
+  q.push(resultOk('done'));
+  await settle();
+  assert.equal(h.clock.armed, 0, 'between turns');
+  h.driver.prompt('two');
+  await settle();
+  assert.ok(h.clock.armed > 0);
+  await h.driver.close();
+  assert.equal(h.clock.armed, 0, 'after close');
+});
+
+test('a late result from the query that stalled is ignored, and cannot end the NEXT prompt', async () => {
+  const h = harness();
+  const q1 = await begin(h, 'first');
+  q1.push(init());
+  await settle();
+  h.clock.advance(DEFAULT_STALL_MS);
+  await settle();
+  assertOneTerminalEach(h.events, 1);
+  const q2 = await begin(h, 'second');
+  // The stalled CLI wakes up and finishes the first turn, with its prompt's stamp.
+  q1.push(resultOk('too late'), { stampWith: UUID_OF(q1) });
+  q1.push(resultAborted());
+  await settle();
+  assertOneTerminalEach(h.events, 1);
+  assert.equal(h.events.filter((e) => e.k === 'result' && (e as { text: string }).text === 'too late').length, 0, 'its words reach nobody');
+  q2.push(resultOk('real answer'));
+  await settle();
+  assertOneTerminalEach(h.events, 2);
+  assert.deepEqual(terminals(h.events)[1], { k: 'result', ok: true, text: 'real answer', subtype: 'success' });
+});
+
+/** The uuid the driver gave the prompt a query received first. */
+function UUID_OF(q: FakeQuery): string {
+  return q.received[0]!.uuid as string;
+}
+
+test('the stall period is configurable, and 0 or a non-number turns the watchdog off entirely', async () => {
+  const short = harness({ cfg: { stallMs: 1500 } });
+  await begin(short);
+  short.clock.advance(1499);
+  await settle();
+  assert.equal(terminals(short.events).length, 0);
+  short.clock.advance(1);
+  await settle();
+  assert.equal((terminalOf(short.events) as { subtype: string }).subtype, 'stalled');
+
+  for (const stallMs of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    const off = harness({ cfg: { stallMs } });
+    await begin(off);
+    assert.equal(off.clock.armed, 0, `stallMs ${stallMs}: no timer at all`);
+    off.clock.advance(10 ** 9);
+    await settle();
+    assert.equal(terminals(off.events).length, 0, `stallMs ${stallMs}`);
+  }
+});
+
+test('after a stall the waiting prompt starts on a fresh query with its own full period', async () => {
+  const h = harness();
+  const q1 = await begin(h, 'first');
+  h.driver.prompt('second'); // waits behind the first
+  await settle();
+  assert.equal(h.queries.length, 1);
+  h.clock.advance(DEFAULT_STALL_MS);
+  await settle();
+  assertOneTerminalEach(h.events, 1);
+  assert.equal(h.queries.length, 2, 'the second prompt started on a new query straight away');
+  assert.equal(h.queries[1]!.received.length, 1);
+  h.clock.advance(DEFAULT_STALL_MS - 1);
+  await settle();
+  assertOneTerminalEach(h.events, 1);
+  h.clock.advance(1);
+  await settle();
+  assertOneTerminalEach(h.events, 2);
+  assert.equal(q1.closes, 1);
+});
+
+test('an interrupt that fails after a stall costs a log line, not a second terminal or a crash', async () => {
+  const h = harness();
+  const q = await begin(h, 'first');
+  q.onInterrupt = () => Promise.reject(new Error('the CLI is gone'));
+  h.clock.advance(DEFAULT_STALL_MS);
+  await settle();
+  assertOneTerminalEach(h.events, 1);
+  assert.ok(h.logs.some((l) => /interrupt after a stall failed: the CLI is gone/.test(l)));
+});
+
+test('asking the driver to stop hands the clock to the grace timer: the silence watchdog does not also end the turn', async () => {
+  const h = harness({ interruptGraceMs: 10 * DEFAULT_STALL_MS });
+  const q = await begin(h, 'first');
+  q.onInterrupt = () => new Promise(() => {}); // acknowledged never
+  void h.driver.interrupt();
+  await settle();
+  h.clock.advance(3 * DEFAULT_STALL_MS);
+  await settle();
+  assert.equal(terminals(h.events).length, 0, 'still waiting for the CLI to answer the interrupt, not declared stalled');
+});
+
+// ---------------------------------------------------------------------------
+// Upstream text is scrubbed before it leaves the driver (D16)
+// ---------------------------------------------------------------------------
+
+test('redactSecrets removes the configured key, key-shaped tokens and echoed auth values', () => {
+  const keys = [KEY];
+  assert.equal(redactSecrets(`Incorrect API key provided: ${KEY}.`, keys, 'error'), `Incorrect API key provided: ${REDACTED}.`);
+  assert.equal(redactSecrets('key sk-ant-api03-ABCDEFGHIJKLMNOP end', [], 'answer'), `key ${REDACTED} end`);
+  assert.equal(redactSecrets('sent Authorization: Bearer abcdef0123456789.xyz', [], 'answer'), `sent Authorization: ${REDACTED}`);
+  // Ordinary words that happen to be Basic or Bearer are left alone: the value must be long.
+  assert.equal(redactSecrets('a Basic installation, the Bearer of news', [], 'answer'), 'a Basic installation, the Bearer of news');
+  assert.equal(redactSecrets('Authorization: Basic dXNlcjpwYXNzd29yZDEyMzQ=', [], 'answer'), `Authorization: ${REDACTED}`);
+});
+
+test('redaction is strict for error text and key-shaped only for an answer', () => {
+  const hash = 'a'.repeat(40);
+  const token = 'Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWo';
+  // An answer keeps a commit id and a long identifier; an upstream error does not.
+  assert.equal(redactSecrets(`commit ${hash}`, [], 'answer'), `commit ${hash}`);
+  assert.equal(redactSecrets(`commit ${hash}`, [], 'error'), `commit ${REDACTED}`);
+  assert.equal(redactSecrets(`token ${token}`, [], 'answer'), `token ${token}`);
+  assert.equal(redactSecrets(`token ${token}`, [], 'error'), `token ${REDACTED}`);
+  // A session id is a UUID: long, token-shaped, and not a secret; the log needs it.
+  const uuid = '3602e11c-9a7b-4c1d-8f00-0123456789ab';
+  assert.equal(redactSecrets(`session ${uuid}`, [], 'error'), `session ${uuid}`);
+  // `sk-` inside a word is not a key.
+  assert.equal(redactSecrets('the risk-assessment and task-runner', [], 'answer'), 'the risk-assessment and task-runner');
+  // A key too short to be real is left alone rather than shredding every message.
+  assert.equal(redactSecrets('use abc here', ['abc'], 'error'), 'use abc here');
+  // The placeholder survives the sanitiser that turns result text into device text.
+  assert.equal(summarizeForDevice(`Error ${REDACTED}.`, LIMITS.resultMax), `Error ${REDACTED}.`);
+  assert.match(REDACTED, /^[\x20-\x7e]+$/);
+  assert.doesNotMatch(REDACTED, /[_*`#]/);
+  // Linear time on a hostile input.
+  const t0 = performance.now();
+  redactSecrets('a-'.repeat(200_000) + 'sk-'.repeat(50_000), [KEY], 'error');
+  assert.ok(performance.now() - t0 < 1500, 'a megabyte of near-misses must not stall the bridge');
+});
+
+test('a failed result whose upstream text echoes the key reaches the server without it', async () => {
+  const h = harness();
+  const q = await begin(h, 'hello');
+  q.push(resultErr('error_during_execution', { errors: [`API Error: 400 Incorrect API key provided: ${KEY}. Also sk-ant-api03-LEAKEDLEAKEDLEAKED`] }));
+  await settle();
+  const r = terminalOf(h.events) as Extract<DriverEvent, { k: 'result' }>;
+  assert.equal(r.ok, false);
+  const wire = JSON.stringify(h.events);
+  assert.ok(!wire.includes(KEY) && !wire.includes('LEAKED'), wire);
+  assert.ok(r.text.includes(REDACTED) && r.text.startsWith('API Error: 400'), 'the useful part of the message is still there');
+  // A failed result is the STRICT level: a long token-looking run goes too (a gateway may echo a credential in any shape).
+  const long = 'Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWo';
+  const h3 = harness();
+  const q3 = await begin(h3, 'hello');
+  q3.push(resultErr('error_during_execution', { errors: [`gateway said: bad credential ${long}`] }));
+  await settle();
+  assert.equal((terminalOf(h3.events) as { text: string }).text, `gateway said: bad credential ${REDACTED}`);
+  // Companion: text with nothing in it to remove passes through unchanged.
+  const h2 = harness();
+  const q2 = await begin(h2, 'hello');
+  q2.push(resultErr('error_during_execution', { errors: ['API Error: 529 overloaded, try again later'] }));
+  await settle();
+  assert.equal((terminalOf(h2.events) as { text: string }).text, 'API Error: 529 overloaded, try again later');
+});
+
+test('a successful answer and the narration are scrubbed of key-shaped text too, but keep their commit ids', async () => {
+  const h = harness();
+  const q = await begin(h, 'hello');
+  q.push(assistantText(`I found ${KEY} in the file`));
+  q.push(resultOk(`The key is ${KEY} and the commit is ${'b'.repeat(40)}.`));
+  await settle();
+  const wire = JSON.stringify(h.events);
+  assert.ok(!wire.includes(KEY), wire);
+  const r = terminalOf(h.events) as Extract<DriverEvent, { k: 'result' }>;
+  assert.equal(r.text, `The key is ${REDACTED} and the commit is ${'b'.repeat(40)}.`);
+  assert.ok(h.events.some((e) => e.k === 'text' && e.text === `I found ${REDACTED} in the file`));
+});
+
+test('a fatal message and the give-up sentence are scrubbed on the same road', async () => {
+  const h = harness();
+  const q = await begin(h, 'hello');
+  q.fail(new Error(`connect ECONNREFUSED while using ${KEY} and sk-ant-api03-ZZZZZZZZZZZZZZZZ`));
+  await settle();
+  const f = terminalOf(h.events) as Extract<DriverEvent, { k: 'fatal' }>;
+  assert.ok(!JSON.stringify(f).includes(KEY) && !f.msg.includes('ZZZZ'), f.msg);
+  // The hint for a rejected key is driver-authored text; the sanitiser must leave it exactly as written.
+  const h2 = harness();
+  const q2 = await begin(h2, 'hello');
+  q2.push(apiRetry('authentication_failed', 401));
+  await settle();
+  const r = terminalOf(h2.events) as Extract<DriverEvent, { k: 'result' }>;
+  assert.equal(summarizeForDevice(r.text, LIMITS.resultMax), r.text, 'what the server sends the device is what the driver wrote');
+  assert.doesNotMatch(r.text, /[A-Z]+_[A-Z_]+/, 'no environment variable name: the sanitiser strips underscores from them');
+});
+
+// ---------------------------------------------------------------------------
+// Is the driver's policy-tier lock in force on this machine? (K2, K3, M5)
+// ---------------------------------------------------------------------------
+
+type Resolver = NonNullable<Parameters<typeof checkManagedLock>[1]>['resolveSettings'];
+const resolver = (effective: Record<string, unknown>, sources: unknown[] = []): Resolver =>
+  (() => Promise.resolve({ effective, provenance: {}, sources })) as unknown as Resolver;
+
+test('checkManagedLock: both locks in force', async () => {
+  const seen: unknown[] = [];
+  const ok = await checkManagedLock(CWD, {
+    resolveSettings: ((opts: unknown) => {
+      seen.push(opts);
+      return Promise.resolve({ effective: { allowManagedPermissionRulesOnly: true, allowManagedHooksOnly: true }, provenance: {}, sources: [{ source: 'managed', policyOrigin: 'parent', settings: {} }] });
+    }) as unknown as Resolver,
+  });
+  assert.deepEqual(ok, { effective: true, missing: [], displacedBy: [] });
+  // It asks for the policy tier only, with the driver's own lock: never a repository's files.
+  assert.deepEqual(seen, [{ cwd: CWD, settingSources: [], managedSettings: { allowManagedPermissionRulesOnly: true, allowManagedHooksOnly: true } }]);
+});
+
+test('checkManagedLock: an administrator\'s tier displaces the lock, and says where it came from', async () => {
+  const admin = await checkManagedLock(CWD, { resolveSettings: resolver({}, [{ source: 'managed', policyOrigin: 'file', settings: { permissions: {} } }]) });
+  assert.deepEqual(admin, { effective: false, missing: ['allowManagedPermissionRulesOnly', 'allowManagedHooksOnly'], displacedBy: ['file'] });
+  const half = await checkManagedLock(CWD, { resolveSettings: resolver({ allowManagedHooksOnly: true }) });
+  assert.deepEqual([half?.effective, half?.missing], [false, ['allowManagedPermissionRulesOnly']]);
+  // "true" must be the boolean: a string is not a lock the CLI honours the same way.
+  const text = await checkManagedLock(CWD, { resolveSettings: resolver({ allowManagedPermissionRulesOnly: 'true', allowManagedHooksOnly: true }) });
+  assert.equal(text?.effective, false);
+});
+
+test('checkManagedLock: when the question cannot be answered, the answer is "unknown", never "fine"', async () => {
+  const broken = await checkManagedLock(CWD, { resolveSettings: (() => Promise.reject(new Error('alpha API moved'))) as unknown as Resolver });
+  assert.equal(broken, undefined);
+  const garbage = await checkManagedLock(CWD, { resolveSettings: (() => Promise.resolve(null)) as unknown as Resolver });
+  assert.equal(garbage, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// The version this driver's CLI claims were measured against
+// ---------------------------------------------------------------------------
+
+test('the installed SDK is the one the real-CLI suite was last run against', () => {
+  const installed = (JSON.parse(readFileSync(new URL('../node_modules/@anthropic-ai/claude-agent-sdk/package.json', import.meta.url), 'utf8')) as { version: string }).version;
+  assert.equal(
+    installed,
+    REAL_CLI_VERIFIED_SDK,
+    `the SDK is ${installed} but test/real-cli.integration.test.ts was last run against ${REAL_CLI_VERIFIED_SDK}. ` +
+      'Run `npm run test:real-cli`; only when it passes, update REAL_CLI_VERIFIED_SDK in test/support/sdk-version.ts. ' +
+      'Every claim about the CLI (what settings run, what a pin stops) was measured on the old one.',
+  );
+  const dep = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { dependencies: Record<string, string> }).dependencies['@anthropic-ai/claude-agent-sdk'];
+  assert.equal(dep, REAL_CLI_VERIFIED_SDK, 'package.json pins the SDK to the exact version, with no range');
+});
+
+// ---------------------------------------------------------------------------
 // The source itself
 // ---------------------------------------------------------------------------
 
-const SOURCES = ['../src/drivers/claude.ts', '../src/drivers/claude-adapter.ts', '../src/voice-prompt.ts'].map((rel) => ({
+const SOURCES = ['../src/drivers/claude.ts', '../src/drivers/claude-adapter.ts', '../src/voice-prompt.ts', '../src/memory.ts'].map((rel) => ({
   rel,
   text: readFileSync(new URL(rel, import.meta.url), 'utf8'),
 }));

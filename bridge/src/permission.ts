@@ -7,7 +7,10 @@
  *     device tap can resolve to `allow`. Every other path out of here is a refusal.
  *  2. A hard-denied call is refused WITHOUT asking. The device never sees it, so a
  *     tired thumb cannot approve it; the refusal text tells the model the rule so
- *     it stops probing for a way round.
+ *     it stops probing for a way round. That includes every tool on tools.ts's
+ *     UNSERVED_TOOL_NAMES list, checked here on the NAME alone as well as through the
+ *     describer: the list the driver hides from the model and the list this refuses
+ *     are one list, and an injected describer cannot turn one of them into an ask.
  *  3. Fail closed. Anything that throws -- the describer, the id source, a broken
  *     injected dependency -- becomes a refusal. The log line carries the tool name
  *     and risk only (plus, when a rule refused the call, that rule's own fixed
@@ -17,7 +20,7 @@
  */
 
 import type { ApprovalManager, ApprovalOutcome } from './approvals.ts';
-import { describeTool } from './tools.ts';
+import { describeTool, unservedReason } from './tools.ts';
 import { toAscii, truncateText } from './text.ts';
 import type { DescribeTool, Logger, PermissionDecision, PermissionHandler } from './types.ts';
 
@@ -67,14 +70,19 @@ export function createPermissionHandler(deps: PermissionDeps): PermissionHandler
       risk = view.risk;
 
       // `!== undefined`, not truthiness: an empty reason is still a refusal.
-      if (view.deny !== undefined) {
+      const unserved = unservedReason(req.tool);
+      const deny = view.deny ?? unserved;
+      if (deny !== undefined) {
         // The reason is the rule's own text ("recursive delete of the root ..."), written by
         // tools.ts and never built from the input; the input itself is not logged.
-        log(`permission: refused by rule tool=${logName(req.tool)} risk=${risk} reason=${truncateText(toAscii(view.deny), 120) || 'blocked'}`);
+        log(`permission: refused by rule tool=${logName(req.tool)} risk=${risk} reason=${truncateText(toAscii(deny), 120) || 'blocked'}`);
+        // A tool this device cannot serve is not a rule the model is probing: its reason already says
+        // what to do instead, and "do not work around it with a different tool" would contradict it.
+        if (unserved !== undefined) return { allow: false, message: unserved };
         return {
           allow: false,
           message:
-            `This action was refused by the bridge's safety rules (${truncateText(toAscii(view.deny), 120) || 'blocked'}). ` +
+            `This action was refused by the bridge's safety rules (${truncateText(toAscii(deny), 120) || 'blocked'}). ` +
             'The rule cannot be overridden from the handheld, so do not try to work around it with a different command or tool; ' +
             'tell the user what you were trying to do and ask how they would like to proceed.',
         };

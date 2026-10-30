@@ -8,8 +8,9 @@ a test holds this document to, on every run:
 
 - the numbers: the limits table, the size budgets, the close-code table and the timings
   table are compared with the constants in the code (`LIMITS`, `CLOSE`, `DEFAULTS`);
-- the shapes: every message has a field table, and its keys and their order are compared
-  with what the encoder writes; every message type, phase, enum value and error code must be
+- the shapes: every message has a field table, and its keys are compared, in order, with what
+  the encoder writes; the members of every enumerated field and the length limits in its notes
+  are compared with the code; every message type, phase, enum value and error code must be
   named here;
 - the conversation: the worked example at the end is **replayed against a live bridge** and
   every frame it lists must be exactly what the bridge sends, in that order, including the
@@ -17,11 +18,13 @@ a test holds this document to, on every run:
 - the bytes: the files in `fixtures/` are the conformance suite for any other
   implementation (the firmware's test should read that directory).
 
-What no test compares is the *prose*: the sentences about what the bridge does in a corner
-(the "Input rules" table, the error table, the reconnect rules) are each covered by an
-end-to-end test of the bridge, but nothing checks that the sentence and the test agree. When
-a sentence here and the bridge's behaviour differ, the behaviour is the bug if a test
-pins it and the sentence is the bug if none does: report it.
+What no test compares is most of the *prose*: the sentences about what the bridge does in a
+corner (the "Input rules" table, the error table, the reconnect rules) are each covered by an
+end-to-end test of the bridge, but nothing checks that the sentence and the test agree. The
+exceptions are the sentences that carry a number or a list: the calls that run without an ask
+(from `AUTO_RUN_TOOLS`), the figures in the lifecycle and reconnect prose, and the close-code
+and timings tables. When a sentence here and the bridge's behaviour differ, the behaviour is
+the bug if a test pins it and the sentence is the bug if none does: report it.
 
 Words in capitals (MUST, SHOULD, MAY) mean what they mean in RFC 2119. The **device** is
 the handheld, the **bridge** is the server it connects to, and the **player** is the
@@ -55,15 +58,26 @@ State this plainly, because the transport is plaintext.
   something to bolt on per deployment.
 - **The device does not authenticate the bridge.** Nothing in version 1 lets the device
   tell the real bridge from something that answers on the same address.
-- **Only a tap can approve.** A tool call is allowed only if the bridge receives
-  `ask_rsp` with `ok: true` and an `id` that matches the ask currently presented to the
-  player, on the current authenticated connection. The bridge presents one ask at a time
-  and accepts only the id of the one on screen, so a late tap for an ask that already
-  ended can never land on the next one. Nothing else can grant it: not the text of a
-  `say`, not audio or its transcript, not any other message or field. Every other outcome
-  is a denial: `ok: false`, a timeout, `abort`, a disconnect that outlasts the grace
-  period, a bridge restart, an answer that does not decode, an answer with an unknown id.
-  The bridge fails closed.
+- **Only a tap can approve a call that is asked about, and almost every call is.** A tool
+  call that is put to the player is allowed only if the bridge receives `ask_rsp` with
+  `ok: true` and an `id` that matches the ask currently presented to the player, on the
+  current authenticated connection. The bridge presents one ask at a time and accepts only
+  the id of the one on screen, so a late tap for an ask that already ended can never land
+  on the next one. Nothing else can grant it: not the text of a `say`, not audio or its
+  transcript, not any other message or field. Every other outcome is a denial: `ok: false`,
+  a timeout, `abort`, a disconnect that outlasts the grace period, a bridge restart, an
+  answer that does not decode, an answer with an unknown id. The bridge fails closed.
+- **The calls that run without any ask.** The device is never shown, and never asked about,
+  a read-only call to one of `Read`, `Glob`, `Grep`, `LS` or `NotebookRead` on a path inside
+  the bridge's working directory that is not a credential store (symbolic links followed, no
+  look-alike characters in the name). These are the calls the bridge rates `low`, and they are
+  the only calls that run without a tap; the Claude Code build the bridge ships with offers
+  only `Read` of the five, so a search or a listing there is a `Bash` call and is asked about.
+  Everything else is asked about, a read outside the working directory included, and some calls
+  are refused without being asked about at all. So "nothing runs unless the player tapped
+  ALLOW" holds for every call except that short list, which can read a file inside the project
+  and change nothing; what such a read returns goes to the model. See "`ask`" for what that
+  means for `risk: low`.
 - **An answer is single use.** The first valid `ask_rsp` for an id closes that ask. A
   second one for the same id gets `err` with `unknown_ask`.
 - **Ids are handles, not secrets.** An ask id is 8 hex characters, random for every ask
@@ -94,7 +108,11 @@ State this plainly, because the transport is plaintext.
 
 - WebSocket (RFC 6455) over plain TCP: `ws://<host>:<port>/`. The path is `/` and
   nothing else. Host and port are configuration on both ends; the protocol fixes neither.
-- No sub-protocol is negotiated and `permessage-deflate` is not used.
+- No sub-protocol is used and `permessage-deflate` is not. A client that offers sub-protocols
+  in `Sec-WebSocket-Protocol` is answered with the first one it offered, which is only what
+  RFC 6455 asks of a server that accepts the connection; it gives that name no meaning, and a
+  client that offers none gets none. A client library that insists on offering a default
+  sub-protocol will therefore connect.
 - The device is the client and the bridge is the server. The bridge serves one device at
   a time (see "Reconnect and takeover").
 - A **text** frame carries exactly one JSON object. A **binary** frame carries exactly one
@@ -104,24 +122,30 @@ State this plainly, because the transport is plaintext.
 - Control frames (ping, pong, close) are ordinary RFC 6455. See "Keepalive".
 - **Before the WebSocket exists** the bridge may answer the upgrade request with an HTTP
   status instead of `101`: `403` (a browser `Origin` header, or a device on the bridge's own
-  machine and the bridge is not set up for one) or `404` (a path other than `/`). Or it may
-  drop the TCP connection without a word (too many
-  connections, or the address is locked out after repeated wrong tokens). A `403` will not
-  get better by retrying. A dropped connection is treated like any other drop (see
-  "Reconnect and takeover"), except that a device which keeps retrying a wrong token makes
-  the lockout longer. The upgrade request itself must be complete within **5 seconds** of
-  the TCP connection opening, or the bridge hangs up.
+  machine and the bridge is not set up for one), `404` (a path other than `/`), `503` (the
+  bridge is shutting down), `400` (not HTTP at all), `408` (the request was not complete in
+  time) or `426` (a plain request that is not an upgrade). Any status other than `101` means
+  the connection is not a WebSocket and the device has not been looked at; none of the
+  bodies repeats anything the request carried. Or it may drop the TCP connection without a
+  word (too many connections, or the address is locked out after repeated wrong tokens). A
+  `403` will not get better by retrying. A dropped connection is treated like any other
+  drop (see "Reconnect and takeover"), except that a device which keeps retrying a wrong
+  token makes the lockout longer. The upgrade request itself must be complete within **5
+  seconds** of the TCP connection opening, or the bridge answers `408` and hangs up. A query
+  string on the path (`/?x=1`) is ignored: it is the same path.
 
 ### Close codes
 
 Every close the bridge sends or the transport sends on its behalf, and the one a device sees
-when nobody sent a close at all:
+when nobody sent a close at all (a library that reports no code for a closed connection is
+reporting the same thing as 1006):
 
 | code | sent by | meaning |
 |---|---|---|
 | 1000 | either | normal close: the answer to a close the other side started |
 | 1001 | bridge | the bridge is shutting down; reconnect with a backoff like any other drop |
-| 1006 | nobody | not a code on the wire: what a device's library reports when the connection ended with no close frame (a Wi-Fi drop, or the bridge terminated a connection that went silent) |
+| 1002 | transport | the peer broke RFC 6455 (an unmasked client frame, reserved bits set, a bad control frame). No `err`, and before the handshake no `hello_ack`: the protocol never saw a message |
+| 1006 | nobody | not a code on the wire: what a device's library reports when the connection ended with no close frame (a Wi-Fi drop, the bridge terminated a connection that went silent, or one that stopped reading with 64 KiB queued for it) |
 | 1007 | transport | a text frame that is not valid UTF-8. No `err`, and before the handshake no `hello_ack`: the protocol never saw a message |
 | 1008 | bridge | five undecodable or invalid frames in a row after the handshake (the fifth is answered with `err` `bad_msg` first) |
 | 1009 | transport | a message above 2048 bytes. The same, before or after the handshake: no `err`, no `hello_ack` |
@@ -301,7 +325,8 @@ transcript: **a transcript never starts a turn by itself**. After `stt` the brid
 | `text` | string | any printable ASCII | 0 to 400 characters |
 
 Sent while a turn is running, or while the bridge is `listening` or `transcribing`, it is
-answered with `err` `busy` (and a listen window stays open). Text that is empty or only
+answered with `err` `busy` (and a listen window stays open); that check comes first, so an
+empty `say` in those phases is `busy` too. When the bridge is free, text that is empty or only
 spaces is answered with `err` `empty`. The text of a `say` has no power to approve anything.
 
 ### `listen`
@@ -321,6 +346,14 @@ away). The device caps an utterance at 30 seconds; the bridge refuses more than 
 (35 seconds) with `err` `too_long` and closes the window. `start` while a turn is running or
 while a transcription is in flight is `busy`; `start` inside an open window starts it over.
 `stop` with no window open is `err` `not_listening`.
+
+A window that receives **no audio for 15 seconds** (counted from `start`, or from the last MIC
+frame) is closed by the bridge: it sends `err` `empty` (text "listen window timed out"), then
+the phase goes to `idle`, and whatever audio had arrived is thrown away. Without this a
+microphone that never delivered a frame would leave the bridge `listening`, and every `say`
+answered `busy`, for as long as the connection stayed alive. A device that is streaming
+audio never sees it; one that has stopped streaming and has not sent `stop` or `cancel`
+learns that its window is gone from the `err` and the `idle` state.
 
 ### `ask_rsp`
 
@@ -459,6 +492,12 @@ without waiting, and MUST NOT answer an ask it believes is expired. A device SHO
 ignore a tap for a short moment after an ask appears, so a tap already in flight cannot
 answer a question the player has not read.
 
+`risk: low` is valid and a device MUST accept it, but a real bridge sends it rarely or never:
+`low` is the rating of the calls that run without any ask (see "Security model"), so such a call
+only reaches the device if the Claude Code CLI itself asks about it, which it does not normally
+do. The scripted Claude used for demonstrations does not send it either. `med` and `high` are
+what a player will see.
+
 What `sum` and `risk` hold is the bridge's business and may change between bridge versions;
 a device shows them and MUST NOT parse them. Today: for a shell command, the command itself
 (cut at 96 characters, and a cut or multi-line command is at least `high`); for a file tool,
@@ -518,12 +557,19 @@ gets on reconnecting, which is `idle` or the turn still in progress.
 | `ok` | boolean | `true`, `false` | whether the turn succeeded |
 | `text` | string | any printable ASCII | 0 to 240 characters; a short summary, already reduced to whole sentences where they fit |
 
+A turn the bridge gives up on ends like any other: one `result` with `ok` `false`. When Claude
+shows no sign of life for five minutes (no output, no tool running, no ask open) the text is
+"Claude is not responding."; after an `abort` it is "Stopped."; these are the bridge's words,
+never to be parsed.
+
 ### `err`
 
 Something the device did, or something that went wrong, that is not fatal to the
-connection. An `err` does not close the connection, with one exception: the fifth frame in a
-row that cannot be decoded is answered with `err` `bad_msg` and then closed with 1008. Any
-frame that decodes resets that count.
+connection. An `err` does not close the connection, with one exception: the fifth bad frame in a
+row is answered with `err` `bad_msg` and then closed with 1008. Any frame the bridge accepts
+resets that count. A second `hello`, a message of the wrong direction and an audio frame with a
+bad kind or length are bad frames even when they decode, so they do not reset it: a device that
+retries `hello` in a loop is closed after five.
 
 | key | type | allowed | notes |
 |---|---|---|---|
@@ -603,6 +649,7 @@ device                                  bridge
   |--------------------------------------->|
   |                  state transcribing    |
   |                  stt "run the unit tests"
+  |                  state idle            |
   |<---------------------------------------|
   |  (the player reads it and taps SEND)   |
   | say "run the unit tests"               |
@@ -626,7 +673,7 @@ An `err` is about what the device did or what the bridge could not do; a refused
 | `unknown_ask` | `ask_rsp` for an id that is not the ask being presented | drop that ask from the screen |
 | `not_listening` | a MIC frame outside a listen window (at most one reply a second); `listen` `stop` with no window open | stop sending audio |
 | `too_long` | the utterance passed 1120000 bytes; the window is closed and the audio discarded | tell the player; the device's own 30 s cap should prevent it |
-| `empty` | `say` with empty or blank text, or nothing intelligible in the audio | ask the player to try again |
+| `empty` | `say` with empty or blank text while the bridge is free, nothing intelligible in the audio, or a listen window that received no audio for 15 s ("listen window timed out") | ask the player to try again |
 | `stt_unavailable` | the bridge has no speech-to-text configured | fall back to typed input |
 | `stt_failed` | speech-to-text failed | ask the player to try again |
 | `driver` | the Claude session failed; a `result` with `ok` false follows | show an error; a new `say` starts again |
@@ -646,13 +693,15 @@ case the bridge's end-to-end tests drive.
 | input | phase | result |
 |---|---|---|
 | `say` with text | `idle` (also `done`, `error`) | starts a turn: `state` `thinking` |
-| `say` with empty or blank text | any | `err` `empty`; nothing starts |
+| `say` with empty or blank text | `idle` (also `done`, `error`) | `err` `empty`; nothing starts |
+| `say` with empty or blank text | a turn running, `listening`, `transcribing` | `err` `busy`, as for any `say`; the busy check comes first |
 | `say` | `thinking`, `tool`, `asking` (a turn is running) | `err` `busy`; the turn is untouched |
 | `say` | `listening`, `transcribing` | `err` `busy`; the window or transcription is untouched |
 | `listen` `start` | `idle` | opens a window: `state` `listening` |
 | `listen` `start` | `listening` | starts the window over; the audio so far is discarded |
 | `listen` `start` | a turn running, or `transcribing` | `err` `busy` |
-| MIC audio | `listening` | collected |
+| MIC audio | `listening` | collected; each frame restarts the 15 s idle limit |
+| nothing (no MIC frame for 15 s) | `listening` | the bridge closes the window: `err` `empty`, then `state` `idle`; the audio is discarded |
 | MIC audio | any other phase | `err` `not_listening` (at most one a second); the audio is discarded |
 | `listen` `stop` | `listening` | `state` `transcribing`, then `stt` and `state` `idle` (or an `err`, then `idle`) |
 | `listen` `stop` | no window open | `err` `not_listening` |
@@ -737,6 +786,7 @@ command line); a device MUST NOT assume the defaults for those two.
 | `pingIntervalMs` | 10 s | WebSocket ping interval |
 | `keepaliveCheckMs` | 5 s | how often a connection is looked at for silence |
 | `deadAfterMs` | 25 s | silence beyond this, found at a look, drops the connection |
+| `listenIdleMs` | 15 s | a listen window that receives no audio for this long is closed (`err` `empty`, then `idle`) |
 | `askTtlMs` | 90 s | time to answer an ask (its `ttl` counts down from this) |
 | `graceMs` | 15 s | how long an ask outlives a disconnect |
 | `maxConnections` | 32 | TCP connections the bridge holds, from anyone |

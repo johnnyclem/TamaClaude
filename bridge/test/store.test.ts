@@ -175,3 +175,28 @@ test('a save is atomic: when the final rename fails the old session is whole, an
   saveSession(dir, CWD, 'replacement-id');
   assert.equal(loadSession(dir, CWD), 'replacement-id');
 });
+
+test('ST4: the temporary file is created exclusively and private -- flag wx, mode 0600 -- so a file or link put at that name is never written through', (t) => {
+  const dir = scratch(t);
+  const real = fs.writeFileSync;
+  const seen: Array<{ path: string; options: unknown }> = [];
+  // A spy that records how the file is opened and then does the write. The temp name has random bytes in it, so a
+  // test cannot plant a file at it; what can be pinned is the way the bridge asks for it to be created.
+  fs.writeFileSync = ((path: fs.PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, options?: fs.WriteFileOptions): void => {
+    seen.push({ path: String(path), options });
+    real(path, data, options);
+  }) as typeof fs.writeFileSync;
+  syncBuiltinESMExports();
+  try {
+    saveSession(dir, CWD, ID);
+  } finally {
+    fs.writeFileSync = real;
+    syncBuiltinESMExports();
+  }
+  assert.equal(seen.length, 1, 'one write, to one file');
+  const w = seen[0]!;
+  assert.notEqual(w.path, file(dir), 'never straight to the real path: that is what makes the save atomic');
+  assert.match(w.path, /session\.json\.\d+\.[0-9a-f]{8}\.tmp$/, 'a name no other process can guess');
+  assert.deepEqual(w.options, { mode: 0o600, flag: 'wx' }, 'created exclusively (never through an existing file or link) and readable by the owner only');
+  assert.equal(loadSession(dir, CWD), ID, 'and the save worked');
+});

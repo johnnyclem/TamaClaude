@@ -60,6 +60,8 @@ export const AUDIO = { rate: 16000, bits: 16, channels: 1 } as const;
 export const CLOSE = {
   normal: 1000,
   goingAway: 1001,
+  /** The peer broke RFC 6455 (an unmasked frame, reserved bits, a bad control frame); the transport sends it, the protocol never sees a message. */
+  protocolError: 1002,
   /** A text frame that is not valid UTF-8; the transport sends it before the protocol sees the frame. */
   invalidData: 1007,
   /** Five bad frames in a row. */

@@ -21,26 +21,28 @@
  *    log, or left a timer armed after `close()`.
  */
 
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import type { TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { get as httpGet } from 'node:http';
 import { connect as netConnect, createServer as createNetServer } from 'node:net';
 import type { Socket } from 'node:net';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import WebSocket, { WebSocketServer } from 'ws';
 import { DeviceClient, HelloRefused } from '../src/device-client.ts';
 import type { DeviceClientOptions } from '../src/device-client.ts';
 import { claudeDriverFactory } from '../src/drivers/claude.ts';
+import type { ClaudeDriverConfig } from '../src/drivers/claude.ts';
 import { FAKE_SCENARIOS, fakeDriverFactory, fakeScenarioFor } from '../src/drivers/fake.ts';
 import { ABORT_GRACE_MS, DEFAULTS, FailureTable, MAX_TRACKED_ADDRESSES, isLocalPeer, normalizeAddress, ownAddresses, startServer } from '../src/server.ts';
 import type { RunningServer, ServerOptions } from '../src/server.ts';
+import { run } from '../src/main.ts';
 import { loadSession, saveSession } from '../src/store.ts';
 import { ScriptedStt } from '../src/stt.ts';
-import { describeTool, needsTap } from '../src/tools.ts';
+import { describeTool, needsTap, setBridgeSecrets } from '../src/tools.ts';
 import { LIMITS } from '../src/types.ts';
 import type {
   AskMsg,
@@ -325,8 +327,20 @@ const PRINTABLE = /^[\x20-\x7e]*$/;
 // The rig
 // ---------------------------------------------------------------------------
 
+/** What the rig owns and a custom `start` must use, so the invariants below still apply to the server it builds. */
+interface RigEnv {
+  clock: FakeClock;
+  newId: () => string;
+  log: (line: string) => void;
+}
 interface RigOptions {
   server?: Partial<ServerOptions>;
+  /**
+   * Builds the server some other way than `startServer`: the real-driver rig goes through main.ts's `run()`, so the
+   * composition under test is the one the program runs. It must put the rig's clock, id source and log tee on the
+   * server it starts.
+   */
+  start?: (env: RigEnv) => Promise<RunningServer>;
 }
 interface Rig {
   clock: FakeClock;
@@ -347,24 +361,30 @@ async function startRig(t: TestContext, o: RigOptions = {}): Promise<Rig> {
   const logs: string[] = [];
   const logSignal = new Signal();
   let n = 0;
-  const server = await startServer({
-    host: '127.0.0.1',
-    port: 0,
-    token: TOKEN,
-    cwd: CWD,
-    driverFactory: fakeDriverFactory(),
-    clock,
-    // The rig's devices are on this machine; the refusal of a local device has tests of its own.
-    allowLocalDevice: true,
-    askTtlMs: 60_000,
-    graceMs: 15_000,
-    newId: () => (++n).toString(16).padStart(8, '0'),
-    log: (l) => {
-      logs.push(l);
-      logSignal.fire();
-    },
-    ...o.server,
-  });
+  const newId = (): string => (++n).toString(16).padStart(8, '0');
+  const log = (l: string): void => {
+    logs.push(l);
+    logSignal.fire();
+  };
+  const server =
+    o.start !== undefined
+      ? await o.start({ clock, newId, log })
+      : await startServer({
+          host: '127.0.0.1',
+          port: 0,
+          token: TOKEN,
+          cwd: CWD,
+          driverFactory: fakeDriverFactory(),
+          clock,
+          // The rig's devices are on this machine; the refusal of a local device has tests of its own.
+          allowLocalDevice: true,
+          askTtlMs: 60_000,
+          graceMs: 15_000,
+          newId,
+          log,
+          ...o.server,
+        });
+  LIVE.add(server);
   const clients: DeviceClient[] = [];
   const rig: Rig = {
     clock,
@@ -403,6 +423,7 @@ async function startRig(t: TestContext, o: RigOptions = {}): Promise<Rig> {
     for (const c of clients) c.terminate();
     try {
       await server.close();
+      LIVE.delete(server);
     } catch (e) {
       note(e);
     }
@@ -412,6 +433,18 @@ async function startRig(t: TestContext, o: RigOptions = {}): Promise<Rig> {
   });
   return rig;
 }
+
+/**
+ * Servers a rig started and has not yet closed. node:test does not run the remaining `after` hooks of a test once one of them
+ * has thrown, and a rig's teardown throws on purpose when it finds a broken invariant; a test that starts several rigs
+ * (a loop over cases) then left every rig but the first listening, and the process never exited: the run HUNG instead of
+ * printing the failure (M6). This set, closed by the file-level hook below, makes a failing teardown cost one red test.
+ */
+const LIVE = new Set<RunningServer>();
+after(async () => {
+  await Promise.all([...LIVE].map((s) => s.close().catch(() => undefined)));
+  LIVE.clear();
+});
 
 /** One full turn from a connected client: say it, wait for the result and for the pet to rest. */
 async function turn(c: DeviceClient, text: string): Promise<ResultMsg> {
@@ -1361,12 +1394,35 @@ test('failure endings: an error result is error then rest, a fatal says driver, 
   assert.equal((await turn(c, 'hello after the failure')).text, 'You said: hello after the failure');
 });
 
+test('Y6/Y2: a failure message with accents, emoji or a great length reaches the device as bounded plain ASCII -- `err driver`, not `err internal`', async (t) => {
+  const wild = `caf\u00e9 \u{1F600} ${'long '.repeat(80)}\u201cquoted\u201d`;
+  const sc = scripted((d) => d.emit({ k: 'fatal', msg: wild }));
+  const rig = await startRig(t, { server: { driverFactory: sc.factory } });
+  const c = await rig.connect();
+  c.say('go');
+  const e = await c.waitFor(isErr);
+  assert.equal(e.code, 'driver', 'the intended code, not "internal" (which is what an unsanitised message would have become)');
+  assert.ok(e.msg.length <= LIMITS.errMax && /^[\x20-\x7e]+$/.test(e.msg), `err msg ${JSON.stringify(e.msg)}`);
+  assert.match(e.msg, /^cafe \?/, 'accents folded, emoji shown as ?');
+  const r = await c.waitFor(isResult);
+  assert.ok(!r.ok && r.text.length <= LIMITS.resultMax && /^[\x20-\x7e]+$/.test(r.text));
+  await c.waitForPhase('idle');
+  assert.equal(c.transcript.some(errOf('internal')), false);
+  // Companion: an empty failure message still says something (the fallback after the sanitiser).
+  const empty = scripted((d) => d.emit({ k: 'fatal', msg: '\u00a0' }));
+  const rig2 = await startRig(t, { server: { driverFactory: empty.factory } });
+  const c2 = await rig2.connect();
+  c2.say('go');
+  assert.equal((await c2.waitFor(errOf('driver'))).msg.length > 0, true);
+});
+
 test('an empty result still says something', async (t) => {
   const subtypes: [string, boolean, RegExp][] = [
     ['error_max_turns', false, /turn limit/],
     ['error_during_execution', false, /went wrong/],
     ['made_up_by_a_future_sdk', false, /did not work/],
     ['success', true, /Done/],
+    ['stalled', false, /^Claude is not responding\.$/], // the driver's watchdog ended the turn
   ];
   const sc = scripted((d, prompt) => {
     const [subtype, ok] = subtypes[Number(prompt)] ?? ['x', false];
@@ -2713,20 +2769,85 @@ async function prompted(q: FakeQuery, n: number): Promise<void> {
   assert.ok(q.received.length >= n, `the driver pushed ${q.received.length} prompt(s), expected ${n}`);
 }
 
-function realDriverRig(t: TestContext, over: Partial<ServerOptions> = {}): { sdk: FakeSdk; start: () => Promise<Rig> } {
+/**
+ * The real-driver rig is built by main.ts's `run()`, not by hand. It used to retype the two functions main.ts hands the
+ * driver "the same way", which is a test that keeps its own copy of the wiring: a regression in `run()` itself (the veto
+ * stripped, the grace period forced to a default, a canned recognizer in real mode) passed everything. Now the program's
+ * own composition is under test; the only things replaced are the CLI (the fake SDK) and the clock, the id source and the
+ * log tee the rig needs for its invariants. Every other option reaches the server exactly as `run()` built it.
+ *
+ * The flags are deliberately NOT the defaults (a 60 s ask, a 20 s grace), so a composition that falls back to a default
+ * behaves differently here.
+ */
+const RIG_ASK_SEC = 60;
+const RIG_GRACE_SEC = 20;
+
+interface RealRig {
+  sdk: FakeSdk;
+  /** The working directory `run()` was given: a real, empty directory. */
+  cwd: string;
+  stateDir: string;
+  /** What `run()` handed the driver factory. */
+  config: () => ClaudeDriverConfig;
+  start: () => Promise<Rig>;
+}
+
+interface RealRigOptions {
+  /** More flags for `run()`, given the working directory it will be started in. */
+  args?: (cwd: string) => string[];
+  /** Use tools.ts's real registry for the bridge's own credential files (a process-wide global, cleared at the end). */
+  registry?: boolean;
+}
+
+/**
+ * A tool call the test expects to be decided WITHOUT the device (refused by a rule, or left to the CLI). If the composition
+ * regressed and the device is asked after all, the call waits for a tap nobody will give: bounded, that is a failure that
+ * names the cause instead of a hang that takes the rest of the run with it (M6).
+ */
+function cliCallNoTap(...args: Parameters<typeof cliToolCall>): ReturnType<typeof cliToolCall> {
+  return bounded(cliToolCall(...args), 'the CLI to be told, with no tap: the device was asked about a call that should not reach it');
+}
+
+function realDriverRig(t: TestContext, o: RealRigOptions = {}): RealRig {
   const sdk = fakeSdk();
   const scratch = mkdtempSync(join(tmpdir(), 'tamaclaude-compose-'));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));
-  const driverFactory = claudeDriverFactory(
-    {
-      apiKey: 'sk-ant-compose-test-0123456789',
-      // The two functions main.ts hands the driver, built the same way (see buildClaudeConfig).
-      hardDeny: (tool, input) => describeTool(tool, input, CWD).deny,
-      needsAsk: (tool, input) => needsTap(tool, input, CWD),
+  const cwd = realpathSync(mkdtempSync(join(tmpdir(), 'tamaclaude-compose-cwd-')));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const stateDir = join(scratch, 'state');
+  if (o.registry === true) t.after(() => setBridgeSecrets([]));
+  let given: ClaudeDriverConfig | undefined;
+  return {
+    sdk,
+    cwd,
+    stateDir,
+    config: () => {
+      if (given === undefined) throw new Error('run() never built the driver');
+      return given;
     },
-    { query: sdk.query, env: { PATH: '/usr/bin:/bin' }, settingsDir: scratch },
-  );
-  return { sdk, start: () => startRig(t, { server: { driverFactory, ...over } }) };
+    start: () =>
+      startRig(t, {
+        start: async ({ clock, newId, log }) => {
+          const r = await run(
+            ['--port', '0', '--cwd', cwd, '--state-dir', stateDir, '--allow-local-device', '--ask-ttl-sec', String(RIG_ASK_SEC), '--grace-sec', String(RIG_GRACE_SEC), ...(o.args?.(cwd) ?? [])],
+            { ANTHROPIC_API_KEY: 'sk-ant-compose-test-0123456789', BRIDGE_TOKEN: TOKEN },
+            { out: () => {}, err: () => {} },
+            {
+              makeClaudeDriver: (cfg) => {
+                given = cfg;
+                return claudeDriverFactory(cfg, { query: sdk.query, env: { PATH: '/usr/bin:/bin' }, settingsDir: scratch });
+              },
+              startServer: (opts) => startServer({ ...opts, clock, newId, log: (l) => (opts.log?.(l), log(l)) }),
+              ...(o.registry === true ? {} : { secrets: { set: () => {}, inside: () => [] } }),
+              guardInspector: () => {},
+            },
+          );
+          assert.equal(r.exitCode, 0, 'run() came up');
+          assert.ok(r.server);
+          return r.server;
+        },
+      }),
+  };
 }
 
 test('the real driver in the real server: a tap allows exactly the call that was shown; no, silence, a rule and a free read each behave', async (t) => {
@@ -2793,7 +2914,7 @@ test('the real driver in the real server: a tap allows exactly the call that was
   c.say('clean up the home folder');
   await prompted(q, 4);
   q.push(toolStart('tu4', 'Bash'));
-  const out4 = await cliToolCall(q.params.options!, 'Bash', { command: 'rm -rf ~' }, { autoAllow: true });
+  const out4 = await cliCallNoTap(q.params.options!, 'Bash', { command: 'rm -rf ~' }, { autoAllow: true });
   assert.equal(out4.decision, 'deny');
   assert.equal(out4.via, 'hook', 'refused in the SDK hook, before any allow rule or the callback could see it');
   q.push(toolResult('tu4', true));
@@ -2806,7 +2927,7 @@ test('the real driver in the real server: a tap allows exactly the call that was
   c.say('read two files');
   await prompted(q, 5);
   q.push(toolStart('tu5', 'Read'));
-  const free = await cliToolCall(q.params.options!, 'Read', { file_path: 'src/app.ts' }, { autoAllow: true });
+  const free = await cliCallNoTap(q.params.options!, 'Read', { file_path: 'src/app.ts' }, { autoAllow: true });
   assert.equal(free.via, 'cli-auto-allow', 'the bridge rates it low, so the hook leaves it to the CLI');
   assert.equal(asks(), before, 'and no ask was raised for it');
   const outside = cliToolCall(q.params.options!, 'Read', { file_path: '/etc/hostname' }, { autoAllow: true });
@@ -2846,9 +2967,9 @@ test('the real driver in the real server: abort during an ask denies it, interru
 });
 
 test('the real driver in the real server: a saved session id the CLI cannot find is replaced, silently, and the new id is the one saved', async (t) => {
-  const dir = stateDir(t);
-  saveSession(dir, CWD, 'stale-session-id-0001');
-  const { sdk, start } = realDriverRig(t, { stateDir: dir });
+  const real = realDriverRig(t);
+  const { sdk, start } = real;
+  saveSession(real.stateDir, real.cwd, 'stale-session-id-0001');
   const rig = await start();
   const c = await rig.connect();
   assert.equal(c.ack?.ok === true && c.ack.sid, 'stale-session-id-0001', 'the device is told the id that will be tried');
@@ -2876,11 +2997,429 @@ test('the real driver in the real server: a saved session id the CLI cannot find
   assert.deepEqual({ ok: r.ok, text: r.text }, { ok: true, text: 'It says hello.' }, 'the player sees an ordinary answer');
   await c.waitForPhase('idle');
   assert.equal(c.transcript.some(isErr), false, 'and no error at all');
-  assert.equal(loadSession(dir, CWD), 'brand-new-session-0002', 'the new id replaced the dead one in the state directory');
+  assert.equal(loadSession(real.stateDir, real.cwd), 'brand-new-session-0002', 'the new id replaced the dead one in the state directory');
 
   // A device that connects now is told the new id.
   const d = await rig.connect();
   assert.equal(d.ack?.ok === true && d.ack.sid, 'brand-new-session-0002');
+});
+
+test('M3: the composition run() builds honours --ask-ttl-sec and --grace-sec as given, not their defaults', async (t) => {
+  const { sdk, start } = realDriverRig(t);
+  const rig = await start();
+  const c = await rig.connect();
+  c.say('run the tests');
+  const q = await nextQuery(sdk);
+  await prompted(q, 1);
+  q.push(init('sess-grace'));
+  q.push(toolStart('tu1', 'Bash'));
+  const run1 = cliToolCall(q.params.options!, 'Bash', { command: 'npm test' }, { autoAllow: true });
+  const ask = await c.waitFor(isAsk);
+  assert.equal(ask.ttl, RIG_ASK_SEC, 'the ask lasts what --ask-ttl-sec said (the default is 90)');
+
+  // Away for 19 s: past the default grace (15 s) and inside the flag's (20 s). The ask must still be there.
+  c.terminate();
+  await rig.logged(/conn 1 closed/);
+  rig.clock.advance(19_000);
+  const d = await rig.connect();
+  const again = await d.waitFor(isAsk);
+  assert.deepEqual({ id: again.id, ttl: again.ttl }, { id: ask.id, ttl: RIG_ASK_SEC - 19 }, 'the same ask, with the time that is left');
+
+  // Away for the whole grace period: now it is denied, and the CLI is told.
+  d.terminate();
+  await rig.logged(/conn 2 closed/);
+  rig.clock.advance(RIG_GRACE_SEC * 1000);
+  const out = await bounded(run1, 'the CLI to be told');
+  assert.equal(out.decision, 'deny');
+  assert.match(out.message ?? '', /./, 'and the model is told something');
+  q.push(toolResult('tu1', true));
+  q.push(resultOk('Nobody answered.'));
+});
+
+test('M3: real mode has no canned recognizer: dictation says the speech engine is not set up', async (t) => {
+  const { start } = realDriverRig(t);
+  const rig = await start();
+  const c = await rig.connect();
+  c.speak(5);
+  const e = await c.waitFor(isErr);
+  assert.equal(e.code, 'stt_unavailable', 'the demo recognizer ("please run the tests") must not exist in real mode');
+  await c.waitForPhase('idle');
+  assert.equal(c.transcript.some((m) => m.t === 'stt'), false);
+});
+
+test('S5/M13 through the whole stack: a read of the bridge\'s own token file is put in front of the device at HIGH risk; another file in the project runs free', async (t) => {
+  let token = '';
+  const real = realDriverRig(t, {
+    registry: true,
+    args: (cwd) => {
+      token = join(cwd, 'notes.txt'); // an innocent name: only run()'s registration can make it a secret
+      writeFileSync(token, TOKEN, { mode: 0o600 });
+      writeFileSync(join(cwd, 'other.txt'), 'ordinary');
+      return ['--token-file', token];
+    },
+  });
+  const { sdk, start } = real;
+  const rig = await start();
+  const c = await rig.connect();
+  c.say('read my notes');
+  const q = await nextQuery(sdk);
+  await prompted(q, 1);
+  q.push(init('sess-token'));
+  q.push(toolStart('tu1', 'Read'));
+  const free = await cliCallNoTap(q.params.options!, 'Read', { file_path: join(real.cwd, 'other.txt') }, { autoAllow: true });
+  assert.equal(free.via, 'cli-auto-allow', 'control: an ordinary file in the project is read with no tap');
+  assert.equal(c.transcript.some(isAsk), false);
+  const guarded = cliToolCall(q.params.options!, 'Read', { file_path: token }, { autoAllow: true });
+  const ask = await c.waitFor(isAsk);
+  assert.deepEqual({ tl: ask.tl, risk: ask.risk }, { tl: 'Read', risk: 'high' }, 'the token file is asked about, and says how serious it is');
+  c.answer(ask.id, false);
+  assert.equal((await bounded(guarded, 'the CLI to be told')).decision, 'deny');
+  q.push(resultOk('I could not read it.'));
+  await c.waitFor(isResult);
+});
+
+// ===========================================================================
+// The listen window has an idle limit (C11)
+// ===========================================================================
+//
+// Before this a window that never received a frame lasted for as long as the device kept answering pongs, and every `say`
+// in that time was `busy`. 12_345 ms is used instead of the shipped 15 s so that the only timer of that length armed on the
+// rig's clock is the listen window's (the approval grace period is also 15 s).
+
+const IDLE = 12_345;
+
+test('C11: a listen window that receives no audio is closed after the idle time -- err empty, then idle -- and a prompt works again', async (t) => {
+  const stt = new ScriptedStt('never heard');
+  const rig = await startRig(t, { server: { stt, listenIdleMs: IDLE } });
+  const c = await rig.connect();
+  c.listen('start');
+  await c.waitForPhase('listening');
+  assert.ok(rig.clock.delays().includes(IDLE), 'a timer is armed for the window');
+
+  // The wedge this fixes: while the window is open every typed prompt is refused.
+  c.say('hello');
+  assert.equal((await c.waitFor(isErr)).code, 'busy');
+
+  rig.clock.advance(IDLE - 1);
+  await c.sync();
+  assert.equal(c.transcript.some(errOf('empty')), false, 'one millisecond early: still open');
+  rig.clock.advance(1);
+  const e = await c.waitFor(errOf('empty'));
+  assert.equal(e.msg, 'listen window timed out');
+  await c.waitForPhase('idle');
+  await rig.logged(/listen window had no audio for 12 s, closing it/);
+  assert.deepEqual(stt.received, [], 'nothing was transcribed: there was nothing');
+  assert.equal(rig.clock.delays().includes(IDLE), false, 'and the timer is gone');
+  assert.deepEqual(shape(c), ['hello_ack', 'state idle', 'state listening', 'err busy', 'err empty', 'state idle']);
+
+  // Companion: the same prompt that was refused a moment ago now starts a turn.
+  assert.equal((await turn(c, 'hello')).ok, true);
+});
+
+test('C11: the idle time counts from the LAST audio frame, not from the start of the window', async (t) => {
+  const stt = new ScriptedStt('x');
+  const rig = await startRig(t, { server: { stt, listenIdleMs: IDLE } });
+  const c = await rig.connect();
+  c.listen('start');
+  await c.waitForPhase('listening');
+  rig.clock.advance(10_000);
+  c.sendPcm(2);
+  await c.sync();
+  rig.clock.advance(10_000); // 20 s after the start, 10 s after the last frame: the first timer fires here and finds it is not time yet
+  await c.sync();
+  assert.equal(c.transcript.some(errOf('empty')), false, 'a window with audio in it is not idle');
+  // It fired at 12_345, found the last frame 2_345 ms old, and slept again for the 10_000 ms that were left.
+  assert.ok(rig.clock.delays().includes(10_000), 'the timer went back to sleep for what is left of the idle time');
+  rig.clock.advance(2_344);
+  await c.sync();
+  assert.equal(c.transcript.some(errOf('empty')), false);
+  rig.clock.advance(1);
+  assert.equal((await c.waitFor(errOf('empty'))).msg, 'listen window timed out');
+  await c.waitForPhase('idle');
+  assert.deepEqual(stt.received, [], 'the audio of a window that timed out is thrown away, not transcribed');
+});
+
+test('C11: a window leaves no timer behind however it ends: stop, cancel, a restart, the device leaving, a takeover', async (t) => {
+  const rig = await startRig(t, { server: { stt: new ScriptedStt('x'), listenIdleMs: IDLE } });
+  const armed = (): boolean => rig.clock.delays().includes(IDLE);
+  const open = async (c: DeviceClient): Promise<void> => {
+    c.listen('start');
+    await c.waitForPhase('listening');
+    assert.equal(armed(), true, 'control: an open window has its timer');
+  };
+
+  const c = await rig.connect();
+  await open(c);
+  c.listen('stop');
+  await c.waitFor((m) => m.t === 'stt');
+  await c.waitForPhase('idle');
+  assert.equal(armed(), false, 'stop');
+
+  await open(c);
+  c.listen('cancel');
+  await c.waitForPhase('idle');
+  assert.equal(armed(), false, 'cancel');
+
+  await open(c);
+  c.listen('start'); // a restart: one window, one timer
+  await c.sync();
+  assert.equal(rig.clock.delays().filter((d) => d === IDLE).length, 1, 'a restart replaces the timer, it does not add one');
+  c.listen('cancel');
+  await c.waitForPhase('idle');
+
+  await open(c);
+  const d = await rig.connect(); // a takeover while the old device was mid-sentence
+  assert.equal(armed(), false, 'takeover');
+  await open(d);
+  d.terminate();
+  await rig.logged(/conn 2 closed/);
+  assert.equal(armed(), false, 'the device leaving');
+  rig.clock.advance(IDLE * 3);
+  const e = await rig.connect();
+  await e.sync();
+  assert.equal(e.transcript.some(isErr), false, 'and nothing fires late into the next device');
+});
+
+test('C11: close() with a listen window open leaves no timer armed, and nothing fires afterwards', async (t) => {
+  const rig = await startRig(t, { server: { listenIdleMs: IDLE } });
+  const c = await rig.connect();
+  c.listen('start');
+  await c.waitForPhase('listening');
+  assert.equal(rig.clock.delays().includes(IDLE), true, 'control: the window has its timer');
+  await rig.server.close();
+  assert.equal(rig.clock.delays().includes(IDLE), false, 'close() took it down');
+  assert.equal(rig.clock.armed, 0);
+  rig.clock.advance(IDLE * 2);
+  assert.equal(c.transcript.some(errOf('empty')), false, 'and no late error was sent to a device that was told the bridge is going away');
+});
+
+// ===========================================================================
+// Smaller guards that used to survive deletion (M11), and the transport rows of PROTOCOL.md (C3-C7)
+// ===========================================================================
+
+/**
+ * One raw exchange: connect, run `send`, return what the server wrote once it hung up or finished a chunked answer (the 426
+ * keeps its connection open, so a hang-up cannot be waited for).
+ */
+function rawExchange(port: number, send: (s: Socket) => void, ms = 3000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const s = netConnect({ host: '127.0.0.1', port });
+    let out = '';
+    const done = (): void => {
+      clearTimeout(timer);
+      s.destroy();
+      resolve(out);
+    };
+    const timer = setTimeout(() => {
+      s.destroy();
+      reject(new Error(`timed out after ${ms} ms waiting for the server to answer; it had written ${JSON.stringify(out)}`));
+    }, ms);
+    s.setEncoding('utf8');
+    s.on('data', (d: string) => {
+      out += d;
+      if (/\r\n0\r\n\r\n$/.test(out)) done();
+    });
+    s.on('error', () => {});
+    s.on('close', done);
+    s.on('connect', () => send(s));
+  });
+}
+
+const UPGRADE_KEY = 'dGhlIHNhbXBsZSBub25jZQ==';
+const upgradeRequest = (path: string, extra = ''): string =>
+  `GET ${path} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${UPGRADE_KEY}\r\nSec-WebSocket-Version: 13\r\n${extra}\r\n`;
+
+test('N3d: the overall connection cap is released as sockets close -- a full house empties, and the room is really there again', async (t) => {
+  const rig = await startRig(t, { server: { limits: { maxConnections: 2, maxConnectionsPerAddress: 100 } } });
+  const a = await rig.open();
+  const b = await rig.open();
+  assert.deepEqual(await tryUpgrade(rig.url), { status: 0 }, 'full: the third is dropped');
+  a.terminate();
+  b.terminate();
+  // BOTH slots must come back: a count that never went down by one for each would leave the bridge refusing everybody.
+  await eventually(async () => {
+    const first = await tryUpgrade(rig.url);
+    if (!('open' in first)) return false;
+    const second = await tryUpgrade(rig.url);
+    first.open.terminate();
+    if ('open' in second) second.open.terminate();
+    return 'open' in second;
+  }, 'both slots to be free again');
+});
+
+test('N4: an upgrade that reaches a server that is shutting down is answered 503 and never becomes a WebSocket', async (t) => {
+  let release: () => void = () => {};
+  const held = new Promise<void>((r) => (release = r));
+  let started: () => void = () => {};
+  const closeStarted = new Promise<void>((r) => (started = r));
+  const sc = scripted();
+  const factory: DriverFactory = (opts) => {
+    const d = sc.factory(opts);
+    const inner = d.close.bind(d);
+    d.close = async () => {
+      started();
+      await held; // shutdown is parked here, after `closed` is set and before the sockets are torn down
+      return inner();
+    };
+    return d;
+  };
+  const rig = await startRig(t, { server: { driverFactory: factory } });
+  t.after(() => release());
+
+  let answer = '';
+  const sock = netConnect({ host: '127.0.0.1', port: rig.server.port });
+  sock.setEncoding('utf8');
+  sock.on('data', (d: string) => (answer += d));
+  sock.on('error', () => {});
+  t.after(() => sock.destroy());
+  await once(sock, 'connect');
+  // Half a request: the connection is mid-request, so closing the server does not treat it as idle and drop it.
+  sock.write('GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n');
+  const barrier = await tryUpgrade(rig.url); // a round trip through the server, so it has read the half request
+  if ('open' in barrier) barrier.open.terminate();
+
+  const closing = rig.server.close();
+  await bounded(closeStarted, 'the shutdown to reach the driver');
+  sock.write(`Connection: Upgrade\r\nSec-WebSocket-Key: ${UPGRADE_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n`);
+  await eventually(() => Promise.resolve(/\r\n\r\n/.test(answer)), 'the server to answer the upgrade');
+  assert.match(answer, /^HTTP\/1\.1 503 Service Unavailable\r\n/, 'refused while shutting down; 101 would mean it became a WebSocket');
+  assert.match(answer, /The bridge is shutting down\./);
+  release();
+  await closing;
+});
+
+test('P1c: the log line for a refused ask names the tool and the count, and nothing of what the call said', async (t) => {
+  const sc = scripted();
+  const rig = await startRig(t, { server: { driverFactory: sc.factory, limits: { maxOpenAsks: 1 } } });
+  const c = await rig.connect();
+  void sc.driver().permission('Bash', { command: 'first secret-looking-command' });
+  await c.waitFor(isAsk);
+  const refused = await sc.driver().permission('Bash', { command: 'curl https://hunter2.example/?key=SENTINEL-INPUT' });
+  assert.equal(refused.allow, false);
+  const line = rig.logs.find((l) => /permission: refused/.test(l));
+  assert.ok(line, 'the refusal was logged');
+  assert.match(line, /tool=Bash \(1 asks already open\)/);
+  assert.equal(rig.logs.some((l) => /SENTINEL-INPUT|hunter2|secret-looking/.test(l)), false, 'no part of the input reached the log');
+});
+
+test('Y21: no HTTP answer repeats what the request carried -- the token in a path, a query, a header or an Origin is never echoed back', async (t) => {
+  const rig = await startRig(t, { server: { allowLocalDevice: false } });
+  const cases: Array<[string, string, RegExp]> = [
+    ['a plain GET carrying the token everywhere', `GET /${TOKEN}?token=${TOKEN} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${TOKEN}\r\nX-Token: ${TOKEN}\r\nConnection: close\r\n\r\n`, /^HTTP\/1\.1 426 /],
+    ['an upgrade for another path', upgradeRequest(`/${TOKEN}`), /^HTTP\/1\.1 404 /],
+    ['an upgrade from a browser', upgradeRequest('/', `Origin: https://${TOKEN}.example\r\n`), /^HTTP\/1\.1 403 /],
+    ['an upgrade from this machine', upgradeRequest(`/?token=${TOKEN}`, `X-Token: ${TOKEN}\r\n`), /^HTTP\/1\.1 403 /],
+    ['something that is not HTTP', `${TOKEN}\r\n\r\n`, /^HTTP\/1\.1 400 /],
+  ];
+  for (const [what, request, status] of cases) {
+    const answer = await rawExchange(rig.server.port, (sock) => sock.write(request));
+    assert.match(answer, status, `${what}: it was a real answer`);
+    assert.equal(answer.includes(TOKEN), false, `${what}: the answer repeats the token`);
+  }
+  // Companion: the loop can fail. The same exchange against a server that DOES echo the request line sees the token.
+  const echo = createNetServer((sock) => {
+    sock.on('error', () => {});
+    sock.once('data', (d) => {
+      const body = `no such path: ${d.toString('utf8').split('\r\n')[0] ?? ''}`;
+      sock.end(`HTTP/1.1 404 Not Found\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+    });
+  });
+  await new Promise<void>((r) => echo.listen({ host: '127.0.0.1', port: 0 }, r));
+  t.after(() => void echo.close());
+  const echoed = await rawExchange((echo.address() as { port: number }).port, (sock) => sock.write(upgradeRequest(`/${TOKEN}`)));
+  assert.equal(echoed.includes(TOKEN), true, 'control: a bridge that echoed the path would have been caught above');
+});
+
+test('C3: a peer that breaks RFC 6455 is closed with 1002 and told nothing, before the hello and after it', async (t) => {
+  const rig = await startRig(t);
+  const unmaskedText = Buffer.from([0x81, 0x02, 0x68, 0x69]); // a client frame must be masked; this one is not
+  const raw = (c: DeviceClient): Socket => (c.socket as unknown as { _socket: Socket })._socket;
+
+  const early = await rig.open();
+  raw(early).write(unmaskedText);
+  assert.equal((await early.waitClosed()).code, 1002, 'before the handshake');
+  assert.equal(early.transcript.length, 0, 'and not a word was sent first: no hello_ack, no err');
+
+  const late = await rig.connect();
+  const mark = late.mark();
+  raw(late).write(unmaskedText);
+  assert.equal((await late.waitClosed()).code, 1002, 'after the handshake');
+  assert.deepEqual(late.transcript.slice(mark), [], 'no err either');
+});
+
+test('C4: only a frame the bridge accepts resets the count of bad ones -- a second hello and a frame of the wrong direction do not', async (t) => {
+  const rig = await startRig(t);
+  const hello = (c: DeviceClient, extra: () => void): void => {
+    for (let i = 0; i < 4; i++) c.sendRaw('garbage');
+    extra();
+  };
+
+  const a = await rig.connect();
+  hello(a, () => a.hello(TOKEN)); // the fifth bad frame in a row is a hello that decodes fine but is out of sequence
+  assert.equal((await a.waitClosed()).code, 1008, 'a second hello is the fifth');
+  assert.equal(a.transcript.filter(isErr).length, 5);
+
+  const b = await rig.connect();
+  hello(b, () => b.sendRaw('{"t":"state","seq":1,"ph":"idle","tl":"","pend":0}')); // a bridge-to-device message
+  assert.equal((await b.waitClosed()).code, 1008, 'a frame of the wrong direction is the fifth');
+
+  // Companion: a frame the bridge does accept (a ping) starts the count again.
+  const c = await rig.connect();
+  hello(c, () => c.sendRaw('{"t":"ping","n":1}'));
+  for (let i = 0; i < 4; i++) c.sendRaw('garbage');
+  await c.sync();
+  assert.equal(c.closed, undefined, 'four, a ping, four: never five in a row');
+});
+
+test('C5: an empty say is `empty` only when the bridge is free; while a turn runs or the window is open it is `busy`', async (t) => {
+  const rig = await startRig(t);
+  const c = await rig.connect();
+  c.say('');
+  assert.equal((await c.waitFor(isErr)).code, 'empty', 'idle: empty');
+
+  c.say('a slow search');
+  await c.waitForPhase('tool', 'Grep');
+  const mark = c.mark();
+  for (const blank of ['', '   ']) c.say(blank);
+  await c.sync();
+  assert.deepEqual(c.transcript.slice(mark).filter(isErr).map((e) => e.code), ['busy', 'busy'], 'a turn is running: busy first');
+  c.abort();
+  await c.waitFor(isResult);
+  await c.waitForPhase('idle');
+
+  c.listen('start');
+  await c.waitForPhase('listening');
+  const mark2 = c.mark();
+  c.say('');
+  await c.sync();
+  assert.deepEqual(c.transcript.slice(mark2).filter(isErr).map((e) => e.code), ['busy'], 'listening: busy first');
+});
+
+test('C6: a client that offers sub-protocols gets the first one echoed back, and none is selected for a client that offers none', async (t) => {
+  const rig = await startRig(t);
+  const offered = await new Promise<string>((resolve, reject) => {
+    const ws = new WebSocket(rig.url, ['arduino', 'second'], { perMessageDeflate: false });
+    ws.once('open', () => {
+      resolve(ws.protocol);
+      ws.terminate();
+    });
+    ws.once('error', reject);
+  });
+  assert.equal(offered, 'arduino');
+  const none = await rig.open();
+  assert.equal(none.socket.protocol, '', 'companion: with nothing offered nothing is selected');
+});
+
+test('C7: what a device library sees before the WebSocket exists -- 400 for rubbish, 408 for a slow request, 426 for a plain GET -- and a query string is ignored', async (t) => {
+  const rig = await startRig(t, { server: { limits: { headersTimeoutMs: 100 } } });
+  assert.match(await rawExchange(rig.server.port, (s) => s.write('garbage\r\n\r\n')), /^HTTP\/1\.1 400 Bad Request\r\n/);
+  assert.match(await rawExchange(rig.server.port, (s) => s.write('GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n')), /^HTTP\/1\.1 426 Upgrade Required\r\n/);
+  // A request that never completes: the bridge answers 408 before it hangs up.
+  assert.match(await rawExchange(rig.server.port, (s) => s.write('GET / HTTP/1.1\r\nHost: x\r\n')), /^HTTP\/1\.1 408 Request Timeout\r\n/);
+  // A query string is not a different path (the document says it is ignored).
+  const q = await tryUpgrade(`${rig.url}?device=1`);
+  assert.ok('open' in q);
+  q.open.terminate();
 });
 
 // ===========================================================================

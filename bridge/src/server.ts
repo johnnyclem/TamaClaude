@@ -126,6 +126,12 @@ export interface ServerOptions {
   pingIntervalMs?: number;
   /** How often the keepalive looks at a connection. A silent device is dropped at the first look after `deadAfterMs`. */
   keepaliveCheckMs?: number;
+  /**
+   * A listen window that receives no audio for this long is closed by the bridge (`err` `empty`, then
+   * `idle`). Without it a microphone that never delivers a frame would leave the bridge `listening`, and
+   * every `say` answered `busy`, for as long as the device's pongs keep the connection alive.
+   */
+  listenIdleMs?: number;
   deadAfterMs?: number;
   /** The keepalive's time source. Default: the real monotonic clock. */
   keepaliveClock?: Clock;
@@ -184,6 +190,7 @@ export const DEFAULTS = {
   pingIntervalMs: 10_000,
   keepaliveCheckMs: 5_000,
   deadAfterMs: 25_000,
+  listenIdleMs: 15_000,
   headersTimeoutMs: 5_000,
   maxConnections: 32,
   maxConnectionsPerAddress: 8,
@@ -203,6 +210,8 @@ const GENERIC_RESULT = new Map<string, string>([
   ['error_max_structured_output_retries', 'Could not produce an answer.'],
   ['error_during_execution', 'Something went wrong.'],
   ['session_failed', 'The Claude session failed.'],
+  // The driver's own watchdog ended the turn (no sign of life); it words this itself, so this is the fallback.
+  ['stalled', 'Claude is not responding.'],
 ]);
 
 /** What the MODEL is told when the bridge, not the user, refuses a call because too many are waiting. */
@@ -402,6 +411,10 @@ interface Conn {
 interface ListenWindow {
   chunks: Buffer[];
   bytes: number;
+  /** Clock reading of the window opening or of the last audio frame, whichever is later. */
+  lastAudio: number;
+  /** One timer per window, re-armed lazily: when it fires it looks at `lastAudio` before it closes anything. */
+  timer: TimerHandle | undefined;
 }
 
 /** Real and monotonic: the keepalive measures a real socket going quiet. */
@@ -431,6 +444,7 @@ class Bridge {
   readonly #pingEvery: number;
   readonly #checkMs: number;
   readonly #deadAfterMs: number;
+  readonly #listenIdleMs: number;
   readonly #allowLocal: boolean;
   readonly #localAddresses: () => readonly string[];
   readonly #limits: ServerLimits;
@@ -483,6 +497,7 @@ class Bridge {
     this.#checkMs = Math.min(positive('keepaliveCheckMs', o.keepaliveCheckMs ?? DEFAULTS.keepaliveCheckMs), pingMs);
     this.#pingEvery = Math.max(1, Math.round(pingMs / this.#checkMs));
     this.#deadAfterMs = positive('deadAfterMs', o.deadAfterMs ?? DEFAULTS.deadAfterMs);
+    this.#listenIdleMs = positive('listenIdleMs', o.listenIdleMs ?? DEFAULTS.listenIdleMs);
     this.#allowLocal = o.allowLocalDevice === true;
     this.#localAddresses = o.localAddresses ?? ((): readonly string[] => ownAddresses());
     this.#limits = {
@@ -1064,17 +1079,19 @@ class Bridge {
         // A second `start` inside a window is a restart, not an error: the device may have
         // lost track of whether it was listening, and starting over is what it asked for.
         if (this.#turnActive || this.#state.base === 'transcribing') return this.#err(conn, 'busy', 'a turn is already running');
-        this.#listen = { chunks: [], bytes: 0 };
+        this.#discardWindow(); // a restart: the old window's timer must not outlive it
+        this.#listen = { chunks: [], bytes: 0, lastAudio: this.#clock.now(), timer: undefined };
+        this.#armListenTimer(this.#listen, this.#listenIdleMs);
         this.#apply({ k: 'listen_start' });
         if (this.#state.base !== 'listening') {
-          this.#listen = undefined; // the state machine would not open a window: do not hold audio for one
+          this.#discardWindow(); // the state machine would not open a window: do not hold audio (or a timer) for one
           return this.#err(conn, 'busy', 'cannot listen now');
         }
         return;
       case 'stop': {
         const win = this.#listen;
         if (win === undefined) return this.#err(conn, 'not_listening', 'no listen window is open');
-        this.#listen = undefined;
+        this.#discardWindow();
         const gen = ++this.#sttGen;
         this.#apply({ k: 'listen_stop' });
         void this.#transcribe(conn, gen, Buffer.concat(win.chunks, win.bytes));
@@ -1089,9 +1106,39 @@ class Bridge {
 
   /** Forget the audio, abandon any transcription in flight, and stop being in a listen phase. */
   #dropListen(): void {
-    this.#listen = undefined;
+    this.#discardWindow();
     this.#sttGen += 1;
     this.#apply({ k: 'listen_cancel' });
+  }
+
+  /** Throws the open window away, with its timer. Does not touch the phase: that is the caller's reducer input. */
+  #discardWindow(): void {
+    const win = this.#listen;
+    if (win === undefined) return;
+    if (win.timer !== undefined) this.#clock.clearTimeout(win.timer);
+    win.timer = undefined;
+    this.#listen = undefined;
+  }
+
+  #armListenTimer(win: ListenWindow, ms: number): void {
+    win.timer = this.#clock.setTimeout(() => this.#onListenTimer(win), ms);
+  }
+
+  /**
+   * The idle rule for a listen window. A frame does not touch the timer (50 of them a second would mean
+   * 50 clear-and-set pairs a second); it only moves `lastAudio`, and the timer, when it fires, either closes
+   * the window or sleeps again for what is left.
+   */
+  #onListenTimer(win: ListenWindow): void {
+    win.timer = undefined;
+    if (this.#listen !== win) return;
+    const idle = this.#clock.now() - win.lastAudio;
+    if (idle < this.#listenIdleMs) return this.#armListenTimer(win, this.#listenIdleMs - idle);
+    this.#log(`listen window had no audio for ${Math.round(idle / 1000)} s, closing it`);
+    this.#listen = undefined;
+    const conn = this.#active;
+    if (conn !== undefined) this.#endListen(conn, 'empty', 'listen window timed out');
+    else this.#apply({ k: 'listen_cancel' });
   }
 
   #onAudio(conn: Conn, frame: Buffer): void {
@@ -1118,6 +1165,7 @@ class Bridge {
     }
     win.chunks.push(Buffer.from(pcm.buffer, pcm.byteOffset, pcm.length));
     win.bytes += pcm.length;
+    win.lastAudio = this.#clock.now();
   }
 
   /** Still the transcription somebody wants: same device, not cancelled, not shut down. */
@@ -1312,6 +1360,7 @@ class Bridge {
     this.#closed = true;
     if (this.#watchdog !== undefined) this.#clock.clearTimeout(this.#watchdog);
     this.#watchdog = undefined;
+    this.#discardWindow();
     for (const c of this.#conns) this.#clearConnTimers(c);
 
     // Stop accepting first. The callback fires when the last connection is gone.

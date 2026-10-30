@@ -133,8 +133,117 @@ function globHitsConfig(word: string): boolean {
   return false;
 }
 
-/** Names a secret-hunting glob would match. */
-const SECRET_SAMPLES = ['.env', '.envrc', '.ssh', '.aws', '.gnupg', '.npmrc', '.netrc', 'id_rsa', 'id_ed25519', 'x.pem', 'x.key', 'credentials', 'credentials.json'];
+// ---------------------------------------------------------------------------
+// The secret lists
+//
+// WHAT COUNTS AS A SECRET STORE is data, in one exported object, and every pattern below is
+// BUILT from it, so a name cannot be on a list and missing from the matching. It is exported
+// because test/tools.test.ts derives its whole table from these lists (and pins a digest of
+// each one) instead of keeping a second copy of the names: a mutation sweep deleted sixty
+// individual entries and the suite stayed green, which is what happens when the lists live
+// only in the code that uses them. Reading a secret store is 'high' (what is read goes to
+// the model); so is writing one.
+// ---------------------------------------------------------------------------
+
+export const SECRET_LISTS = {
+  /** A directory with one of these names, at any depth, is a secret store. */
+  dirs: ['.ssh', '.aws', '.gnupg', '.kube', '.docker', '.azure', '.password-store', '.oci', '.terraform.d', '.ibmcloud', '.bluemix', '.minikube'],
+  /** `~/.config/<app>` directories that hold a login. */
+  configApps: ['gcloud', 'gh', 'hub', 'doctl', 'rclone', 'op', 'heroku', 'huggingface'],
+  /** Absolute places that are secret stores wherever the project lives. `/proc` is all of it: `environ` is every secret of a process, `cmdline` every argument. */
+  absoluteRoots: [
+    '/proc', '/etc/shadow', '/etc/gshadow', '/etc/master.passwd', '/etc/sudoers', '/etc/sudoers.d', '/etc/ssl/private',
+    '/run/secrets', '/var/run/secrets', '/Library/Keychains', '/System/Library/Keychains',
+  ],
+  /**
+   * Under the home directory (relative to it). The last two are the BRIDGE's own: the token file the
+   * README suggests, and the default state directory (src/store.ts); a bridge started with other
+   * paths registers them through `setBridgeSecrets`.
+   */
+  homeFiles: [
+    '.claude.json', '.claude/.credentials.json', '.netrc', '.npmrc', '.pypirc', '.git-credentials', '.pgpass', '.bash_history', '.zsh_history',
+    '.tamaclaude-token', '.local/state/tamaclaude-bridge',
+  ],
+  /**
+   * `<dir>/<name>` (lower case, compared case-insensitively): the second is a secret only beneath the first. `.git/config`
+   * can carry a remote URL with a token in it (the rest of `.git` is not a secret); the personal, git-ignored settings
+   * file is where a project's env and tokens go; the macOS keychains live under Library. A pair, not a home-relative
+   * root, so a glob such as `~/*` is not a warning only because `Library` is a directory that contains one.
+   */
+  pairs: [['.git', 'config'], ['.claude', 'settings.local.json'], ['library', 'keychains']],
+  /** `.<name>` dotfiles that carry a login. */
+  dotfiles: ['npmrc', 'netrc', 'pypirc', 'git-credentials', 'pgpass', 'my.cnf', 's3cfg', 'boto', 'htpasswd', 'vault-token', 'dockercfg', 'terraformrc', 'yarnrc.yml', 'yarnrc.yaml'],
+  /** `id_<type>` and `id_<type>_sk`: private keys. */
+  keyTypes: ['rsa', 'dsa', 'ecdsa', 'ed25519'],
+  /** `anything.<extension>`: key material and state that holds it. */
+  extensions: ['pem', 'key', 'p12', 'pfx', 'jks', 'keystore', 'kdbx', 'tfstate', 'tfvars'],
+  /** `secret.<ext>` and `secrets.<ext>`. */
+  secretsExtensions: ['json', 'yaml', 'yml', 'toml', 'env', 'txt'],
+  /** A shell or REPL history: every command ever typed, including the ones with a password on them. (`*_history` is a pattern.) */
+  historyFiles: ['.history', '.zhistory', '.lesshst', '.viminfo'],
+  /** `token.<ext>`, `bridge.token`, `access_token.json`: a file named for the credential it holds. Source code (`token.ts`) is not on the list. */
+  tokenExtensions: ['txt', 'json', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf', 'dat', 'key', 'secret'],
+  /**
+   * Names a secret-hunting GLOB would match (`**\/.env*`, `*.pem`). Deliberately not every name above:
+   * a sample for `*.yaml` or `*.txt` would ask about every search for configuration or notes.
+   */
+  globSamples: [
+    '.env', '.envrc', '.ssh', '.aws', '.gnupg', '.kube', '.docker', '.azure', '.npmrc', '.netrc', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519',
+    'x.pem', 'x.key', 'x.p12', 'x.pfx', 'x.jks', 'x.keystore', 'x.kdbx', 'x.tfstate', 'x.tfvars', 'credentials', 'credentials.json',
+    '.bash_history', '.zsh_history', 'token', '.token', 'bridge.token', '.tamaclaude-token', 'secrets.json',
+  ],
+} as const;
+
+const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const anyOf = (xs: readonly string[]): string => xs.map(escapeRe).join('|');
+
+export interface SecretNamePattern {
+  re: RegExp;
+  /** Names that must match `re` and be rated high everywhere; the test drives every one. */
+  examples: readonly string[];
+  /** True when only the FILE name (the last component) is judged: a directory called `tokens` is not a secret. */
+  last: boolean;
+}
+
+/** `.env.example` and friends are documentation, not secrets. */
+const ENV_TEMPLATE_RE = /^\.env\.(example|sample|template|dist)$/;
+
+export const SECRET_NAME_PATTERNS: readonly SecretNamePattern[] = [
+  { re: /^\.env(rc)?(\..+)?$/, examples: ['.env', '.envrc', '.env.local', '.env.production', '.envrc.local'], last: false },
+  { re: new RegExp(`^\\.(?:${anyOf(SECRET_LISTS.dotfiles)})$`), examples: SECRET_LISTS.dotfiles.map((n) => `.${n}`), last: false },
+  {
+    re: new RegExp(`^id_(?:${anyOf(SECRET_LISTS.keyTypes)})(?:_sk)?$`),
+    examples: SECRET_LISTS.keyTypes.flatMap((t) => [`id_${t}`, `id_${t}_sk`]),
+    last: false,
+  },
+  { re: /^ssh_host_.*_key$/, examples: ['ssh_host_rsa_key', 'ssh_host_ed25519_key'], last: false },
+  { re: new RegExp(`\\.(?:${anyOf(SECRET_LISTS.extensions)})$`), examples: SECRET_LISTS.extensions.map((e) => `server.${e}`), last: false },
+  // credentials, .credentials.json, application_default_credentials.json
+  { re: /(?:^|[._-])credentials(?:\.[\w.]+)?$/, examples: ['credentials', '.credentials.json', 'application_default_credentials.json', 'aws-credentials'], last: false },
+  { re: /^service-account.*\.json$/, examples: ['service-account.json', 'service-account-prod.json'], last: false },
+  { re: /^\.?token$/, examples: ['token', '.token'], last: false },
+  {
+    re: new RegExp(`^secrets?\\.(?:${anyOf(SECRET_LISTS.secretsExtensions)})$`),
+    examples: SECRET_LISTS.secretsExtensions.flatMap((e) => [`secret.${e}`, `secrets.${e}`]),
+    last: false,
+  },
+  {
+    re: new RegExp(`^(?:\\.?[\\w-]*_history|${anyOf(SECRET_LISTS.historyFiles)})$`),
+    examples: ['.bash_history', '.python_history', 'psql_history', 'fish_history', ...SECRET_LISTS.historyFiles],
+    last: false,
+  },
+  // The bridge's own token file by NAME, wherever it was put (a copy in the project, a backup beside it).
+  {
+    re: new RegExp(`(?:^|[._-])tokens?(?:\\.(?:${anyOf(SECRET_LISTS.tokenExtensions)}))?$`),
+    examples: ['bridge.token', '.tamaclaude-token', 'my_token', 'github-token', 'tokens', ...SECRET_LISTS.tokenExtensions.map((e) => `token.${e}`), 'access_token.json'],
+    last: true,
+  },
+];
+
+/** The list names, for the code that reads them. */
+const SECRET_DIRS: ReadonlySet<string> = new Set(SECRET_LISTS.dirs);
+const SECRET_CONFIG_APPS: ReadonlySet<string> = new Set(SECRET_LISTS.configApps);
+const SECRET_SAMPLES: readonly string[] = SECRET_LISTS.globSamples;
 
 /** `**\/.env*` or `*.pem` names secret files. A pattern needs three literal characters to count, so `*` and `*.ts` do not. */
 function globHitsSecret(word: string): boolean {
@@ -158,25 +267,6 @@ function configComps(comps: string[]): boolean {
   });
 }
 
-const SECRET_DIRS = new Set([
-  '.ssh', '.aws', '.gnupg', '.kube', '.docker', '.azure', '.password-store', '.oci', '.terraform.d', '.ibmcloud', '.bluemix', '.minikube',
-]);
-/** `~/.config/<app>` directories that hold a login. */
-const SECRET_CONFIG_APPS = new Set(['gcloud', 'gh', 'hub', 'doctl', 'rclone', 'op', 'heroku', 'huggingface']);
-const SECRET_FILE_RE = [
-  /^\.env(rc)?(\..+)?$/,
-  /^\.(npmrc|netrc|pypirc|git-credentials|pgpass|my\.cnf|s3cfg|boto|htpasswd|vault-token|dockercfg|terraformrc|yarnrc\.ya?ml)$/,
-  /^id_(rsa|dsa|ecdsa|ed25519)(_sk)?$/,
-  /^ssh_host_.*_key$/,
-  /\.(pem|key|p12|pfx|jks|keystore|kdbx|tfstate|tfvars)$/,
-  /(?:^|[._-])credentials(?:\.[\w.]+)?$/, // credentials, .credentials.json, application_default_credentials.json
-  /^service-account.*\.json$/,
-  /^\.?token$/,
-  /^secrets?\.(json|ya?ml|toml|env|txt)$/,
-  // A shell or REPL history: every command ever typed, including the ones with a password on them.
-  /^(?:\.?[\w-]*_history|\.history|\.zhistory|\.lesshst|\.viminfo)$/,
-];
-const ENV_TEMPLATE_RE = /^\.env\.(example|sample|template|dist)$/;
 /** The longest a single file name can be on any file system we run on. */
 const MAX_NAME = 255;
 /** A glob this long is not one anybody typed to find a file: it is asked about rather than matched. */
@@ -189,35 +279,69 @@ function sensitiveComps(comps: string[]): boolean {
     const next = (comps[i + 1] ?? '').toLowerCase();
     if (SECRET_DIRS.has(c)) return true;
     if (c === '.config' && SECRET_CONFIG_APPS.has(next)) return true;
-    // `.git/config` can carry a remote URL with a token in it; the rest of `.git` is not a secret.
-    if (c === '.git' && next === 'config') return true;
-    // The personal (git-ignored) settings file is where a project's env and tokens go.
-    if (c === '.claude' && next === 'settings.local.json') return true;
+    for (const [a, b] of SECRET_LISTS.pairs) if (c === a && next === b) return true;
     if (c === '.claude.json') return true; // OAuth account, MCP server environments
     // No file system has a name this long, so nothing real hides here; and a few of these patterns
     // backtrack, which a megabyte of `.credentials.credentials...` must not be able to exploit.
     if (c.length > MAX_NAME) continue;
     if (ENV_TEMPLATE_RE.test(c)) continue;
-    if (SECRET_FILE_RE.some((re) => re.test(c))) return true;
+    const isFile = i === comps.length - 1;
+    for (const p of SECRET_NAME_PATTERNS) if ((isFile || !p.last) && p.re.test(c)) return true;
   }
   return false;
 }
 
-let rootsFor: { home: string; roots: string[] } | undefined;
+/**
+ * The bridge's OWN credentials, registered by the composition root at start-up (the --token-file
+ * it was given, the state directory it writes to). They are secret stores wherever they live,
+ * including inside the working directory, which is exactly where a token file ends up when the
+ * project is the home directory. Absolute, normalised, and also resolved through symlinks when
+ * they exist, so a link to the token file is the token file.
+ */
+let bridgeSecrets: readonly string[] = [];
+let secretsGeneration = 0;
+
+export function setBridgeSecrets(paths: readonly string[]): void {
+  const out = new Set<string>();
+  for (const raw of paths) {
+    if (typeof raw !== 'string' || !raw.startsWith('/')) continue; // the caller resolves; a relative path means nothing here
+    const norm = posix.normalize(raw).replace(/\/+$/, '') || '/';
+    out.add(norm);
+    try {
+      out.add(realpathSync(norm));
+    } catch {
+      // not there yet (a token file about to be written): the lexical path stands
+    }
+  }
+  bridgeSecrets = [...out];
+  secretsGeneration++;
+}
+
+/** Which of the registered bridge secrets lie inside `cwd`? The composition root warns about them at start-up. */
+export function bridgeSecretsInside(cwd: string): string[] {
+  const base = posix.normalize(cwd).replace(/\/+$/, '') || '/';
+  return bridgeSecrets.filter((s) => s === base || s.startsWith(base === '/' ? '/' : base + '/'));
+}
+
+let rootsFor: { key: string; roots: string[] } | undefined;
 
 /**
- * Absolute places that are secret stores wherever the project lives. `/proc` is all of
- * it: `/proc/<pid>/environ` is every secret in a process's environment, and `cmdline`
- * is every argument it was started with.
+ * Absolute places that are secret stores wherever the project lives, resolved against the
+ * home directory: the lists above, the bridge's default state directory (also where
+ * $XDG_STATE_HOME points), and whatever was registered with `setBridgeSecrets`.
  */
 function secretRoots(home: string): string[] {
-  if (rootsFor?.home === home) return rootsFor.roots;
+  const xdg = process.env['XDG_STATE_HOME'];
+  const key = `${home}\0${xdg ?? ''}\0${secretsGeneration}`;
+  if (rootsFor?.key === key) return rootsFor.roots;
   const h = home.replace(/\/+$/, '');
-  const roots = ['/proc', '/etc/shadow', '/etc/gshadow', '/etc/master.passwd', '/etc/sudoers', '/etc/sudoers.d'];
+  const roots: string[] = [...SECRET_LISTS.absoluteRoots];
   for (const d of SECRET_DIRS) roots.push(`${h}/${d}`);
   for (const a of SECRET_CONFIG_APPS) roots.push(`${h}/.config/${a}`);
-  for (const f of ['.claude.json', '.claude/.credentials.json', '.netrc', '.npmrc', '.pypirc', '.git-credentials', '.pgpass', '.bash_history', '.zsh_history']) roots.push(`${h}/${f}`);
-  rootsFor = { home, roots };
+  for (const f of SECRET_LISTS.homeFiles) roots.push(`${h}/${f}`);
+  if (xdg !== undefined && xdg.startsWith('/')) roots.push(`${posix.normalize(xdg).replace(/\/+$/, '')}/tamaclaude-bridge`);
+  roots.push(...bridgeSecrets);
+  rootsFor = { key, roots };
   return roots;
 }
 
@@ -759,6 +883,9 @@ function parseScript(src: string, depth: number, ctx: ParseCtx): Seg[] {
 //   - the same command inside bash -c '...', eval '...', $(...), `...`, <(...), (...)
 //   - chains (; && || | newline) and heredoc/here-string bodies fed to a shell
 //   - download piped into a shell, or into an interpreter that reads its program from stdin
+//   - zsh's `=rm` (the full path of rm) and `noglob`/`nocorrect`: read as the command they name
+//   - a command too big to analyse (BASH_WORK_LIMIT units of work, MAX_COMMAND_CHARS characters, a
+//     find nested more than MAX_DEPTH deep in find): refused, so the analysis can never be a stall
 // Flagged 'high' (the human sees the warning; nothing is refused) because the analyser
 // cannot see what runs:
 //   - a shell or an interpreter doing the work: bash -c, bash script.sh, source, ./script,
@@ -767,6 +894,10 @@ function parseScript(src: string, depth: number, ctx: ParseCtx): Seg[] {
 //     /proc, shell history, ~/.claude.json, .git/config and the other secret stores
 //   - a path or command computed at run time ($(echo /), $(echo rm), a glob that only
 //     the filesystem can resolve)
+//   - zsh syntax that runs code while a word is expanded (`*(e:'...':)`, `*(+fn)`, `${(e)x}`),
+//     because the reader does not track quoting per character and a refusal is final
+//   - anything that hands out stored credentials (`security`, `secret-tool`, `git credential`)
+//     or runs in a place the line does not describe (docker/podman run, a VM)
 // NOT caught at all, by design or because it cannot be known statically; each is a row in
 // the characterisation table in test/tools.test.ts, so changing one is a deliberate act:
 //   - an interpreter, script or build tool DOING the damage (python -c shutil.rmtree is
@@ -777,6 +908,10 @@ function parseScript(src: string, depth: number, ctx: ParseCtx): Seg[] {
 //   - only the TOP level of a system directory is protected: rm -rf /usr/lib is not denied
 //     (prefix matching would also refuse rm -rf /home/me/project)
 //   - symlinks, bind mounts, and relative paths after a cd that is not a literal
+//   - `find` behind a wrapper this file does not list (`parallel find / -delete ::: x`): its rule
+//     runs at the command position only, because applying it to every word spelled `find` made the
+//     analysis exponential. (rm, chmod, dd, git and the rest still apply wherever they appear.)
+//   - the other zsh-only ways to run code (aliases, functions, hooks such as precmd, `print -z`)
 // ---------------------------------------------------------------------------
 
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'ash', 'fish', 'csh', 'tcsh', 'mksh']);
@@ -798,6 +933,10 @@ const SECRET_VAR_RE = /(?:^|_)(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|CREDENT
 const FETCHERS = new Set(['curl', 'wget', 'fetch', 'aria2c']);
 const PRIVILEGE = new Set(['sudo', 'sudoedit', 'doas', 'pkexec', 'su', 'runas']);
 const NETWORK = new Set(['ssh', 'scp', 'sftp', 'nc', 'ncat', 'netcat', 'socat', 'telnet']);
+/** Print or manage stored credentials: the macOS keychain command, libsecret, the kernel keyring. */
+const CREDENTIAL_CMDS = new Set(['security', 'secret-tool', 'keyctl']);
+/** Run commands inside a virtual machine or a stack of containers: an environment the line says nothing about. */
+const VM_CMDS = new Set(['lima', 'limactl', 'colima', 'multipass', 'vagrant', 'docker-compose', 'podman-compose']);
 const PREFIX_WORDS = new Set(['!', '{', 'then', 'do', 'else', 'elif', 'if', 'while', 'until', 'time', 'coproc']);
 const READ_ONLY = new Set([
   'cat', 'less', 'more', 'head', 'tail', 'ls', 'll', 'la', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'wc', 'stat',
@@ -829,16 +968,57 @@ interface State {
   high: boolean;
   tooDeep: boolean;
   ctx: ParseCtx;
+  /** Units of analysis work spent so far; see BASH_WORK_LIMIT. */
+  work: number;
 }
 
 const noteDeny = (st: State, why: string): void => {
   st.deny ??= why;
 };
 
-/** The command a word names. Whitespace means it is prose in one argument, not a command. */
+/**
+ * THE WORK BOUND. The analyser runs synchronously in the bridge's only thread, inside the hook
+ * the CLI is waiting on, so a command that makes it spend minutes stalls the keepalive, every
+ * open ask and the device with it. A ~270 character `find . -exec find . -exec ...` chain did
+ * exactly that (every level re-analysed the whole tail: tens of seconds at depth 20, hours at
+ * 28), and 50 000 plain words took seven seconds because every word copied the words after it.
+ * Both are fixed at the root, and this bound is what keeps the NEXT shape of that bug a refusal
+ * instead of a freeze.
+ *
+ * One unit is roughly ten microseconds: one segment parsed, one segment analysed, one rule applied,
+ * one path inspected (four when it is a glob, which is matched against every secret store), or
+ * WORDS_PER_UNIT plain words looked at. Past BASH_WORK_LIMIT the analysis stops and the command is
+ * refused: nobody reviews a command of that size on a 25 character panel, and a refusal is final
+ * only for that command (the model is told to split it up). 5 000 units is about twice what a
+ * 300 line script spends (measured: 2 300) and bounds the worst stall to under a tenth of a second.
+ */
+export const BASH_WORK_LIMIT = 5000;
+const WORDS_PER_UNIT = 8;
+export const TOO_COMPLEX = 'the command is too complex to analyse; split it into smaller commands';
+/** One mebibyte of characters: far past any real command, and the point at which even parsing is a stall. */
+export const MAX_COMMAND_CHARS = 1 << 20;
+
+/** Spend `units`; false once the bound is passed (the caller stops), after refusing the command. */
+function spend(st: State, units: number): boolean {
+  if (st.work > BASH_WORK_LIMIT) return false;
+  st.work += units;
+  if (st.work <= BASH_WORK_LIMIT) return true;
+  st.high = true;
+  noteDeny(st, TOO_COMPLEX);
+  return false;
+}
+const overBudget = (st: State): boolean => st.work > BASH_WORK_LIMIT;
+
+/**
+ * The command a word names. Whitespace means it is prose in one argument, not a command.
+ * zsh expands a word that starts with `=` to the full path of the command it names, so `=rm`
+ * IS `/bin/rm` there; bash would call it a missing program. The reader cannot know which shell
+ * runs the line, so it takes the dangerous reading and `=rm -rf ~` meets the same rules as `rm -rf ~`.
+ */
 function base(word: string): string {
   if (/\s/.test(word)) return '';
-  return (word.split('/').pop() ?? '').toLowerCase();
+  const name = /^=[A-Za-z0-9_.+/-]/.test(word) ? word.slice(1) : word;
+  return (name.split('/').pop() ?? '').toLowerCase();
 }
 
 function expandVars(w: string, st: State): string {
@@ -866,7 +1046,10 @@ function braceExpand(w: string, budget = { n: 64 }): string[] {
 
 /** Does deleting or re-owning this wreck the machine or the account? */
 function catastrophic(raw: string, st: State): boolean {
-  for (const w of braceExpand(expandVars(raw, st))) {
+  const alternatives = braceExpand(expandVars(raw, st));
+  // Up to 64 spellings per word, each resolved and split: a long list of brace words is paid for like the work it is.
+  if (!spend(st, alternatives.length)) return true;
+  for (const w of alternatives) {
     let p = w;
     if (p.startsWith('~')) p = st.home + (p.indexOf('/') < 0 ? '' : p.slice(p.indexOf('/')));
     if (!p.startsWith('/')) {
@@ -927,6 +1110,16 @@ const WRAPPERS = new Map<string, (w: string[], from: number) => number>(Object.e
   xargs: (w, f) => skipOpts(w, f, ['-I', '-n', '-P', '-s', '-L', '-d', '-E', '-a', '--max-args', '--max-procs']),
   busybox: (w, f) => f,
   toybox: (w, f) => f,
+  // zsh precommand modifiers: `noglob find / -delete` is `find / -delete`.
+  noglob: (w, f) => f,
+  nocorrect: (w, f) => f,
+  // Programs that run the rest of their line, so the command after them is the command that runs.
+  unbuffer: (w, f) => skipOpts(w, f),
+  fakeroot: (w, f) => skipOpts(w, f),
+  chronic: (w, f) => skipOpts(w, f),
+  caffeinate: (w, f) => skipOpts(w, f, ['-t', '-w']),
+  watch: (w, f) => skipOpts(w, f, ['-n', '--interval']),
+  flock: (w, f) => skipOpts(w, f, ['-w', '-E', '--timeout', '--conflict-exit-code']) + 1, // the lock file, then the command
 }));
 
 /** The index of the word that actually names the program, after env assignments and wrappers. */
@@ -1073,7 +1266,18 @@ function ruleMove(args: string[], st: State): void {
   if (sources.some((t) => catastrophic(t, st))) noteDeny(st, 'moves the root, a system directory or the home directory away');
 }
 
+const FIND_EXEC = new Set(['-exec', '-execdir', '-ok', '-okdir']);
+
 function ruleFind(args: string[], st: State, depth: number): void {
+  // A find inside a find's -exec, inside a find's -exec ...: nobody types that more than a level or two
+  // deep. Past the depth the reader follows everywhere else it is refused, not rated: what hides at
+  // the bottom of a chain this long is not something a human can check.
+  if (depth >= MAX_DEPTH) {
+    st.tooDeep = true;
+    st.high = true;
+    noteDeny(st, TOO_COMPLEX);
+    return;
+  }
   const paths: string[] = [];
   let k = 0;
   while (k < args.length && /^-[HLP]$|^-O\d$/.test(args[k]!)) k++;
@@ -1082,7 +1286,7 @@ function ruleFind(args: string[], st: State, depth: number): void {
   const hasDelete = args.includes('-delete');
   let execDestructive = false;
   for (let j = 0; j < args.length; j++) {
-    if (!['-exec', '-execdir', '-ok', '-okdir'].includes(args[j]!)) continue;
+    if (!FIND_EXEC.has(args[j]!)) continue;
     let e = j + 1;
     while (e < args.length && args[e] !== ';' && args[e] !== '+') e++;
     const inner = args.slice(j + 1, e);
@@ -1139,9 +1343,31 @@ function ruleGit(args: string[], st: State): void {
     case 'branch':
       if (rest.some((w) => /^-[a-zA-Z]*D/.test(w))) st.high = true;
       break;
+    case 'credential':
+      // `git credential fill` prints the stored username and password for a host.
+      st.high = true;
+      break;
     default:
       break;
   }
+}
+
+/** The words that have a rule of their own in `analyzeSeg`'s "wherever they appear" pass. */
+const RULED = new Set(['rm', 'chmod', 'chown', 'chgrp', 'find', 'dd', 'git', 'rsync', 'docker', 'podman', 'nerdctl', 'mv', 'cp', 'ln', 'npm', 'yarn', 'pnpm', 'brew']);
+const isForceFlag = (a: string): boolean => /^-[a-zA-Z]*f/.test(a) && a !== '--';
+
+/**
+ * A container runtime hands the command to a program the analyser never sees, in an environment
+ * the person cannot judge from the line: `docker run -v /:/host alpine ...` is a root shell on this
+ * machine's files, and a container on its own network can reach the bridge from an address the
+ * local-peer refusal does not know. Anything that RUNS something is 'high'; `docker ps` and
+ * `docker logs` are ordinary. (Rated, never refused: there are plenty of honest uses.)
+ */
+function ruleContainer(args: string[], st: State): void {
+  let i = 0;
+  while (i < args.length && args[i]!.startsWith('-')) i += ['-H', '--host', '-c', '--context', '--config', '--log-level'].includes(args[i]!) ? 2 : 1;
+  const sub = (args[i] ?? '').toLowerCase();
+  if (['run', 'create', 'exec', 'compose', 'start', 'attach', 'cp'].includes(sub)) st.high = true;
 }
 
 function analyzeScript(src: string, depth: number, st: State): void {
@@ -1150,8 +1376,12 @@ function analyzeScript(src: string, depth: number, st: State): void {
   // heredoc) goes through; it reports back through the shared context.
   const segs = parseScript(src, depth, st.ctx);
   if (st.ctx.tooDeep) st.tooDeep = true;
+  if (!spend(st, segs.length)) return;
   analyzePipelines(segs, st);
-  for (const seg of segs) analyzeSeg(seg, depth, st);
+  for (const seg of segs) {
+    analyzeSeg(seg, depth, st);
+    if (overBudget(st)) return;
+  }
 }
 
 /**
@@ -1236,6 +1466,8 @@ function dumpsEnvironment(cmd: string, operands: string[], found: Found): boolea
 }
 
 function analyzeSeg(seg: Seg, depth: number, st: State): void {
+  // Paid for before any per-word work, so a segment of a hundred thousand words is refused in O(1).
+  if (!spend(st, 1 + seg.words.length / WORDS_PER_UNIT)) return;
   const words = seg.words.map((w) => expandVars(w, st));
   const found = findCommand(words);
   const cmd = found.idx >= 0 ? base(words[found.idx]!) : '';
@@ -1246,7 +1478,7 @@ function analyzeSeg(seg: Seg, depth: number, st: State): void {
   // A program name that is only known at run time cannot be inspected.
   if (found.idx >= 0 && /^[$`]|\$\(/.test(words[found.idx]!)) st.high = true;
   if (found.wrappers.some((w) => PRIVILEGE.has(w)) || PRIVILEGE.has(cmd)) st.high = true;
-  if (NETWORK.has(cmd)) st.high = true;
+  if (NETWORK.has(cmd) || CREDENTIAL_CMDS.has(cmd) || VM_CMDS.has(cmd)) st.high = true;
   if (words.some((w) => w.startsWith('--force'))) st.high = true;
   if (st.tooDeep) st.high = true;
 
@@ -1291,11 +1523,18 @@ function analyzeSeg(seg: Seg, depth: number, st: State): void {
     for (const w of words.slice(found.idx + 1)) if (BLOCK_DEV_RE.test(w)) noteDeny(st, 'writing to a disk device file');
   }
 
-  // Commands that are dangerous wherever they appear in the segment.
+  // Commands that are dangerous wherever they appear in the segment (a wrapper nobody listed, `watch rm -rf /`).
+  // The words after one are copied only when a rule needs them, and each copy is paid for: copying them for
+  // EVERY word made a plain command of fifty thousand words quadratic. `find` is the one exception to
+  // "wherever": its rule re-analyses everything after each -exec, so applying it to every word spelled `find`
+  // was exponential in the number of them (see ruleFind). It runs at the command position only.
   for (let j = 0; j < words.length; j++) {
     const w = words[j]!;
     if (ASSIGN_RE.test(w) || w.startsWith('-')) continue;
     const b = base(w);
+    if (!RULED.has(b)) continue;
+    if (b === 'find' && j !== found.idx) continue;
+    if (!spend(st, 1 + (words.length - j) / WORDS_PER_UNIT)) return;
     const args = words.slice(j + 1);
     switch (b) {
       case 'rm': ruleRm(args, st); break;
@@ -1304,12 +1543,17 @@ function analyzeSeg(seg: Seg, depth: number, st: State): void {
       case 'dd': ruleDd(args, st); break;
       case 'git': ruleGit(args, st); break;
       case 'rsync': ruleRsync(args, st); break;
-      case 'mv': case 'cp': case 'ln': case 'docker': case 'npm': case 'yarn': case 'pnpm': case 'brew':
+      case 'docker': case 'podman': case 'nerdctl':
+        ruleContainer(args, st);
+        if (args.some(isForceFlag)) st.high = true;
+        break;
+      case 'mv': case 'cp': case 'ln': case 'npm': case 'yarn': case 'pnpm': case 'brew':
         if (b === 'mv') ruleMove(args, st);
-        if (args.some((a) => /^-[a-zA-Z]*f/.test(a) && a !== '--')) st.high = true;
+        if (args.some(isForceFlag)) st.high = true;
         break;
       default: break;
     }
+    if (overBudget(st)) return;
   }
 
   // Redirects and tee: where does the output land?
@@ -1337,6 +1581,8 @@ function analyzeSeg(seg: Seg, depth: number, st: State): void {
     const v = w.replace(/^[-\w]+=/, '');
     if (/\s/.test(v) || v.length > 512 || v.startsWith('-')) continue;
     for (const alt of braceExpand(v)) {
+      // Inspecting a path is the dearest thing done per word, and a glob is matched against every secret store.
+      if (!spend(st, GLOB_CHARS.test(alt) ? 4 : 1)) return;
       const info = inspectPath(alt, st.cwd, st.baseCwd, st.home);
       // grep -r pattern ~ walks into ~/.ssh: a search is judged by what is beneath its directory too.
       if (info.sensitiveLiteral || (searches && info.abs !== undefined && reachesSecret(info.abs, st.home))) st.high = true;
@@ -1352,6 +1598,44 @@ function mentionsSecretVar(src: string): boolean {
   return false;
 }
 
+/**
+ * `text` with every single-quoted span removed (and, with `double`, every double-quoted span too) and
+ * every backslash-escaped character blanked: what a shell would still read as syntax. An unterminated
+ * quote swallows the rest, which is what the shell does with it.
+ */
+function withoutQuoted(text: string, double: boolean): string {
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '\\') {
+      out += ' '; // an escaped character is a literal one, never syntax
+      i++;
+    } else if (c === "'" || (double && c === '"')) {
+      const j = text.indexOf(c, i + 1);
+      if (j < 0) break;
+      i = j;
+    } else out += c;
+  }
+  return out;
+}
+
+/**
+ * zsh syntax that RUNS CODE while a word is being expanded, with no command word to find:
+ *   - a glob qualifier with code, `*(e:'rm -rf ~':)` or `*(+function)`;
+ *   - a parameter-expansion flag, `${(e)x}`, `${(P)name}`: `e` evaluates, `P` reads a variable by name.
+ * Both are errors in bash, so a line that contains one was written for zsh, and the CLI runs the
+ * operator's own shell. They are rated 'high' and never refused, because this reader does not track
+ * quoting per character and a refusal is final: `grep 'f(name:' x` must still work. That is a choice
+ * to be honest about, not coverage: zsh has more ways to run code than these two, and the README says
+ * the analyser is a backstop (`=rm` and `=curl x | =sh`, which ARE command words, go through the
+ * ordinary rules via `base`).
+ */
+function mentionsZshCode(command: string): boolean {
+  if (/\$\{\(/.test(withoutQuoted(command, false))) return true;
+  const bare = withoutQuoted(command, true);
+  return /\([^()\s]*e:/.test(bare) || /\(\+[A-Za-z_]/.test(bare);
+}
+
 function analyzeCommand(command: string, baseCwd: string | undefined): State {
   const st: State = {
     home: safeHome(),
@@ -1362,11 +1646,28 @@ function analyzeCommand(command: string, baseCwd: string | undefined): State {
     high: false,
     tooDeep: false,
     ctx: { nextGroup: 0, tooDeep: false },
+    work: 0,
   };
+  // Parsing is linear, but a megabyte of text still costs a second the bridge does not have; no
+  // model writes a command this long on purpose, and a person cannot review it on the panel.
+  if (command.length > MAX_COMMAND_CHARS) {
+    st.high = true;
+    noteDeny(st, TOO_COMPLEX);
+    return st;
+  }
   analyzeScript(command, 0, st);
   // Any reference to a secret-looking variable, wherever it sits (quotes, heredocs, nested -c).
   if (mentionsSecretVar(command)) st.high = true;
+  if (mentionsZshCode(command)) st.high = true;
   return st;
+}
+
+/**
+ * For the tests: how much work analysing `command` took, against BASH_WORK_LIMIT. A count, not a
+ * clock, so a test about "this stays cheap" cannot fail because the machine was busy.
+ */
+export function bashWorkUnits(command: string, cwd?: string): number {
+  return analyzeCommand(command, cwd === undefined ? undefined : posix.normalize(cwd)).work;
 }
 
 // ---------------------------------------------------------------------------
@@ -1646,12 +1947,12 @@ function viewUnknown(name: string, input: Record<string, unknown>, cwd: string |
 }
 
 /**
- * Built-in tools that only keep the session's own books (the to-do list, plans, tool lookup).
+ * Built-in tools that only keep the session's own books (the to-do list, tool lookup).
  * They still need a tap -- they are not read-only, so they are not in the auto-run set -- but
  * they are 'med' rather than 'high', because crying wolf on every to-do update teaches the
  * player to ignore the label that matters.
  */
-const SESSION_TOOLS = new Set(['TodoWrite', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'ToolSearch', 'EnterPlanMode', 'ExitPlanMode']);
+const SESSION_TOOLS = new Set(['TodoWrite', 'TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'ToolSearch']);
 
 function viewSession(name: string, input: Record<string, unknown>): ToolView {
   if (name === 'TodoWrite' && Array.isArray(input.todos)) return finish(name, { risk: 'med', summary: `${name} (${input.todos.length} items)` });
@@ -1667,28 +1968,50 @@ const ASKING_MODES = new Set(['default', 'plan']);
 
 function viewAgent(name: string, input: Record<string, unknown>): ToolView {
   // The prompt and description are the model's own account of the task, so only the fields that
-  // identify WHAT is being started are eligible for the summary.
+  // identify WHAT is being started are eligible for the summary. That means the person who taps
+  // ALLOW approves a task they cannot read: a sub-agent whose whole brief (the prompt) is never
+  // shown, and which may be told to do anything the model could do. Its own tool calls still ask
+  // one by one, which bounds the damage but not the surprise, so every Agent call is 'high' and the
+  // README lists "what a delegated task was asked to do" among the things 96 characters cannot show.
   const summary = identifySummary(name, input, AGENT_KEYS, false);
   const mode = input.mode;
-  if (mode === undefined || (typeof mode === 'string' && ASKING_MODES.has(mode))) return finish(name, { risk: 'med', summary });
+  if (mode === undefined || (typeof mode === 'string' && ASKING_MODES.has(mode))) return finish(name, { risk: 'high', summary });
   return finish(name, { risk: 'high', summary, deny: 'starts a subagent in a permission mode that does not ask the user' });
 }
 
 // -- tools the device cannot serve ------------------------------------------
 
 /**
- * Tools that would hang, or answer the model with a lie, on a handheld that has no keyboard,
- * no multiple-choice screen and no way to wake the session later. They are refused with a
- * reason the MODEL reads, so it does the useful thing instead of retrying. Each entry is here
- * because ALLOWING it would be worse than refusing it:
+ * Tools that would hang, answer the model with a lie, or run work the person cannot see, on a
+ * handheld that has no keyboard, no multiple-choice screen, no way to wake the session later and
+ * 96 characters to describe a call. They are refused with a reason the MODEL reads, so it does the
+ * useful thing instead of retrying. Each entry is here because ALLOWING it would be worse than
+ * refusing it:
  *  - AskUserQuestion: the panel cannot show the question, and a tap on ALLOW tells the model
  *    "the user did not answer", which it reads as an answer.
  *  - ScheduleWakeup, CronCreate, CronDelete, CronList: they create or manage turns that start
  *    on their own later; nothing in a voice session is listening for those (and a result with
  *    no prompt behind it is exactly what the driver now refuses to report).
  *  - Monitor: streams a background process's output into the session as unprompted turns.
- * The list is exact tool names from the SDK's own BUILTIN_TOOL_NAMES; an MCP tool that happens
- * to share a name has a different, prefixed one.
+ *  - Workflow: runs a script of sub-agents in the background; the ask shows the first 48 characters
+ *    of up to half a megabyte of script, and its agents' own asks surface later, under whatever
+ *    prompt happens to be in flight.
+ *  - Skill: a skill body can carry inline shell commands that the CLI runs under its own read-only
+ *    rules, never through the permission callback, so one tap on "Skill" ran `cat .env` unasked.
+ *  - EnterPlanMode, ExitPlanMode: a tap on ALLOW tells the model "the user approved the plan",
+ *    which nobody reviewed on a panel that cannot show one.
+ *  - SendMessage, ListAgents, TaskStop: they address background agents and tasks, which a voice
+ *    session does not start (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS) and cannot supervise.
+ *  - EnterWorktree, ExitWorktree: they move the session's working directory, which is what
+ *    "inside the working directory" is judged against.
+ *  - ReportFindings: hands structured output to a host UI that does not exist here.
+ * The names are exact tool names from the SDK's BUILTIN_TOOL_NAMES (test/tools.test.ts checks every
+ * one; an MCP tool that happens to share a name has a different, prefixed one), and each was seen
+ * in the first request the real CLI sends to the model, or in the listing ToolSearch loads next.
+ *
+ * THIS IS THE ONE LIST. The driver hides exactly these names from the model (`disallowedTools`),
+ * the permission handler refuses exactly these names, and `describeTool` rates them all the same
+ * way; none of them keeps a copy.
  */
 const UNSERVED_TOOLS = new Map<string, string>([
   ['AskUserQuestion', 'This device cannot show multiple-choice questions; ask one short question in your final message instead.'],
@@ -1697,6 +2020,23 @@ const UNSERVED_TOOLS = new Map<string, string>([
   ['CronDelete', 'Scheduled tasks are not available in this voice session; there is nothing to delete.'],
   ['CronList', 'Scheduled tasks are not available in this voice session; there is nothing to list.'],
   ['Monitor', 'Background monitors are not available in this voice session; run it to completion and report in your final message.'],
+  ['Workflow', 'Workflows are not available in this voice session; do the steps yourself with the ordinary tools, one at a time.'],
+  ['Skill', 'Skills are not available in this voice session; do the steps yourself with the ordinary tools.'],
+  ['EnterPlanMode', 'Plan mode is not available in this voice session; say your plan in your final message instead.'],
+  ['ExitPlanMode', 'Plan mode is not available in this voice session; say the plan in your final message instead.'],
+  ['SendMessage', 'Messaging other agents is not available in this voice session; do the work yourself.'],
+  ['ListAgents', 'Other agents are not available in this voice session; there is nothing to list.'],
+  ['TaskStop', 'Background tasks are not available in this voice session; there is nothing to stop.'],
+  ['EnterWorktree', 'Worktrees are not available in this voice session; work in the current directory.'],
+  ['ExitWorktree', 'Worktrees are not available in this voice session; there is nothing to exit.'],
+  ['ReportFindings', 'Reporting findings is not available in this voice session; put the findings in your final message.'],
+]);
+
+/** Older spellings the SDK still resolves (its LEGACY_TOOL_NAME_ALIASES); a test checks every alias of an unserved tool is here. */
+const UNSERVED_ALIASES = new Map<string, string>([
+  ['KillShell', 'TaskStop'],
+  ['KillBash', 'TaskStop'],
+  ['ListPeers', 'ListAgents'],
 ]);
 
 /**
@@ -1705,10 +2045,16 @@ const UNSERVED_TOOLS = new Map<string, string>([
  */
 export const UNSERVED_TOOL_NAMES: readonly string[] = [...UNSERVED_TOOLS.keys()];
 
+/** Why this tool is refused outright, in words the model reads; undefined when it is not on the list. */
+export function unservedReason(name: unknown): string | undefined {
+  if (typeof name !== 'string') return undefined;
+  return UNSERVED_TOOLS.get(UNSERVED_ALIASES.get(name) ?? name);
+}
+
 // -- entry point --------------------------------------------------------------
 
 function describe(name: string, input: Record<string, unknown>, cwd: string | undefined): ToolView {
-  const unserved = UNSERVED_TOOLS.get(name);
+  const unserved = unservedReason(name);
   if (unserved !== undefined) return finish(name, { risk: 'high', summary: name, deny: unserved });
   const home = safeHome();
   if (name === 'Bash') return viewBash(name, input, cwd);

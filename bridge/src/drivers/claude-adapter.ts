@@ -58,9 +58,14 @@ export type AdapterEvent =
  * owner needs. The CLI's own prose for these exists only after its whole retry cycle (about
  * three minutes for a rejected key, measured), so the sentence comes from the CLI's error
  * CODE, which arrives with the first retry. Printable ASCII, one line, under the wire limit.
+ *
+ * NO IDENTIFIERS WITH UNDERSCORES OR ASTERISKS in these sentences: the server runs result text
+ * through src/text.ts, which reads markdown, and `ANTHROPIC_API_KEY` reached the device as
+ * `ANTHROPICAPIKEY` (measured). test/claude-adapter.test.ts holds every sentence here to "the
+ * sanitiser leaves it unchanged", so this cannot come back.
  */
-const GIVE_UP: ReadonlyMap<string, string> = new Map([
-  ['authentication_failed', 'the API key was rejected. Check ANTHROPIC_API_KEY.'],
+export const GIVE_UP: ReadonlyMap<string, string> = new Map([
+  ['authentication_failed', 'the API key was rejected. Check the key the bridge was started with.'],
   ['oauth_org_not_allowed', 'this account is not allowed to use the API.'],
   ['account_on_hold', 'the Claude account is on hold.'],
   ['verification_required', 'the Claude account needs verification.'],
@@ -146,6 +151,20 @@ export class ClaudeAdapter {
   /** How many tools are announced and not yet ended. */
   get openToolCount(): number {
     return this.#open.size;
+  }
+
+  /**
+   * How many tools are actually RUNNING: announced, finished streaming their input, and without a
+   * result yet. A tool whose input block is still streaming is not running; a model that goes silent
+   * in the middle of writing one is a stalled turn, and the driver's watchdog must not mistake it
+   * for a long build. Subagent tools count (their context has its own streaming map).
+   */
+  get runningToolCount(): number {
+    const streaming = new Set<string>();
+    for (const m of this.#streaming.values()) for (const id of m.values()) streaming.add(id);
+    let running = 0;
+    for (const id of this.#open) if (!streaming.has(id)) running++;
+    return running;
   }
 
   /**
