@@ -4,12 +4,15 @@
   "private": true,
   "description": "Bridge between the TamaClaude handheld and a Claude Code session",
   "type": "module",
-  "engines": { "node": ">=22.18" },
+  "engines": {
+    "node": ">=22.18"
+  },
   "scripts": {
-    "start": "node src/main.ts",
+    "start": "node --disable-sigusr1 src/main.ts",
     "fake-device": "node tools/fake-device.ts",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --test-reporter=spec \"test/**/*.test.ts\""
+    "test": "node --test --test-timeout=120000 --test-reporter=spec \"test/**/*.test.ts\"",
+    "test:real-cli": "BRIDGE_REAL_CLI=1 node --test --test-timeout=180000 --test-reporter=spec test/real-cli.integration.test.ts"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.314",
