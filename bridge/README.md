@@ -78,8 +78,9 @@ next start, per working directory; `--new-session` forgets it. Fake mode keeps n
 its made-up ids can never be resumed by a real run.
 
 **The project's own settings are not read.** By default Claude Code is started with no
-repository configuration and none of yours (`--setting-sources none`), and with its own auto-memory
-switched off; see "Repository settings are off by default" below for why. What a person usually wants from
+repository configuration and none of yours (`--setting-sources none`), with its own auto-memory
+switched off and with the `git` commands it runs at start-up to describe the repository switched off
+(`--git-context` is the way back); see "Repository settings are off by default" below for why. What a person usually wants from
 the repository, its `CLAUDE.md`, is given to Claude by the bridge itself, as plain text: `CLAUDE.md` and
 `.claude/CLAUDE.md` in the working directory, and no other file. What the bridge does with them:
 
@@ -144,14 +145,16 @@ guaranteed").
 | `--fake-claude` | off | scripted stand-in for Claude; also gives push-to-talk a canned recognizer |
 | `--fake-delay-ms` | `400` (fake mode) | pause between the fake's steps |
 | `--model` | the Claude Code default | the model; a voice session may want a smaller one than the default |
-| `--max-turns` | unlimited | most model turns one prompt may take. Claude reads files inside the project without asking, so with no limit a loop of reads costs API calls until `--turn-stall-sec` or you stop it; setting this is sensible |
+| `--max-turns` | unlimited | most model turns one prompt may take. Claude reads files inside the project without asking, so with no limit a loop of reads costs API calls until `--turn-stall-sec` or you stop it; setting this is sensible (with `--ask-all` every read is a tap, so the player bounds the loop) |
 | `--turn-stall-sec` | `300` | end a turn after this many seconds in which Claude showed no sign of life while no tool was running and no ask was open (0 to 3600; `0` never). A running tool or an ask on the panel is not silence |
-| `--pass-env` | none | environment variable names (comma separated, or repeat the flag) that the commands Claude runs may see, on top of the list below. A name the bridge sets itself is refused (`BRIDGE_TOKEN` and four more, listed below) |
+| `--pass-env` | none | environment variable names (comma separated, or repeat the flag) that the commands Claude runs may see, on top of the list below. A name the bridge sets itself is refused (`BRIDGE_TOKEN` and five more, listed below) |
 | `--state-dir` | `$XDG_STATE_HOME/tamaclaude-bridge`, else `~/.local/state/tamaclaude-bridge` | where the session id lives (directory 0700, file 0600) |
 | `--new-session` | off | forget the saved session and start a fresh conversation |
 | `--ask-ttl-sec` | `90` | how long the player has to answer one ask (1 to 3600) |
 | `--grace-sec` | `15` | how long an open ask survives a lost connection (0 to 3600) |
 | `--setting-sources` | `none` | **opt-in**: which Claude Code settings files are read: `user`, `project`, `local`, a list, or `none`. Anything with `project` or `local` lets the repository run commands, and prints a loud warning; see "Repository settings are off by default" |
+| `--git-context` | off | **opt-in**: lets Claude Code run `git` in the working directory when it starts, so the prompt carries the branch, the status and the recent commits. Git then reads the repository's own `.git/config`, and a filter written there can run a program with no ask; the banner prints a boxed warning. Use it only with a `--cwd` whose `.git` directory you trust; see "What is not guaranteed" |
+| `--ask-all` | off | **strict mode**: every call asks the device, a `Read` inside the working directory included, because the names that keep a read tap-free are a heuristic that will never be complete. See "Asking about everything" |
 
 `SIGINT` and `SIGTERM` close gracefully: connected devices get a 1001 close, the Claude
 session is closed, the port is released. A second signal exits immediately, without closing
@@ -174,9 +177,12 @@ the claims that carry a list or a number are held to the code by tests (`test/ma
 - **Exactly one tool runs without a tap in the Claude Code build this bridge ships with:
   `Read`, inside the working directory.** A path that goes through a symbolic link is never free: it asks
   at `high`, and the panel shows both the path given and where it really points. The path must not be a
-  credential store (`/proc`, `~/.ssh`, `~/.claude.json`, shell histories, `.git/config`,
-  `.claude/settings.local.json`, the bridge's own token file and state directory and the like, **and a
-  backup, rotated or editor copy of one**, such as `id_rsa.bak` or `.netrc.old`), must contain no
+  credential store (`/proc`, `~/.ssh`, `~/.claude.json`, shell histories, `.git/config` and its twins in a
+  submodule's or a worktree's git directory (`.git/modules/<name>/config`, `.git/config.worktree`,
+  `.git/worktrees/<name>/config.worktree`, `.git/remotes/<name>`, `.git/branches/<name>`, `.git/credentials`; the
+  rest of `.git` is an ordinary read), `.claude/settings.local.json`, the bridge's own token file and state
+  directory and the like, **and a backup, rotated or editor copy of one**, such as `id_rsa.bak` or `.netrc.old`),
+  must contain no
   look-alike characters and no pile of wildcards (more than 24 of `*` `?` `[` in one path, or five `*` in a
   row). **Everything else
   asks the device first**: every `Bash` command (even `ls`; a search or a listing is a `Bash`
@@ -184,7 +190,8 @@ the claims that carry a list or a number are held to the code by tests (`test/ma
   and every MCP tool. A read outside the working directory asks. The bridge's own rule is
   wider than this build: it also lets `Read`, `Glob`, `Grep`, `LS` and `NotebookRead` through
   when they are inside the project and not a credential store, so a Claude Code that offers the
-  others behaves the same. The banner prints what this build has.
+  others behaves the same. The banner prints what this build has. **With `--ask-all` not even that one does:**
+  see "Asking about everything" below.
 - **It fails closed.** No answer within the time, a device gone longer than the grace period,
   an abort, an error anywhere in the approval path (including a crash in the analysis of a
   command), more than 8 asks open at once, or a bridge restart: all of them deny the call.
@@ -233,6 +240,30 @@ rest):
 - **The ratings are patterns, not proof.** `low`, `med` and `high` are the bridge's guess from the text of the call;
   see "Hard-deny is a backstop, not a guarantee" above.
 
+### Asking about everything (`--ask-all`)
+
+By default exactly one call runs without a tap: a `Read` inside the working directory of a file that does not look
+like a credential store. What "looks like one" is decided by names (the lists and patterns in `src/tools.ts`: file
+names, directory names, backup suffixes, links, look-alike characters), and a rule that works from names is a
+heuristic that will never be complete: `config/database.yml` is read freely, and so is a secret in any file nobody
+thought to list. Somebody who prefers safety to convenience should start the bridge with `--ask-all`.
+
+One consequence you may meet on macOS, where `/tmp` and `/var` are symbolic links: if `--cwd` is, or sits under, a link,
+the CLI hands the bridge the real paths, they are not recognised as inside the working directory, and EVERY read asks.
+That is the safe direction, not a hole. Start the bridge with the real path (`realpath <dir>`) to get the free read back.
+
+- **Every call that is not refused asks the device, a `Read` inside the working directory included.** The driver's
+  hook answers `ask` for all of it, so neither an allow rule nor the CLI's own auto-allow can skip the tap, and the
+  panel shows the read like any other call (risk `low`, unless something about the path makes it more). A call the
+  bridge refuses outright (the hard-deny list) is still refused without being asked about.
+- **It composes with everything else:** `--git-context`, `--setting-sources`, `--pass-env`, `--max-turns`. It adds
+  asks and removes none, and it is real-mode only (the scripted Claude of `--fake-claude` has no reads to ask about).
+- **What it costs** is taps: a task that reads ten files is ten asks, one at a time, each with its own 90 seconds.
+  A voice session that mostly answers from what it was told will hardly notice; one that works through a codebase
+  will.
+- **What it does not change** is what a tap can show (see "What a tap does and does not cover"), and what an
+  allowed call returns: a tap on a `Read` still puts the file in front of the model and the API provider.
+
 ### Repository settings are off by default
 
 A repository's `.claude/settings.json` and `settings.local.json` are not a list of preferences.
@@ -251,9 +282,13 @@ Claude Code release, so the default is to read **none** of it:
   off too: the driver sets `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` in the child's environment itself, and
   `--pass-env` refuses the name. The cost is only that the repository's `CLAUDE.md` does not arrive through
   the CLI; the bridge reads it and hands it over as text (see "Real mode"), headed by a note that it was
-  written by whoever owns the repository and cannot approve anything. **Two things outside settings
-  files still apply** and are described under "What is not guaranteed": git reads the repository's own
-  `.git/config` when Claude starts, and the bridge's own `CLAUDE.md` text does change how Claude behaves.
+  written by whoever owns the repository and cannot approve anything. The same goes for the CLI's own `git`
+  commands at start-up, which read the repository's `.git/config` (a file that is not a settings file, so
+  `--setting-sources` does not govern it): the driver sets `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`, `--pass-env`
+  refuses that name too, and `--git-context` is the explicit way back (see "What is not guaranteed").
+  **Two things outside settings files still apply** and are described under "What is not guaranteed": the bridge's
+  own `CLAUDE.md` text does change how Claude behaves, and with `--git-context` git reads the repository's own
+  `.git/config` when Claude starts.
 - `--setting-sources project,local` (or any list with `project` or `local`) is an **opt-in** for a
   repository you trust as much as you trust its build scripts. The banner prints a boxed warning
   when it is on. **`none` is the only safe setting for a repository you do not trust.**
@@ -293,25 +328,38 @@ Read this before trusting the bridge with a machine you care about.
   `~/.ssh`, `~/.config/gh`, `~/.npmrc` and the like are reachable by any command you approve (only
   environment variables are held back, see the next section), and the API key is in its
   environment. Approving a command is trusting it with those.
-- **Reads inside the project are free.** The bridge protects named credential stores (and the backup,
-  rotated and editor copies of them: `id_rsa.bak` asks), not the meaning of a file: `config/database.yml`
-  inside the working directory is read without a tap, and what is read goes to the model. A file in the
-  project (or the `CLAUDE.md` the bridge hands over) can carry instructions aimed at the model; the tap is the
-  defence, and a tap on a summary that cannot show everything is a judgement (see "What a tap does and does not
-  cover"). A hard link to a credential store has no name that gives it away and is read like any file; so is a
-  file that never ends (a FIFO): a `Read` of one holds the turn until you abort it, because a running tool is not
-  silence to `--turn-stall-sec`.
-- **git reads the repository's own configuration when Claude starts, and the bridge cannot stop it.** Claude
-  Code runs a few `git` commands in the working directory as it starts (a status, a log), before any tool call
-  exists for the device to be asked about. It turns off git's hooks and file-system monitor for them; it does not
-  turn off *filters*, so a `filter.<name>.clean` program written in the repository's `.git/config` can run at that
-  moment, with no ask. (Measured with git itself for the filter; the start-up commands are as a red-team measured
-  them on the bundled CLI, version 2.1.314. The CLI has a switch for its git commands,
-  `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS`; the driver does not set it.) Such a `.git/config` arrives with a repository that came
-  WITH its `.git` directory (an archive, a copied folder) or from a `.git/config` edited by a call somebody
-  tapped; a `git clone` you made yourself does not copy configuration. **So `--cwd` belongs only on a repository
-  whose `.git` directory you trust.** What the bridge does about it: a `Write` to `.git/config`, `.git/hooks/*`
-  or `.gitattributes` is rated `high` and asked about; it is not refused. The banner repeats the warning.
+- **Reads inside the project are free** (unless you start with `--ask-all`, which exists because of this). The
+  bridge protects named credential stores (and the backup, rotated and editor copies of them: `id_rsa.bak` asks),
+  not the meaning of a file: `config/database.yml` inside the working directory is read without a tap, and what is
+  read goes to the model. A file in the project (or the `CLAUDE.md` the bridge hands over) can carry instructions
+  aimed at the model; the tap is the defence, and a tap on a summary that cannot show everything is a judgement
+  (see "What a tap does and does not cover"). A hard link to a credential store has no name that gives it away and
+  is read like any file; so is a file that never ends (a FIFO): a `Read` of one holds the turn until you abort it,
+  because a running tool is not silence to `--turn-stall-sec`.
+- **Git context is OFF by default; with `--git-context`, git reads the repository's own configuration when Claude
+  starts.** Claude Code runs a few `git` commands in the working directory as it starts (a status, a log, a
+  config read) to tell the model the branch and the recent commits, before any tool call exists for the device to
+  be asked about. It turns off git's hooks and file-system monitor for them; it does not turn off *filters*, so a
+  `filter.<name>.clean` program written in the repository's `.git/config` runs while git hashes a file that differs
+  from its index entry, with no ask (measured on the bundled CLI, version 2.1.314: a marker file was created and
+  the device saw no ask). The driver therefore sets the CLI's own switch for those commands,
+  `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1`, in the child's environment and in the pinned settings, and `--pass-env`
+  refuses the name. With it, the same repository's filter does not run, none of the commands that build the context
+  (`status`, `log`, and a `config` listing of the repository's settings) is started, and the first request carries no git status. **What that costs** is the
+  branch, the status and the recent commits in the prompt, which a voice session hardly needs; Claude can still run
+  `git status` itself, as a `Bash` call you are asked about. **What it does not stop:** the CLI still runs a few
+  read-only git commands of its own: `ls-files --error-unmatch` on its local settings file, then ones that read the
+  remote's name and URL. In a repository with no remote that is three commands (`remote` and `remote get-url origin`
+  besides the first); in a clone, which has an `origin` remote, it is four (`remote get-url origin`,
+  `config --get remote.origin.url` and `remote get-url --push origin` besides the first). They hash no file, and the test that plants a clean filter, a file-system monitor and a
+  hooks directory in the repository saw none of them run a program. A `git` command that YOU approve reads the same
+  `.git/config`, and the panel shows `git status`, not the filter it would run (see "What a tap does and does not
+  cover"). `--git-context` turns the CLI's commands back on, prints a boxed warning in the banner, and the filter
+  then runs. **Use `--cwd` only on a repository whose `.git` directory you trust when you pass it.** Such a
+  `.git/config` arrives with a repository that came WITH its `.git` directory (an archive, a copied folder) or from a
+  `.git/config` edited by a call somebody tapped; a `git clone` you made yourself does not copy configuration. What
+  the bridge does about the second road: a `Write` to `.git/config`, `.git/hooks/*` or `.gitattributes` is rated
+  `high` and asked about; it is not refused.
 - **Wildcards are not expanded, and a link a command makes does not exist yet.** A path or a shell word with a
   wildcard in a directory name (`cat g?/config` where `g0` is a link to `.git`) is rated by its text, not by what
   the wildcard would match; `ln -s .git g && cat g/config` is judged before the link exists. A shell command is
@@ -345,9 +393,10 @@ for a gateway. **Only environment variables are withheld:** files under `HOME` a
 above. **The API key itself is visible to any command you approve**, because the CLI passes its
 own environment on.
 
-Five names are set by the bridge and **refused** by `--pass-env` at start-up, with the reason: `BRIDGE_TOKEN`,
-`ANTHROPIC_API_KEY` (always the one from this process), and the three switches the driver sets for itself,
-`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`, `CLAUDE_CODE_DISABLE_WORKFLOWS` and `CLAUDE_CODE_DISABLE_AUTO_MEMORY`.
+Six names are set by the bridge and **refused** by `--pass-env` at start-up, with the reason: `BRIDGE_TOKEN`,
+`ANTHROPIC_API_KEY` (always the one from this process), and the four switches the driver sets for itself,
+`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`, `CLAUDE_CODE_DISABLE_WORKFLOWS`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY` and
+`CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS` (this one is left off the child only by `--git-context`, never by a name).
 
 Two things the allowlist does not decide, both measured by a red-team on the bundled CLI (2.1.314) and
 not re-measured here: **the CLI adds variables of its own** to every command it runs, among them a
@@ -417,7 +466,10 @@ Verified by tests on every run (`npm test`, no network, no key):
   `run()`**, so a one-line regression in the wiring (the veto stripped, the grace period forced,
   a canned recognizer in real mode) fails;
 - `main.ts`: the flags, the banner, and what `run()` hands the driver and the server, field by field,
-  including that the memory `run()` reads is the memory the driver and the banner are given;
+  including that the memory `run()` reads is the memory the driver and the banner are given, and that
+  `--git-context` and `--ask-all` reach the driver and its hook (a `Read` in the project asks under `--ask-all`
+  and runs under the default, a refused call is refused under both, and the git switch is on the child unless
+  `--git-context` was given, in the child's environment and in the pinned file alike);
 - the README's flag table, its list of tools that run without a tap, its list of tools that are
   refused, the environment allowlist (in both directions), the names `--pass-env` refuses (one list, the
   driver's), and the numbers that sit in its prose (the admission numbers, the lockout, the 40 KB and 1 MiB
@@ -432,16 +484,18 @@ Verified by tests on every run (`npm test`, no network, no key):
 **Not run by `npm test`:** `npm run test:real-cli` (about two minutes, no key, no network) runs the
 real driver over the **real Claude Code CLI bundled with the SDK** against a local fake of the
 Anthropic API. It is the only evidence for what the CLI does with permission hooks, settings, the
-pins, session resume and interrupts, and for each guard in "Repository settings are off by
-default", every one with a control run that removes the guard to show the exploit working. **Nothing
+pins, session resume and interrupts, for each guard in "Repository settings are off by
+default", for the CLI's git commands (a `git` placed first on the CLI's `PATH` records each one it starts, and a
+repository's clean filter runs with the switch off and not with it on) and for `--ask-all` (a `Read` in the
+project reaches the device), every one with a control run that removes the guard to show the exploit working. **Nothing
 runs it automatically** (there is no CI in this repository): run it after every SDK bump and before
 trusting a README sentence about the CLI. `npm test` fails when the installed SDK is not the one that
 file was last recorded as passing against, which is the reminder.
 
 **Not verified**: a real turn against `api.anthropic.com` with a real key (the fake API decides
 what a rejected key looks like); what the bundled CLI runs at start-up beyond what its own test
-shows (the git commands, the messaging socket and the traffic to `api.anthropic.com` under a gateway were
-measured once by a red-team and are described as such above); macOS, where `/tmp` and `/var` are themselves links
+shows (its git commands are recorded by that test; the messaging socket and the traffic to `api.anthropic.com`
+under a gateway were measured once by a red-team and are described as such above); macOS, where `/tmp` and `/var` are themselves links
 and so should rate `high` for a `Read` rather than `med` (nothing here ran on it, and nothing here ran on a
 case-insensitive file system either); the SDK's sandbox auto-allow (no `bubblewrap` here); anything
 on a real handheld or a real network (no firmware exists yet); whether the bridge's pattern

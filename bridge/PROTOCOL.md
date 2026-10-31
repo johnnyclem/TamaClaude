@@ -77,7 +77,8 @@ State this plainly, because the transport is plaintext.
   are refused without being asked about at all. So "nothing runs unless the player tapped
   ALLOW" holds for every call except that short list, which can read a file inside the project
   and change nothing; what such a read returns goes to the model. See "`ask`" for what that
-  means for `risk: low`.
+  means for `risk: low`. A bridge started with `--ask-all` (its strict mode) asks about these too, so for
+  that bridge the list is empty and every call that is not refused is put to the player.
 - **An answer is single use.** The first valid `ask_rsp` for an id closes that ask. A
   second one for the same id gets `err` with `unknown_ask`.
 - **Ids are handles, not secrets.** An ask id is 8 hex characters, random for every ask
@@ -496,7 +497,9 @@ answer a question the player has not read.
 `low` is the rating of the calls that run without any ask (see "Security model"), so such a call
 only reaches the device if the Claude Code CLI itself asks about it, which it does not normally
 do. The scripted Claude used for demonstrations does not send it either. `med` and `high` are
-what a player will see.
+what a player will see. The exception is a bridge started with `--ask-all`: it puts even a read
+inside the project to the player, so it sends `risk: low` for those. A device therefore shows a `low`
+ask like any other and never assumes that one cannot arrive.
 
 What `sum` and `risk` hold is the bridge's business and may change between bridge versions;
 a device shows them and MUST NOT parse them. Today: for a shell command, the command itself

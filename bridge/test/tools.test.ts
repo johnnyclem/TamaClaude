@@ -1336,7 +1336,8 @@ const PINNED_LISTS: Record<string, string> = {
   configApps: 'a797f426d5d6',
   absoluteRoots: '26f54ca0ec06',
   homeFiles: '07b6e966bcda',
-  pairs: '814f757c0180',
+  pairs: 'aa916ff13a24',
+  gitDirNames: '9815255c322e',
   dotfiles: '9edc2c72b7c8',
   keyTypes: '571484ff4aec',
   extensions: '82f734b82785',
@@ -1393,6 +1394,13 @@ test('M4: every entry of every list is high for Read, Grep (path and glob), Glob
   for (const d of SECRET_LISTS.dirs) checked += everywhereHigh(`dirs: ${d}`, [...where(`${d}/data`), ...where(d), ...where(`sub/${d}/data`)]);
   for (const a of SECRET_LISTS.configApps) checked += everywhereHigh(`configApps: ${a}`, [...where(`.config/${a}/data`), ...where(`.config/${a}`)]);
   for (const [a, b] of SECRET_LISTS.pairs) checked += everywhereHigh(`pairs: ${a}/${b}`, [...where(`${a}/${b}/data`), ...where(`${a}/${b}`)]);
+  // A git directory's own files (G1/D24): after `.git` or a bare repository's name, at any depth, whatever stands between.
+  for (const n of SECRET_LISTS.gitDirNames) {
+    checked += everywhereHigh(`gitDirNames: ${n}`, [
+      ...where(`.git/${n}`), ...where(`.git/${n}/data`), ...where(`sub/.git/${n}`), ...where(`.git/modules/m/${n}`),
+      ...where(`.git/modules/a/modules/b/${n}`), ...where(`.git/worktrees/w/${n}`), ...where(`bare.git/${n}`),
+    ]);
+  }
   for (const r of SECRET_LISTS.absoluteRoots) checked += everywhereHigh(`absoluteRoots: ${r}`, [r, `${r}/x`]);
   // Home-relative stores exist under HOME only; the same NAMES are also caught anywhere by the patterns below.
   for (const f of SECRET_LISTS.homeFiles) checked += everywhereHigh(`homeFiles: ${f}`, [`${HOME}/${f}`, `~/${f}`, `${HOME}/${f}/x`]);
@@ -2600,6 +2608,19 @@ test('R6: every secret name stays a secret with any backup, rotation or editor s
   assert.ok(checked > 1500, `the loops ran (${checked})`);
 });
 
+test('G1/D24: a backup of a git directory\'s secret file is a secret too (no file system needed: the name alone decides)', () => {
+  // (In a real checkout the directory's contents would also give it away; these paths do not exist, so only the NAME rule is exercised.)
+  for (const n of SECRET_LISTS.gitDirNames) {
+    for (const suf of [...SAMPLE_SUFFIXES, ...BACKUP_SUFFIXES()]) {
+      for (const q of [`${CWD}/.git/${n}${suf}`, `${CWD}/.git/modules/m/${n}${suf}`, `${CWD}/bare.git/${n}${suf}`]) assert.deepEqual(notHigh(q), [], q);
+    }
+  }
+  assert.deepEqual(notHigh(`${CWD}/.git/.config.swp`), []);
+  // A suffix that is not a backup form is another file.
+  assert.equal(tool('Read', { file_path: '.git/configuration' }).risk, 'low');
+  assert.equal(tool('Read', { file_path: '.git/config-notes' }).risk, 'low');
+});
+
 test('R6: the editors\' own copies: vim\'s swap file, emacs\' auto-save and lock, a copy of a copy', () => {
   for (const n of ['.id_rsa.swp', '.id_rsa.swo', '#id_rsa#', '.#id_rsa', 'id_rsa.bak.1', 'id_rsa.old.old', '.netrc.bak~', '.env.local.swp', '.credentials.json.orig', '.aws-credentials.save']) {
     assert.deepEqual(notHigh(`${CWD}/${n}`), [], n);
@@ -2825,6 +2846,685 @@ test('R1/D17: the bridge\'s own secrets are found by where they REALLY are when 
     assert.equal(bash('cat notes/innocuous.txt', viaLink).risk, 'high', 'a command word is followed to it too');
     assert.equal(bash('grep -r x .', viaLink).risk, 'high');
     assert.equal(at('Read', { file_path: 'a.txt' }).risk, 'low', 'and an ordinary file beside it is still free');
+  } finally {
+    done();
+  }
+});
+
+// ===========================================================================
+// G1 / D24: a git directory's secrets are found by what comes AFTER the git directory, in every layout git uses
+//
+// The rule used to be the pair `['.git', 'config']`, which matches only the component RIGHT AFTER `.git`. Through the real CLI
+// three Reads returned canary tokens with no ask: `.git/modules/<name>/config` (a submodule's remote URL and whatever extraheader a
+// CI checkout wrote), `.git/worktrees/<name>/config.worktree` and `.git/config.worktree`; `.git/remotes/origin` and
+// `.git/branches/origin` (the legacy one-URL-per-file remotes) were free as well. That is the repo's first trap again: a rule
+// enforced for one layout and not for its twins. So this section is driven by a TABLE OF LAYOUTS, each built for real in a
+// temp directory, and every row is run through every way of reading (the nine Read/Grep/Glob shapes of the symlink section and
+// six Bash words) and every way of writing: a layout nobody listed can be added as a row, and cannot be forgotten by one entry point.
+// ===========================================================================
+
+function put(p: string, text = 'x'): void {
+  mkdirSync(join(p, '..'), { recursive: true });
+  writeFileSync(p, text);
+}
+
+/** HEAD, objects, refs and a config with a token in it: what makes a directory a git directory. */
+function gitSkeleton(gitDir: string): void {
+  put(join(gitDir, 'HEAD'), 'ref: refs/heads/main\n');
+  mkdirSync(join(gitDir, 'objects'), { recursive: true });
+  put(join(gitDir, 'refs', 'heads', 'main'), `${'0'.repeat(40)}\n`);
+  put(join(gitDir, 'index'));
+  put(join(gitDir, 'config'), '[remote "origin"]\n\turl = https://u:CANARY-TOKEN@example.invalid/x\n');
+}
+
+interface GitLayout {
+  name: string;
+  /** Builds the layout under `dir` (empty, made for this row) and returns the session's working directory. */
+  build: (dir: string, w: World) => string;
+  /** Paths (relative to the working directory) that hold a login: high for every way of reading and of writing, never refused. */
+  secret: string[];
+  /** Paths in the same layout that hold none: free to Read, med as a Bash word. */
+  ordinary: string[];
+  /** Not secrets, but reached THROUGH a `.git` pointer file: never free (the panel names both ends), never refused. */
+  throughPointer?: string[];
+  /** Directories a recursive search must not start at (they hold, or are, a git directory). */
+  searchHigh?: string[];
+  /** Directories a search may start at without a tap. */
+  searchFree?: string[];
+}
+
+/** Files named like git's secrets with no git directory anywhere above them: nothing but the name is shared. */
+const DECOYS = [
+  'config', 'config.worktree', 'app/config', 'modules/sub/config', 'worktrees/w/config.worktree', 'remotes/origin', 'branches/origin',
+  '.github/config', '.gitlab/config', 'gitconfig/config', 'dotgit/config', 'src/config/database.yml', '.gitmodules', '.gitignore', 'git/config', 'mygit/remotes/origin',
+  // A directory with a file called HEAD is not a git directory: it needs the objects (or a worktree's pointer to them) as well.
+  'onlyhead/HEAD', 'onlyhead/config', 'onlyhead/remotes/origin',
+];
+
+const GIT_LAYOUTS: GitLayout[] = [
+  {
+    name: 'plain: .git in the project',
+    build: (dir) => {
+      gitSkeleton(join(dir, '.git'));
+      for (const f of ['config.worktree', 'credentials', 'remotes/origin', 'branches/origin', 'logs/HEAD', 'hooks/pre-commit.sample', 'info/exclude', 'packed-refs', 'description']) {
+        put(join(dir, '.git', f));
+      }
+      put(join(dir, 'src', 'a.txt'));
+      return dir;
+    },
+    secret: ['.git/config', '.git/config.worktree', '.git/credentials', '.git/remotes/origin', '.git/branches/origin', '.git/config.bak', '.git/CONFIG', '.git/hooks/../config'],
+    ordinary: ['.git/HEAD', '.git/index', '.git/refs/heads/main', '.git/logs/HEAD', '.git/hooks/pre-commit.sample', '.git/info/exclude', '.git/packed-refs', '.git/description', 'src/a.txt'],
+    searchHigh: ['.git', '.git/refs', '.git/hooks'],
+    searchFree: ['.', 'src'],
+  },
+  {
+    name: 'module: a submodule\'s git directory inside the superproject\'s',
+    build: (dir) => {
+      gitSkeleton(join(dir, '.git'));
+      gitSkeleton(join(dir, '.git', 'modules', 'sub'));
+      put(join(dir, '.git', 'modules', 'sub', 'config.worktree'));
+      put(join(dir, '.git', 'modules', 'sub', 'remotes', 'origin'));
+      gitSkeleton(join(dir, '.git', 'modules', 'sub', 'modules', 'inner'));
+      put(join(dir, 'sub', 'a.txt'));
+      return dir;
+    },
+    secret: ['.git/modules/sub/config', '.git/modules/sub/config.worktree', '.git/modules/sub/remotes/origin', '.git/modules/sub/modules/inner/config'],
+    ordinary: ['.git/modules/sub/HEAD', '.git/modules/sub/index', '.git/modules/sub/refs/heads/main', 'sub/a.txt'],
+    searchHigh: ['.git/modules', '.git/modules/sub', '.git/modules/sub/modules'],
+    searchFree: ['sub'],
+  },
+  {
+    name: 'worktree: a linked worktree\'s private directory',
+    build: (dir) => {
+      gitSkeleton(join(dir, '.git'));
+      put(join(dir, '.git', 'worktrees', 'w', 'HEAD'), 'ref: refs/heads/w\n');
+      put(join(dir, '.git', 'worktrees', 'w', 'gitdir'), `${dir}/.git\n`);
+      put(join(dir, '.git', 'worktrees', 'w', 'commondir'), '../..\n');
+      put(join(dir, '.git', 'worktrees', 'w', 'index'));
+      put(join(dir, '.git', 'worktrees', 'w', 'config.worktree'));
+      return dir;
+    },
+    secret: ['.git/worktrees/w/config.worktree', '.git/worktrees/w/config'],
+    ordinary: ['.git/worktrees/w/HEAD', '.git/worktrees/w/gitdir', '.git/worktrees/w/commondir', '.git/worktrees/w/index'],
+    searchHigh: ['.git/worktrees', '.git/worktrees/w'],
+  },
+  {
+    name: 'worktree-shared: the session runs in a LINKED worktree whose .git is a pointer to the shared repository',
+    build: (dir) => {
+      const shared = join(dir, 'shared');
+      const linked = join(dir, 'linked');
+      gitSkeleton(join(shared, '.git'));
+      put(join(shared, '.git', 'worktrees', 'linked', 'HEAD'), 'ref: refs/heads/linked\n');
+      put(join(shared, '.git', 'worktrees', 'linked', 'commondir'), '../..\n');
+      put(join(shared, '.git', 'worktrees', 'linked', 'config.worktree'));
+      put(join(linked, '.git'), `gitdir: ${join(shared, '.git', 'worktrees', 'linked')}\n`);
+      put(join(linked, 'src', 'a.txt'));
+      return linked;
+    },
+    secret: ['.git/config', '.git/config.worktree', '../shared/.git/config', '../shared/.git/worktrees/linked/config.worktree'],
+    ordinary: ['.git', 'src/a.txt'],
+    throughPointer: ['.git/HEAD', '.git/commondir'],
+    searchFree: ['.', 'src', '.git'],
+  },
+  {
+    name: 'gitdir-file: a submodule checkout whose .git is a FILE (relative, absolute, CRLF) and one that points at a secret store',
+    build: (dir, w) => {
+      gitSkeleton(join(dir, '.git'));
+      gitSkeleton(join(dir, '.git', 'modules', 'sub'));
+      put(join(dir, '.git', 'modules', 'sub', 'config.worktree'));
+      put(join(dir, 'sub', '.git'), 'gitdir: ../.git/modules/sub\n');
+      put(join(dir, 'sub', 'a.txt'));
+      gitSkeleton(join(dir, '.git', 'modules', 'abs'));
+      put(join(dir, 'abs', '.git'), `gitdir: ${join(dir, '.git', 'modules', 'abs')}\r\n`);
+      // A hostile project: the pointer names the home directory's ssh folder, and `known_hosts` is a secret only because of where it IS.
+      put(join(dir, 'evil', '.git'), `gitdir: ${join(w.home, '.ssh')}\n`);
+      return dir;
+    },
+    secret: ['sub/.git/config', 'sub/.git/config.worktree', 'abs/.git/config', '.git/modules/sub/config', 'evil/.git/known_hosts'],
+    ordinary: ['sub/.git', 'sub/a.txt', 'abs/.git', 'evil/.git'],
+    throughPointer: ['sub/.git/HEAD', 'abs/.git/HEAD', 'sub/.git/index'],
+    searchFree: ['sub', 'abs'],
+  },
+  {
+    name: 'separate: --separate-git-dir, a .git FILE that points at a directory with no git name',
+    build: (dir) => {
+      gitSkeleton(join(dir, 'gitstore'));
+      put(join(dir, 'gitstore', 'remotes', 'origin'));
+      put(join(dir, '.git'), 'gitdir: gitstore\n');
+      put(join(dir, 'src', 'a.txt'));
+      return dir;
+    },
+    secret: ['.git/config', 'gitstore/config', 'gitstore/remotes/origin', '.git/remotes/origin'],
+    ordinary: ['.git', 'gitstore/HEAD', 'gitstore/refs/heads/main', 'gitstore/index', 'src/a.txt'],
+    throughPointer: ['.git/HEAD'],
+    searchHigh: ['gitstore'],
+    searchFree: ['.', 'src'],
+  },
+  {
+    name: 'bare-looking names: a bare repository, a git directory called nothing in particular, and names that only LOOK like git\'s',
+    build: (dir) => {
+      gitSkeleton(join(dir, 'repo.git'));
+      gitSkeleton(join(dir, 'repo.git', 'modules', 'm'));
+      gitSkeleton(join(dir, 'store'));
+      put(join(dir, 'store', 'remotes', 'origin'));
+      gitSkeleton(join(dir, 'store', 'modules', 'm'));
+      // A linked worktree's private directory has no objects of its own, only HEAD and a pointer to the common directory.
+      put(join(dir, 'wt-private', 'HEAD'), 'ref: refs/heads/w\n');
+      put(join(dir, 'wt-private', 'commondir'), '../..\n');
+      put(join(dir, 'wt-private', 'config.worktree'));
+      // No git directory above any of these: they are just files that share a name with one of git's.
+      for (const p of DECOYS) put(join(dir, p));
+      return dir;
+    },
+    secret: ['repo.git/config', 'repo.git/modules/m/config', 'store/config', 'store/remotes/origin', 'store/modules/m/config', 'wt-private/config.worktree'],
+    ordinary: ['repo.git/HEAD', 'repo.git/refs/heads/main', 'store/HEAD', 'store/refs/heads/main', 'store/modules/m/HEAD', ...DECOYS],
+    searchHigh: ['repo.git', 'store', 'store/modules/m'],
+    searchFree: ['app', 'src/config'],
+  },
+];
+
+/** Every way to write `rel`, each as the call the hook is asked about. */
+function writeCalls(rel: string): [string, string, Record<string, unknown>][] {
+  return [
+    ['Write', 'Write', { file_path: rel, content: 'x' }],
+    ['Edit', 'Edit', { file_path: rel, old_string: 'a', new_string: 'b' }],
+    ['MultiEdit', 'MultiEdit', { file_path: rel, edits: [] }],
+    ['Bash >', 'Bash', { command: `echo x > ${rel}` }],
+    ['Bash >>', 'Bash', { command: `echo x >> ${rel}` }],
+    ['Bash tee', 'Bash', { command: `echo x | tee ${rel}` }],
+  ];
+}
+
+/** The Bash words that read `rel`. */
+const bashReads = (rel: string, cwd: string): string[] => [`cat ${rel}`, `cat < ${rel}`, `head -n1 ${rel}`, `grep -r x ${rel}`, `cat ./${rel}`, `cat ${join(cwd, rel)}`];
+
+test('G1/D24: every git layout - plain, module, worktree, worktree-shared, gitdir-file, separate, bare-looking - keeps its logins behind a tap for every way of reading and writing', () => {
+  const { w, done } = makeWorld();
+  try {
+    let checked = 0;
+    const names = new Set<string>();
+    for (const layout of GIT_LAYOUTS) {
+      assert.ok(!names.has(layout.name), `row ${layout.name} is listed twice`);
+      names.add(layout.name);
+      const dir = join(w.root, `layout-${names.size}`);
+      mkdirSync(dir);
+      const cwd = layout.build(dir, w);
+      const at = (name: string, input: Record<string, unknown>): ToolView => describeTool(name, input, cwd);
+
+      for (const rel of layout.secret) {
+        for (const [way, name, input] of readCalls(rel, cwd)) {
+          const v = at(name, input);
+          assert.equal(v.risk, 'high', `${layout.name}: ${name} ${way} ${show(rel)}`);
+          assert.equal(v.deny, undefined, `${layout.name}: ${way} ${show(rel)}: reading is asked about, not refused`);
+          assert.equal(needsTap(name, input, cwd), true, `${layout.name}: ${way} ${show(rel)}: the hook must ask`);
+          checked++;
+        }
+        for (const c of bashReads(rel, cwd)) {
+          const v = at('Bash', { command: c });
+          assert.equal(v.risk, 'high', `${layout.name}: ${c}`);
+          assert.equal(v.deny, undefined, `${layout.name}: ${c}: reading is rated, not refused`);
+          checked++;
+        }
+        for (const [way, name, input] of writeCalls(rel)) {
+          const v = at(name, input);
+          assert.equal(v.risk, 'high', `${layout.name}: ${way} ${show(rel)}`);
+          assert.equal(v.deny, undefined, `${layout.name}: ${way} ${show(rel)}: asked about, not refused (the README says so)`);
+          checked++;
+        }
+        // A relative word is judged where it resolves, after the cd that precedes it.
+        if (rel.includes('/') && !rel.includes('..')) {
+          const cut = rel.lastIndexOf('/');
+          const v = at('Bash', { command: `cd ${rel.slice(0, cut)} && cat ${rel.slice(cut + 1)}` });
+          assert.equal(v.risk, 'high', `${layout.name}: cd into ${show(rel.slice(0, cut))}, then read ${show(rel.slice(cut + 1))}`);
+          checked++;
+        }
+      }
+
+      for (const rel of layout.ordinary) {
+        // ('Glob path' appends `/*` to the path, and a `*` after a git directory could be `config`: pinned on its own below.)
+        for (const [way, name, input] of readCalls(rel, cwd).filter(([way]) => way !== 'Glob path')) {
+          const v = at(name, input);
+          assert.equal(v.risk, 'low', `${layout.name}: ${name} ${way} ${show(rel)} is free`);
+          assert.equal(needsTap(name, input, cwd), false, `${layout.name}: ${way} ${show(rel)}`);
+          checked++;
+        }
+        for (const c of bashReads(rel, cwd)) {
+          assert.equal(at('Bash', { command: c }).risk, 'med', `${layout.name}: ${c}`);
+          checked++;
+        }
+      }
+
+      for (const rel of layout.throughPointer ?? []) {
+        for (const [way, name, input] of readCalls(rel, cwd).filter(([way]) => way !== 'Glob path')) {
+          const v = at(name, input);
+          assert.equal(v.risk, 'high', `${layout.name}: ${name} ${way} ${show(rel)}: a path through a pointer file is never free`);
+          assert.equal(v.deny, undefined, `${layout.name}: ${way} ${show(rel)}`);
+          checked++;
+        }
+        const read = at('Read', { file_path: rel });
+        assert.match(read.summary, / -> /, `${layout.name}: the panel names both ends of ${show(rel)}`);
+        assert.match(read.summary, ASCII);
+        // Bash reads it as the kernel does: no link rates a read, only where it lands.
+        assert.equal(at('Bash', { command: `cat ${rel}` }).risk, 'med', `${layout.name}: cat ${rel}`);
+      }
+
+      for (const rel of layout.searchHigh ?? []) {
+        assert.equal(at('Grep', { pattern: 'url', path: rel }).risk, 'high', `${layout.name}: Grep inside ${show(rel)} reads the config beneath it`);
+        assert.equal(at('Grep', { pattern: 'url', path: join(cwd, rel) }).risk, 'high', `${layout.name}: Grep inside ${show(join(cwd, rel))}`);
+        for (const c of [`grep -r url ${rel}`, `rg url ${rel}`]) assert.equal(at('Bash', { command: c }).risk, 'high', `${layout.name}: ${c}`);
+        checked += 4;
+      }
+      for (const rel of layout.searchFree ?? []) {
+        assert.equal(at('Grep', { pattern: 'url', path: rel }).risk, 'low', `${layout.name}: Grep in ${show(rel)} stays free`);
+        assert.equal(at('Bash', { command: `grep -r url ${rel}` }).risk, 'med', `${layout.name}: grep -r in ${show(rel)}`);
+        checked += 2;
+      }
+    }
+    assert.ok(GIT_LAYOUTS.length >= 7, 'the table has all the layouts the finding names');
+    assert.ok(checked > 1000, `the loops ran (${checked})`);
+  } finally {
+    done();
+  }
+});
+
+test('G1/D24: a path with more places that might be a git directory than the analyser will probe is a secret, and a few are not', () => {
+  const { w, done } = makeWorld();
+  try {
+    const dir = join(w.root, 'probes');
+    mkdirSync(dir);
+    const at = (rel: string): ToolView => describeTool('Read', { file_path: rel }, dir);
+    // None of these exists, and none is under a git directory. Each `config` is a candidate that costs a probe of the directory above it.
+    for (const n of [1, 2, 8]) assert.equal(at(Array(n).fill('config').join('/') + '/x.txt').risk, 'low', `${n} candidates are probed`);
+    for (const n of [9, 12, 100]) assert.equal(at(Array(n).fill('config').join('/') + '/x.txt').risk, 'high', `${n} candidates: given up on, and not free`);
+  } finally {
+    done();
+  }
+});
+
+test('G1/D24: a name of a few hundred kilobytes under a git directory is analysed at once, by every entry point (a backstop of seconds against analyses of milliseconds)', () => {
+  const started = Date.now();
+  for (const name of ['a.'.repeat(60_000), '.bak'.repeat(30_000), '-2023-01-01'.repeat(10_000)]) {
+    for (const p of [`.git/${name}`, `.git/modules/m/${name}`, `store/${name}`, `.g*/${name}*`]) {
+      for (const [tn, input] of [['Read', { file_path: p }], ['Write', { file_path: p, content: 'x' }], ['Glob', { pattern: p }], ['Grep', { pattern: 'x', path: p }]] as const) {
+        assert.ok(RISKS.includes(tool(tn, input).risk), tn);
+      }
+      assert.ok(RISKS.includes(bash(`cat ${p}`).risk));
+    }
+  }
+  assert.ok(Date.now() - started < 10_000, `took ${Date.now() - started} ms`);
+});
+
+test('G1/D24: a git directory\'s name ABOVE the working directory does not turn the project\'s own config/ into a secret; inside it, and outside, the rule holds', () => {
+  const { w, done } = makeWorld();
+  try {
+    // The project lives under a bare repository's directory (`repo.git/work`): every Read of a `config/` folder used to be a risk of its own.
+    const cwd = join(w.root, 'repo.git', 'work');
+    put(join(cwd, 'config', 'app.yml'));
+    put(join(cwd, 'src', 'config', 'db.yml'));
+    put(join(cwd, '.git', 'config'));
+    const at = (name: string, input: Record<string, unknown>): ToolView => describeTool(name, input, cwd);
+    for (const rel of ['config/app.yml', 'src/config/db.yml', join(cwd, 'config', 'app.yml')]) {
+      assert.equal(at('Read', { file_path: rel }).risk, 'low', `Read ${rel}`);
+      assert.equal(at('Bash', { command: `cat ${rel}` }).risk, 'med', `cat ${rel}`);
+    }
+    assert.equal(at('Glob', { pattern: 'config/*.yml' }).risk, 'low');
+    assert.equal(at('Grep', { pattern: 'x', path: 'config' }).risk, 'low', 'a search in the project is not a search of a git directory');
+    // Inside the project the rule is unchanged, and so it is for a path OUTSIDE it, where the name above counts.
+    assert.equal(at('Read', { file_path: '.git/config' }).risk, 'high');
+    assert.equal(at('Read', { file_path: join(w.root, 'repo.git', 'config') }).risk, 'high', 'outside the cwd, repo.git/config is a bare repository\'s own');
+    assert.equal(at('Read', { file_path: '../config' }).risk, 'high');
+    // The same project under a plain directory is the control for the comment above.
+    const plain = join(w.root, 'plain', 'work');
+    put(join(plain, 'config', 'app.yml'));
+    assert.equal(describeTool('Read', { file_path: 'config/app.yml' }, plain).risk, 'low');
+  } finally {
+    done();
+  }
+});
+
+test('G1/D24: a glob that can name a git directory\'s secret files is high; one that merely shares a letter with them is not', () => {
+  const high = [
+    '.g?t/config', '.g*/config', '.gi[t]/config', '.git/c*', '.git/config*', '.git/modules/*/config', '.git/worktrees/*/config.worktree', '.git/remote?/origin',
+    '*.git/config', 'repo.git/c?nfig', '.git*/config.worktree', '**/.git/config', '.git/**/config', 'src/**/.git/modules/**/config',
+  ];
+  for (const g of high) {
+    for (const [name, input] of [['Glob', { pattern: g }], ['Grep', { pattern: 'url', glob: g }], ['Glob', { pattern: '*', path: g }]] as const) {
+      const v = tool(name, input);
+      assert.equal(v.risk, 'high', `${name} ${JSON.stringify(input)}`);
+      assert.equal(v.deny, undefined, `${name} ${g}: asked about, not refused`);
+    }
+    assert.equal(bash(`cat ${g}`).risk, 'high', `cat ${g}`);
+    assert.equal(bash(`ls ${g}`).risk, 'high', `ls ${g}`);
+  }
+  // A brace list is several words: each is judged.
+  assert.equal(bash('cat .git/{HEAD,config.worktree}').risk, 'high');
+  assert.equal(bash('cat .git/{HEAD,index}').risk, 'med');
+  // Companions: a wildcard that could be ANYTHING is a search for config directories, not for git's; and no git directory means no rule.
+  for (const g of ['*/config', '**/config', '*.*/config', 'src/*/config.ts', '.github/*', '.g*', '.git', '**/.git', 'config/*.yml', '*/remotes/origin', 'src/**/*.ts']) {
+    assert.equal(tool('Glob', { pattern: g }).risk, 'low', `Glob ${g}`);
+    assert.equal(tool('Grep', { pattern: 'x', glob: g }).risk, 'low', `Grep glob ${g}`);
+  }
+  for (const c of ['ls */config', 'ls .git*', 'ls .github/*', 'cat config/*.yml', 'ls **/config']) assert.equal(bash(c).risk, 'med', c);
+});
+
+test('G1/D24: pinned over-asks: a pattern beneath .git that COULD be config, a branch called config, and the remote-tracking refs all ask', () => {
+  // The rule is "after a git directory, any later component". It costs a tap on rare reads (a listing of .git/refs/heads, a branch that is
+  // called `config`, .git/refs/remotes/...), and gives in exchange no layout that has to be listed one by one. If it is ever narrowed, this
+  // is the test that says so.
+  for (const g of ['.git/*', '.git/**', '.git/refs/heads/*', '.git/hooks/*']) assert.equal(tool('Glob', { pattern: g }).risk, 'high', `Glob ${g}`);
+  assert.equal(tool('Glob', { pattern: '*', path: '.git/refs/heads' }).risk, 'high');
+  for (const p of ['.git/refs/heads/config', '.git/refs/remotes/origin/main', '.git/logs/refs/remotes/origin/HEAD']) assert.equal(tool('Read', { file_path: p }).risk, 'high', p);
+  // ...while the files that are plainly not logins stay free to Read.
+  for (const p of ['.git/refs/heads/main', '.git/refs/tags/v1', '.git/logs/refs/heads/main', '.git/hooks/pre-commit']) assert.equal(tool('Read', { file_path: p }).risk, 'low', p);
+});
+
+test('G1/D24 known gap: a search that starts at a directory INSIDE a git directory with no git name is not recognised (the directory itself is)', () => {
+  const { w, done } = makeWorld();
+  try {
+    const dir = join(w.root, 'gap');
+    gitSkeleton(join(dir, 'store'));
+    gitSkeleton(join(dir, 'store', 'modules', 'm'));
+    const at = (name: string, input: Record<string, unknown>): ToolView => describeTool(name, input, dir);
+    assert.equal(at('Grep', { pattern: 'url', path: 'store' }).risk, 'high', 'the git directory itself is');
+    assert.equal(at('Grep', { pattern: 'url', path: 'store/modules/m' }).risk, 'high', 'and so is its submodule\'s');
+    // `store/modules` is neither a git directory nor named for one; a recursive search of it reaches store/modules/m/config. Said, not hidden.
+    assert.equal(at('Grep', { pattern: 'url', path: 'store/modules' }).risk, 'low');
+    // The file itself is always judged by what it is.
+    assert.equal(at('Read', { file_path: 'store/modules/m/config' }).risk, 'high');
+  } finally {
+    done();
+  }
+});
+
+test('G1/D24: a `.git` pointer file is followed to where it really leads, and a hostile one is bounded and never free', () => {
+  const { w, done } = makeWorld();
+  try {
+    const dir = join(w.root, 'ptr');
+    const at = (name: string, input: Record<string, unknown>): ToolView => describeTool(name, input, dir);
+    put(join(dir, 'gitstore', 'HEAD'), 'ref: refs/heads/main\n');
+    put(join(dir, 'ok', '.git'), 'gitdir: ../gitstore\n');
+    // The panel names both ends: the path as given, and where git will really look.
+    assert.equal(at('Read', { file_path: 'ok/.git/HEAD' }).summary, 'ok/.git/HEAD -> gitstore/HEAD');
+    assert.equal(at('Read', { file_path: 'ok/.git/HEAD' }).risk, 'high');
+    assert.equal(at('Write', { file_path: 'ok/.git/HEAD', content: 'x' }).summary, 'ok/.git/HEAD -> gitstore/HEAD');
+    // `..` right after the file does not go into the git directory: the kernel (ENOTDIR) and a normaliser agree it is the folder above.
+    assert.equal(at('Read', { file_path: 'ok/.git/../HEAD' }).risk, 'low', 'nothing was followed, so nothing is a link');
+    assert.equal(at('Read', { file_path: 'ok/.git/./../HEAD' }).risk, 'low');
+    // The pointer file ITSELF is an ordinary file: nothing continues below it, so nothing is followed.
+    assert.equal(at('Read', { file_path: 'ok/.git' }).summary, 'ok/.git');
+    assert.equal(at('Read', { file_path: 'ok/.git' }).risk, 'low');
+    // A pointer that leads to a place outside the project says so with the absolute path, and is judged there.
+    put(join(dir, 'out', '.git'), `gitdir: ${w.outside}\n`);
+    assert.equal(at('Read', { file_path: 'out/.git/notes.txt' }).summary, `out/.git/notes.txt -> ${join(w.outside, 'notes.txt')}`);
+    put(join(dir, 'root', '.git'), 'gitdir: /\n');
+    assert.equal(at('Read', { file_path: 'root/.git/etc/shadow' }).risk, 'high', 'a pointer at / reaches /etc/shadow');
+    assert.equal(at('Bash', { command: 'cat root/.git/etc/shadow' }).risk, 'high');
+
+    // Not a pointer at all: an ordinary file in the middle of a path, which the kernel answers with ENOTDIR. Not followed, not penalised.
+    put(join(dir, 'text', '.git'), 'this is not a pointer\n');
+    assert.equal(at('Read', { file_path: 'text/.git/HEAD' }).risk, 'low');
+    // The line must be the first one, and say `gitdir:`; a long file is read for 4 KiB and no further.
+    put(join(dir, 'late', '.git'), `\ngitdir: ../gitstore\n`);
+    assert.equal(at('Read', { file_path: 'late/.git/HEAD' }).risk, 'low', 'only the first line counts');
+    put(join(dir, 'huge', '.git'), `gitdir: ../gitstore\n${'x'.repeat(2_000_000)}`);
+    assert.equal(at('Read', { file_path: 'huge/.git/HEAD' }).summary, 'huge/.git/HEAD -> gitstore/HEAD');
+    // A pointer at itself, a chain of them and one to a place that is not there: bounded, not free, no crash.
+    put(join(dir, 'self', '.git'), 'gitdir: .git\n');
+    put(join(dir, 'gone', '.git'), 'gitdir: nowhere/at/all\n');
+    // (Each pointer leads to the NEXT one's `.git`, so a path that goes on below it follows them all.)
+    for (let i = 0; i < 45; i++) put(join(dir, `c${i}`, '.git'), `gitdir: ../c${i + 1}/.git\n`);
+    for (const rel of ['self/.git/HEAD', 'self/.git/.git/.git/HEAD', 'gone/.git/HEAD', 'c0/.git/HEAD', 'c40/.git/x']) {
+      const v = at('Read', { file_path: rel });
+      assert.equal(v.risk, 'high', rel);
+      assert.notEqual(v.deny, ANALYSIS_FAILED, rel);
+      assert.equal(needsTap('Read', { file_path: rel }, dir), true, rel);
+    }
+    // The hop bound is the kernel's (40), and a Bash word shows it: a pointer alone does not raise a read there, so a rise is the walk giving up.
+    assert.equal(at('Bash', { command: 'cat c5/.git/HEAD' }).risk, 'med', '40 pointers are followed');
+    assert.equal(at('Bash', { command: 'cat c4/.git/HEAD' }).risk, 'high', '41: given up on, and not trusted');
+    assert.equal(at('Bash', { command: 'cat self/.git/HEAD' }).risk, 'high', 'a pointer at itself is a loop');
+    // Not UTF-8, a NUL, a name too long and a target that climbs out of everything.
+    writeFileSync(join(dir, 'ok', 'bin.bin'), 'x');
+    put(join(dir, 'nul', '.git'), 'gitdir: a\0b\n');
+    put(join(dir, 'long', '.git'), `gitdir: ${'n'.repeat(300)}\n`);
+    put(join(dir, 'up', '.git'), `gitdir: ${'../'.repeat(60)}etc\n`);
+    put(join(dir, 'bin', '.git'), Buffer.from([0x67, 0x69, 0x74, 0x64, 0x69, 0x72, 0x3a, 0x20, 0xff, 0xfe, 0x2f, 0x78, 0x0a]).toString('latin1'));
+    for (const d of ['nul', 'long', 'up', 'bin']) {
+      const v = at('Read', { file_path: `${d}/.git/HEAD` });
+      assert.notEqual(v.deny, ANALYSIS_FAILED, d);
+      assert.ok(RISKS.includes(v.risk), d);
+      assert.match(v.summary, ASCII, d);
+    }
+    assert.equal(at('Read', { file_path: 'up/.git/passwd' }).risk, 'high');
+  } finally {
+    done();
+  }
+});
+
+test('G1/D24: a FIFO or a directory named .git in the middle of a path never blocks the analyser, and a pointer read is charged to the work bound', async () => {
+  const { w, done } = makeWorld();
+  try {
+    const dir = join(w.root, 'special');
+    mkdirSync(dir, { recursive: true });
+    const { execFileSync } = await import('node:child_process');
+    let fifo = true;
+    try {
+      execFileSync('mkfifo', [join(dir, '.git')]);
+    } catch {
+      fifo = false; // no mkfifo here (Windows): the claim is about POSIX
+    }
+    if (fifo) {
+      // open(2) on a FIFO with no writer would park the process for ever; the analysis must come straight back.
+      const t0 = Date.now();
+      const v = describeTool('Read', { file_path: '.git/HEAD' }, dir);
+      assert.ok(Date.now() - t0 < 5_000, 'the analyser did not wait on the FIFO');
+      assert.equal(v.risk, 'low', 'a FIFO is not a pointer: nothing is followed');
+      assert.equal(describeTool('Read', { file_path: '.git/config' }, dir).risk, 'high', 'and the name still decides');
+      assert.equal(describeTool('Bash', { command: 'cat .git/HEAD' }, dir).risk, 'med');
+    }
+    // One lstat per component and ONE unit for reading the pointer: `gitdir: .` leads back to the directory that holds the file, so the
+    // two spellings walk the same number of components and differ by the read alone.
+    const real = join(w.root, 'cost', 'real');
+    const ptr = join(w.root, 'cost', 'ptr');
+    put(join(real, '.git', 'HEAD'));
+    put(join(ptr, '.git'), 'gitdir: .\n');
+    put(join(ptr, 'HEAD'));
+    const plain = bashWorkUnits('cat .git/HEAD', real);
+    const viaPointer = bashWorkUnits('cat .git/HEAD', ptr);
+    assert.equal(viaPointer - plain, 1, `a pointer costs exactly one unit more (${viaPointer} vs ${plain})`);
+  } finally {
+    done();
+  }
+});
+
+// ===========================================================================
+// G3: "a link, then `..`" resolves in the link's TARGET, at every call site that judges a path
+//
+// The kernel resolves `link/..` to the parent of the link's TARGET; a normaliser says it is the folder the link sits in. The
+// code judges both readings (`rawAbsOf`), and that was pinned for Read alone: dropping it at the Write/Edit site, the Bash
+// redirect and tee site, the Bash path-word site or the MCP writer site (each a one-line mutant) kept every test green, and a
+// write that lands in ~/.ssh was rated `med` and shown as a project-relative name.
+//
+// The table below is the rule, one row per kind of landing, and each row is run through EVERY entry point. The paths are built by
+// STRING CONCATENATION: `path.join` would normalise the `..` away and test the very reading that was always right. Each row has a
+// control (the normalised spelling, with no link in it) so that the rise in rating can only come from the kernel's reading.
+// ===========================================================================
+
+interface KernelRow {
+  name: string;
+  /** The link, made in the project: its name and what it points at. */
+  link: string;
+  to: (w: World) => string;
+  /** What the model writes after the link (always one `..` and a file name). */
+  tail: string;
+  /** The given path as the panel shows it (normalised: it is the lexical reading) and where it really lands, relative to the project when inside. */
+  shown: string;
+  lands: (w: World) => string;
+  landsShown: (w: World) => string;
+  /** Ratings: Read-like tools, file-writing tools, a Bash redirect or tee, a Bash operand (cp, touch), a Bash read of the path. */
+  read: Risk;
+  fileWrite: Risk;
+  redirect: Risk;
+  operand: Risk;
+  bashRead: Risk;
+  /** Claude Code's own configuration: every writer is refused. */
+  config: boolean;
+  /** The same spelling with no link in it: the lexical reading alone. */
+  control: { read: Risk; fileWrite: Risk; bashRead: Risk };
+}
+
+const KERNEL_ROWS: KernelRow[] = [
+  {
+    // Harmless, but not where the line says: a folder outside the project. A link alone does not raise a Bash READ (only where it lands does).
+    name: 'outside, harmless',
+    link: 'lnk-out', to: (w) => join(w.outside, 'deep'), tail: '../notes.txt',
+    shown: 'notes.txt', lands: (w) => join(w.outside, 'notes.txt'), landsShown: (w) => join(w.outside, 'notes.txt'),
+    read: 'high', fileWrite: 'high', redirect: 'high', operand: 'med', bashRead: 'med', config: false,
+    control: { read: 'low', fileWrite: 'med', bashRead: 'med' },
+  },
+  {
+    // The one that matters: nothing in the SPELLING is sensitive, the landing is the home directory's ssh folder.
+    name: 'sensitive only through the kernel reading (~/.ssh)',
+    link: 'lnk-ssh', to: (w) => join(w.home, '.ssh', 'sub'), tail: '../known_hosts',
+    shown: 'known_hosts', lands: (w) => join(w.home, '.ssh', 'known_hosts'), landsShown: (w) => join(w.home, '.ssh', 'known_hosts'),
+    read: 'high', fileWrite: 'high', redirect: 'high', operand: 'high', bashRead: 'high', config: false,
+    control: { read: 'low', fileWrite: 'med', bashRead: 'med' },
+  },
+  {
+    // Claude Code's configuration, reached with a harmless-looking name: a write is refused, a read is only asked about.
+    name: 'the configuration (.claude/settings.json)',
+    link: 'lnk-cfg', to: () => '.claude/sub', tail: '../settings.json',
+    shown: 'settings.json', lands: (w) => join(w.proj, '.claude', 'settings.json'), landsShown: () => '.claude/settings.json',
+    read: 'high', fileWrite: 'high', redirect: 'high', operand: 'high', bashRead: 'med', config: true,
+    control: { read: 'low', fileWrite: 'med', bashRead: 'med' },
+  },
+  {
+    // The G1 layouts through the same door: `.git/config` is a secret, `config` in the project is not.
+    name: 'a git directory\'s config (.git/config)',
+    link: 'lnk-git', to: () => '.git/sub', tail: '../config',
+    shown: 'config', lands: (w) => join(w.proj, '.git', 'config'), landsShown: () => '.git/config',
+    read: 'high', fileWrite: 'high', redirect: 'high', operand: 'high', bashRead: 'high', config: false,
+    control: { read: 'low', fileWrite: 'med', bashRead: 'med' },
+  },
+];
+
+test('G3: "link, then .." is judged in the link\'s target by Read, Write/Edit, a Bash redirect and tee, a Bash operand and a Bash read, and an MCP writer', () => {
+  const { w, done } = makeWorld();
+  try {
+    mkdirSync(join(w.home, '.ssh', 'sub'), { recursive: true });
+    mkdirSync(join(w.proj, '.claude', 'sub'), { recursive: true });
+    mkdirSync(join(w.proj, '.git', 'sub'), { recursive: true });
+    for (const row of KERNEL_ROWS) ln(row.to(w), join(w.proj, row.link));
+    const at = (name: string, input: Record<string, unknown>): ToolView => describeTool(name, input, w.proj);
+    let checked = 0;
+    for (const row of KERNEL_ROWS) {
+      // Strings, never path.join: the `..` has to reach the analyser exactly as the model wrote it.
+      const given = `${row.link}/${row.tail}`;
+      const abs = `${w.proj}/${row.link}/${row.tail}`;
+      const want = `${row.shown} -> ${row.landsShown(w)}`;
+      assert.ok(given.includes('/../') && abs.includes('/../'), `${row.name}: the test path still has its ..`);
+      const refusal = row.config ? /configuration/ : undefined;
+      const ctx = (way: string): string => `${row.name}: ${way} ${show(given)}`;
+
+      // Read-like tools: never free, shown as "given -> real".
+      for (const spelled of [given, abs]) {
+        for (const [way, name, input] of [
+          ['Read', 'Read', { file_path: spelled }], ['NotebookRead', 'NotebookRead', { notebook_path: spelled }], ['LS', 'LS', { path: spelled }],
+          ['Grep path', 'Grep', { pattern: 'x', path: spelled }], ['Grep glob', 'Grep', { pattern: 'x', glob: spelled }], ['Glob pattern', 'Glob', { pattern: spelled }],
+        ] as [string, string, Record<string, unknown>][]) {
+          const v = at(name, input);
+          assert.equal(v.risk, row.read, ctx(way));
+          assert.equal(v.deny, undefined, ctx(`${way}: reading is asked about, never refused`));
+          assert.equal(needsTap(name, input, w.proj), true, ctx(`${way}: the hook must ask`));
+          checked++;
+        }
+        // The summary says both ends (a search shows its pattern first, so only the file tools are compared whole).
+        assert.equal(at('Read', { file_path: spelled }).summary, want, ctx('Read summary'));
+      }
+
+      // File-writing tools.
+      for (const spelled of [given, abs]) {
+        for (const [name, input] of [
+          ['Write', { file_path: spelled, content: 'x' }], ['Edit', { file_path: spelled, old_string: 'a', new_string: 'b' }],
+          ['MultiEdit', { file_path: spelled, edits: [] }], ['NotebookEdit', { notebook_path: spelled }],
+        ] as const) {
+          const v = at(name, input);
+          assert.equal(v.risk, row.fileWrite, ctx(name));
+          assert.equal(v.summary, want, ctx(`${name} summary`));
+          if (refusal) assert.match(v.deny ?? '', refusal, ctx(`${name} is refused`));
+          else assert.equal(v.deny, undefined, ctx(`${name} is asked about`));
+          checked++;
+        }
+      }
+
+      // Bash: a redirect or tee writes where the kernel says; an operand and a read are path words.
+      for (const c of [`echo x > ${given}`, `echo x >> ${given}`, `echo x | tee ${given}`, `echo x | tee -a ${given}`, `echo x > ${abs}`]) {
+        const v = at('Bash', { command: c });
+        assert.equal(v.risk, row.redirect, ctx(c));
+        if (refusal) assert.match(v.deny ?? '', refusal, ctx(`${c} is refused`));
+        else assert.equal(v.deny, undefined, ctx(`${c} is asked about`));
+        checked++;
+      }
+      for (const c of [`cp a.txt ${given}`, `touch ${given}`, `mv a.txt ${given}`]) {
+        const v = at('Bash', { command: c });
+        assert.equal(v.risk, row.operand, ctx(c));
+        if (refusal) assert.match(v.deny ?? '', refusal, ctx(`${c} is refused`));
+        else assert.equal(v.deny, undefined, ctx(`${c} is asked about`));
+        checked++;
+      }
+      for (const c of [`cat ${given}`, `head -n1 ${given}`, `cat < ${given}`, `grep x ${abs}`, `cd ${row.link} && cat ${row.tail}`]) {
+        const v = at('Bash', { command: c });
+        assert.equal(v.risk, row.bashRead, ctx(c));
+        assert.equal(v.deny, undefined, ctx(`${c}: a read is rated, never refused`));
+        checked++;
+      }
+      // After a cd into the link, a relative operand is resolved from the link's target as well.
+      if (row.config) assert.match(at('Bash', { command: `cd ${row.link} && echo x > ${row.tail}` }).deny ?? '', /configuration/, ctx('cd into the link, then a redirect'));
+      else assert.equal(at('Bash', { command: `cd ${row.link} && echo x > ${row.tail}` }).risk, row.redirect, ctx('cd into the link, then a redirect'));
+
+      // An MCP tool that looks like a writer is aimed at the same place.
+      const mcp = at('mcp__fs__write_file', { path: given, content: 'x' });
+      assert.equal(mcp.risk, 'high', ctx('mcp writer'));
+      if (refusal) assert.match(mcp.deny ?? '', refusal, ctx('mcp writer is refused'));
+      else assert.equal(mcp.deny, undefined, ctx('mcp writer is asked about'));
+      checked++;
+
+      // The control: the normalised spelling, with no link in it. The rise above is the kernel's reading and nothing else.
+      const plain = row.shown;
+      assert.equal(at('Read', { file_path: plain }).risk, row.control.read, `control: Read ${plain}`);
+      assert.equal(at('Read', { file_path: plain }).summary, plain, `control: no arrow when nothing is followed`);
+      assert.equal(at('Write', { file_path: plain, content: 'x' }).risk, row.control.fileWrite, `control: Write ${plain}`);
+      assert.equal(at('Write', { file_path: plain, content: 'x' }).deny, undefined, `control: Write ${plain} is not refused`);
+      assert.equal(at('Bash', { command: `echo x > ${plain}` }).risk, row.control.fileWrite, `control: echo x > ${plain}`);
+      assert.equal(at('Bash', { command: `cat ${plain}` }).risk, row.control.bashRead, `control: cat ${plain}`);
+      assert.equal(at('mcp__fs__write_file', { path: plain, content: 'x' }).deny, undefined, `control: mcp ${plain}`);
+      checked += 7;
+    }
+    assert.ok(checked > 150, `the loops ran (${checked})`);
+  } finally {
+    done();
+  }
+});
+
+test('G3: both readings are judged and the worse one wins (the normaliser\'s reading is the store, the kernel\'s is harmless)', () => {
+  const { w, done } = makeWorld();
+  try {
+    // The mirror image of the rows above. `sshlink` (an innocent name) leads to ~/.ssh, and inside it `hop` leads somewhere harmless:
+    //   a normaliser reads `sshlink/hop/../known_hosts` as `sshlink/known_hosts`, which is ~/.ssh/known_hosts;
+    //   the kernel goes into `hop`'s target and up from THERE, to `outside/known_hosts`.
+    // Dropping the lexical reading in favour of the kernel's would call this harmless, and the spelling alone shows nothing (no `.ssh` in it).
+    ln(join(w.home, '.ssh'), join(w.proj, 'sshlink'));
+    ln(join(w.outside, 'deep'), join(w.home, '.ssh', 'hop'));
+    const given = 'sshlink/hop/../known_hosts';
+    assert.equal(bash(`cat ${given}`, w.proj).risk, 'high', 'a Bash read: only the lexical landing is the store');
+    assert.equal(bash(`grep x ${w.proj}/${given}`, w.proj).risk, 'high');
+    // Control: with the lexical reading's link taken away the same command is an ordinary read, so the rise above is that reading.
+    ln(w.outside, join(w.proj, 'plainlink'));
+    ln(join(w.outside, 'deep'), join(w.outside, 'hop2'));
+    assert.equal(bash('cat plainlink/hop2/../notes.txt', w.proj).risk, 'med', 'control: both readings are harmless');
+    // The file tools are never free through a link, whatever the readings say.
+    assert.equal(tool('Read', { file_path: given }, w.proj).risk, 'high');
+    assert.equal(tool('Write', { file_path: given, content: 'x' }, w.proj).risk, 'high');
   } finally {
     done();
   }
